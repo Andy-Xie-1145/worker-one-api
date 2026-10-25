@@ -1,0 +1,907 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API 聚合网关 · Workers</title>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#fff; --border:#e3e6ea; --text:#1b1f24; --muted:#6b7480;
+  --accent:#2f6feb; --accent-fg:#fff; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e;
+  --radius:10px; --shadow:0 1px 2px rgba(0,0,0,.05),0 4px 14px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0d1117; --panel:#161b22; --border:#2a313a; --text:#e6edf3; --muted:#8b949e;
+  --accent:#3b82f6; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  --shadow:0 1px 2px rgba(0,0,0,.4);
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+a{color:var(--accent);text-decoration:none}
+button{font:inherit;cursor:pointer;border:1px solid var(--border);background:var(--panel);color:var(--text);padding:6px 12px;border-radius:8px}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+button.danger{color:var(--err);border-color:var(--border)}
+button.danger:hover{border-color:var(--err)}
+button:disabled{opacity:.5;cursor:not-allowed}
+input,select,textarea{font:inherit;padding:7px 10px;border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--text);width:100%}
+textarea{min-height:70px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+label{display:block;margin:10px 0 4px;color:var(--muted);font-size:12.5px}
+.wrap{max-width:1180px;margin:0 auto;padding:20px}
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--panel)}
+header h1{font-size:15px;margin:0;font-weight:600}
+nav{display:flex;gap:2px;flex-wrap:wrap;margin-left:auto}
+nav button{border:none;background:none;padding:6px 11px;border-radius:8px;color:var(--muted)}
+nav button.active{background:var(--bg);color:var(--text);font-weight:600}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow);margin-bottom:16px}
+.card h2{margin:0 0 12px;font-size:14px;font-weight:600}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+.stats{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
+.stat{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
+.stat .v{font-size:22px;font-weight:600;margin-top:2px}
+.stat .k{color:var(--muted);font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--muted);font-weight:500;font-size:12px;white-space:nowrap}
+tbody tr:hover{background:var(--bg)}
+.scroll{overflow-x:auto}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11.5px;border:1px solid var(--border)}
+.tag.ok{color:var(--ok);border-color:currentColor}
+.tag.err{color:var(--err);border-color:currentColor}
+.tag.warn{color:var(--warn);border-color:currentColor}
+.muted{color:var(--muted)}
+.center{min-height:80vh;display:grid;place-items:center}
+.auth{width:340px}
+#toast{position:fixed;top:16px;right:16px;z-index:99;display:flex;flex-direction:column;gap:8px}
+.toast{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:8px;padding:10px 14px;box-shadow:var(--shadow);max-width:360px}
+.toast.err{border-left-color:var(--err)}
+.toast.ok{border-left-color:var(--ok)}
+dialog{border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);color:var(--text);padding:0;max-width:620px;width:92vw;box-shadow:var(--shadow)}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+.dlg-body{padding:18px;max-height:74vh;overflow:auto}
+.dlg-foot{display:flex;gap:8px;justify-content:flex-end;padding:12px 18px;border-top:1px solid var(--border)}
+.bar{height:6px;background:var(--bg);border-radius:4px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--accent)}
+.term{background:#0d1117;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.term-out{height:420px;overflow:auto;padding:12px;white-space:pre-wrap;word-break:break-word;color:#e6edf3;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.5}
+.term-out .term-err{color:#f85149}
+.term-out .term-hint{color:#8b949e}
+.term-in{display:flex;align-items:center;gap:6px;padding:9px 12px;border-top:1px solid #2a313a}
+.term-in .ps{color:#3fb950;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;white-space:nowrap}
+.term-in input{flex:1;background:#161b22;border:1px solid #2a313a;color:#e6edf3;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;padding:5px 8px}
+.term-in input:focus{outline:none;border-color:var(--accent)}
+</style>
+</head>
+<body>
+<div id="toast"></div>
+<div id="app"></div>
+
+<script>
+const $ = (h) => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild; };
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const app = document.getElementById('app');
+
+// 单一管理员令牌，存放在 localStorage；除 /api/status 外所有请求都带 Bearer 头。
+const KEY_STORAGE = 'oneapi_admin_key';
+let state = { owner: null, status: null, page: 'dashboard' };
+const QUOTA_PER_USD = 500000;
+const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
+const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
+const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
+
+function toast(msg, kind = '') {
+  const el = $(`<div class="toast ${kind}">${esc(msg)}</div>`);
+  document.getElementById('toast').append(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+async function api(path, opts = {}) {
+  const key = localStorage.getItem(KEY_STORAGE);
+  const res = await fetch('/api' + path, {
+    ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(key ? { Authorization: 'Bearer ' + key } : {}),
+      ...(opts.headers || {}),
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (res.status === 401) {
+    // 令牌失效：清掉存储、回解锁页，再把错误抛给调用方去 toast。
+    localStorage.removeItem(KEY_STORAGE);
+    state.owner = null;
+    showUnlock();
+    throw new Error('管理令牌无效或已失效，请重新解锁');
+  }
+  let json;
+  try { json = await res.json(); } catch { json = { success: false, message: 'HTTP ' + res.status }; }
+  if (!json.success) throw new Error(json.message || 'HTTP ' + res.status);
+  return json.data;
+}
+
+// ---------------------------------------------------------------- shell
+
+async function boot() {
+  state.status = await api('/status').catch(() => null);
+  if (!state.status) { app.innerHTML = '<div class="center"><p>无法连接到服务</p></div>'; return; }
+  if (!localStorage.getItem(KEY_STORAGE)) return showUnlock();
+  try { state.owner = await api('/owner'); } catch (err) { toast(err.message, 'err'); return; }
+  render();
+}
+
+/** 解锁页：唯一入口是管理令牌，用 GET /api/owner 验证。已在解锁页时不重复渲染，保留已输入内容。 */
+function showUnlock() {
+  stopAutoRefresh();
+  if (document.getElementById('adminKey')) return;
+  app.replaceChildren($(`<div class="center"><div class="card auth">
+    <h2>${esc(state.status?.system_name || 'One API')}</h2>
+    <p class="muted">个人专用网关，输入管理令牌解锁。</p>
+    <label>管理令牌（ADMIN_KEY）</label><input id="adminKey" type="password" autocomplete="current-password">
+    <div style="margin-top:14px"><button class="primary" id="unlock" style="width:100%">解锁</button></div>
+  </div></div>`));
+  const input = document.getElementById('adminKey');
+  const submit = async () => {
+    const key = input.value.trim();
+    if (!key) return toast('请输入管理令牌', 'err');
+    localStorage.setItem(KEY_STORAGE, key);
+    try {
+      state.owner = await api('/owner');
+      toast('已解锁', 'ok'); render();
+    } catch (err) {
+      localStorage.removeItem(KEY_STORAGE);
+      toast(err.message, 'err');
+    }
+  };
+  document.getElementById('unlock').onclick = submit;
+  input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+  input.focus();
+}
+
+const PAGES = {
+  dashboard: ['总览', pageDashboard],
+  tokens: ['令牌', pageTokens],
+  channels: ['渠道', pageChannels],
+  pricing: ['价格', pagePricing],
+  health: ['健康', pageHealth],
+  logs: ['日志', pageLogs],
+  terminal: ['终端', pageTerminal],
+  settings: ['设置', pageSettings],
+};
+
+function render() {
+  stopAutoRefresh();
+  const tabs = Object.entries(PAGES)
+    .map(([key, cfg]) => `<button data-page="${key}" class="${state.page === key ? 'active' : ''}">${esc(cfg[0])}</button>`)
+    .join('');
+
+  app.replaceChildren(
+    $(`<header>
+        <h1>${esc(state.status.system_name)}</h1>
+        <nav>${tabs}</nav>
+        <span class="muted">已解锁</span>
+        <button id="lock">锁定</button>
+      </header>`),
+    $('<div class="wrap" id="view"><p class="muted">加载中…</p></div>'),
+  );
+
+  app.querySelectorAll('nav button').forEach((b) => (b.onclick = () => { state.page = b.dataset.page; render(); }));
+  document.getElementById('lock').onclick = () => {
+    localStorage.removeItem(KEY_STORAGE);
+    state.owner = null;
+    toast('已锁定', 'ok');
+    showUnlock();
+  };
+
+  const fn = (PAGES[state.page] || PAGES.dashboard)[1];
+  fn(document.getElementById('view')).catch((e) => toast(e.message, 'err'));
+}
+
+function table(cols, rows, renderRow) {
+  return `<div class="scroll"><table><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+    <tbody>${rows.length ? rows.map(renderRow).join('') : `<tr><td colspan="${cols.length}" class="muted">暂无数据</td></tr>`}</tbody></table></div>`;
+}
+
+function dialog(title, innerHTML, onSave) {
+  const dlg = $(`<dialog><div class="dlg-body"><h2 style="margin-top:0">${esc(title)}</h2>${innerHTML}</div>
+    <div class="dlg-foot"><button data-x>取消</button><button class="primary" data-ok>保存</button></div></dialog>`);
+  document.body.append(dlg);
+  dlg.showModal();
+  const close = () => { dlg.close(); dlg.remove(); };
+  dlg.querySelector('[data-x]').onclick = close;
+  dlg.querySelector('[data-ok]').onclick = async (e) => {
+    e.target.disabled = true;
+    try { await onSave(dlg); close(); } catch (err) { toast(err.message, 'err'); e.target.disabled = false; }
+  };
+  return dlg;
+}
+const val = (dlg, id) => dlg.querySelector('#' + id)?.value ?? '';
+
+/**
+ * 给当前页面挂一个自动刷新：每 REFRESH_MS 拉一次数据，标签页切到后台就停表，
+ * 切回来立刻补一次 —— 后台期间一个请求都不发。
+ * 同一时刻只允许一个页面注册，render() 换页时会先调 stopAutoRefresh() 收摊。
+ */
+const REFRESH_MS = 30000;
+let stopRefresh = null;
+
+function stopAutoRefresh() { if (stopRefresh) { stopRefresh(); stopRefresh = null; } }
+
+function autoRefresh(fn) {
+  let timer = null, busy = false;
+  const tick = async () => {
+    if (busy || document.hidden) return;
+    busy = true;
+    try { await fn(); } catch { /* 自动刷新失败保持安静，别 30 秒弹一次 toast */ }
+    finally { busy = false; }
+  };
+  const start = () => { if (!timer) timer = setInterval(tick, REFRESH_MS); };
+  const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
+  const onVis = () => { if (document.hidden) stop(); else { start(); tick(); } };
+  document.addEventListener('visibilitychange', onVis);
+  if (!document.hidden) start();
+  stopRefresh = () => { stop(); document.removeEventListener('visibilitychange', onVis); };
+}
+
+// ---------------------------------------------------------------- 总览
+
+async function pageDashboard(view) {
+  await loadDashboard(view);
+  autoRefresh(() => loadDashboard(view));
+}
+
+async function loadDashboard(view) {
+  const d = await api('/dashboard');
+  const byModel = {};
+  for (const r of d.daily) {
+    byModel[r.model_name] = byModel[r.model_name] || { count: 0, quota: 0, pt: 0, ct: 0 };
+    byModel[r.model_name].count += r.count;
+    byModel[r.model_name].quota += r.quota;
+    byModel[r.model_name].pt += r.prompt_tokens;
+    byModel[r.model_name].ct += r.completion_tokens;
+  }
+  const models = Object.entries(byModel).sort((a, b) => b[1].quota - a[1].quota);
+  const max = Math.max(1, ...models.map(([, m]) => m.quota));
+
+  view.replaceChildren($(`<div>
+    <div class="stats" style="margin-bottom:12px">
+      <div class="stat"><div class="k">余额</div><div class="v">${usd(d.self.quota)}</div></div>
+      <div class="stat"><div class="k">累计消耗</div><div class="v">${usd(d.self.used_quota)}</div></div>
+      <div class="stat"><div class="k">近 7 天请求</div><div class="v">${d.totals.requests}</div></div>
+      <div class="stat"><div class="k">近 7 天消耗</div><div class="v">${usd(d.totals.quota)}</div></div>
+    </div>
+    <div class="row" style="margin-bottom:16px"><button id="adjust">调整余额</button>
+      <span class="muted">余额来自 owner 账户，支持正负美元直接加减</span></div>
+    <div class="card"><h2>近 7 天模型用量</h2>
+      ${table(['模型', '请求数', '输入 tokens', '输出 tokens', '消耗', ''], models, ([name, m]) => `<tr>
+        <td class="mono">${esc(name)}</td><td>${m.count}</td><td>${m.pt}</td><td>${m.ct}</td><td>${usd(m.quota)}</td>
+        <td style="width:180px"><div class="bar"><i style="width:${(m.quota / max * 100).toFixed(1)}%"></i></div></td></tr>`)}
+    </div>
+    <div class="card"><h2>接入方式</h2>
+      <p class="muted">把你的客户端 Base URL 指向下面地址，API Key 使用「令牌」页创建的 sk- 开头密钥。</p>
+      <p class="mono">${esc(location.origin)}/v1</p>
+    </div>
+  </div>`));
+
+  document.getElementById('adjust').onclick = () => dialog('调整余额', `
+    <label>调整额（美元，正负均可，如 -5 或 10）</label><input id="delta" type="number" step="0.0001">`,
+    async (dlg) => {
+      const n = Number(val(dlg, 'delta'));
+      if (!Number.isFinite(n) || n === 0) throw new Error('请输入非零金额');
+      const r = await api('/owner/adjust', { method: 'POST', body: { usd: n } });
+      toast(`已调整，当前余额 $${Number(r.usd ?? 0).toFixed(4)}`, 'ok');
+      loadDashboard(view);
+    });
+}
+
+// ---------------------------------------------------------------- 令牌
+
+async function pageTokens(view) {
+  const rows = await api('/tokens');
+  const STATUS = { 1: ['启用', 'ok'], 2: ['已禁用', 'err'], 3: ['已过期', 'warn'], 4: ['额度耗尽', 'warn'] };
+
+  view.replaceChildren($(`<div class="card">
+    <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">令牌</h2><button class="primary" id="new">新建令牌</button></div>
+    ${table(['ID', '名称', '密钥', '状态', '剩余额度', '已用', '过期时间', '模型限制', '定制价', '操作'], rows, (t) => {
+      const pc = (t.price_config && typeof t.price_config === 'object') ? Object.keys(t.price_config).length : 0;
+      return `<tr>
+      <td>${t.id}</td><td>${esc(t.name)}</td>
+      <td><code>sk-${esc(t.key.slice(0, 6))}…</code> <button data-copy="${esc(t.key)}">复制</button></td>
+      <td><span class="tag ${STATUS[t.status]?.[1] || ''}">${STATUS[t.status]?.[0] || t.status}</span></td>
+      <td>${t.unlimited_quota ? '<span class="tag">无限</span>' : usd(t.remain_quota)}</td>
+      <td>${usd(t.used_quota)}</td><td>${t.expired_time < 0 ? '永不' : ts(t.expired_time)}</td>
+      <td class="mono">${esc(t.models || '全部')}</td>
+      <td>${pc ? pc + ' 项' : '—'}</td>
+      <td><button data-edit="${t.id}">编辑</button> <button class="danger" data-del="${t.id}">删除</button></td></tr>`;
+    })}
+  </div>`));
+
+  view.querySelectorAll('[data-copy]').forEach((b) => (b.onclick = () => {
+    navigator.clipboard.writeText('sk-' + b.dataset.copy); toast('完整密钥已复制', 'ok');
+  }));
+
+  const form = (t = {}) => `
+    <label>名称</label><input id="name" value="${esc(t.name || '')}">
+    <label>额度（美元，留空或勾选无限则不限）</label><input id="quota" type="number" step="0.01" value="${t.remain_quota ? (t.remain_quota / QUOTA_PER_USD).toFixed(4) : ''}">
+    <label><input type="checkbox" id="unl" style="width:auto" ${t.unlimited_quota ? 'checked' : ''}> 无限额度</label>
+    <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
+    <label>可用模型（逗号分隔，留空表示全部）</label><input id="models" value="${esc(t.models || '')}">
+    <label>价格配置（可选 JSON）</label>
+    <textarea id="price_config" placeholder='{"my-model":{"in":1.32,"out":3.96,"cached_in":0.044},"fast-model":{"expr":"p * 2 + c * 8"}}'>${t.price_config ? esc(JSON.stringify(t.price_config, null, 2)) : ''}</textarea>
+    <p class="muted" style="margin:4px 0 0">同一模型在此 Key 上的价格覆盖全局价格覆盖与内置价格表。留空 = 不修改（新建时留空 = 不配置）；提交 <code>{}</code> 表示清空。</p>
+    ${t.id ? `<label>状态</label><select id="status"><option value="1"${t.status === 1 ? ' selected' : ''}>启用</option><option value="2"${t.status === 2 ? ' selected' : ''}>禁用</option></select>` : ''}`;
+
+  const collect = (dlg) => {
+    const body = {
+      name: val(dlg, 'name') || '默认令牌',
+      remain_quota: Math.round((parseFloat(val(dlg, 'quota')) || 0) * QUOTA_PER_USD),
+      unlimited_quota: dlg.querySelector('#unl').checked,
+      expired_time: val(dlg, 'exp') ? Math.floor(new Date(val(dlg, 'exp')).getTime() / 1000) : -1,
+      models: val(dlg, 'models').trim(),
+      ...(dlg.querySelector('#status') ? { status: Number(val(dlg, 'status')) } : {}),
+    };
+    const raw = val(dlg, 'price_config').trim();
+    if (raw) {
+      let pc;
+      try { pc = JSON.parse(raw); } catch { throw new Error('价格配置不是合法 JSON'); }
+      if (!pc || typeof pc !== 'object' || Array.isArray(pc)) throw new Error('价格配置必须是 JSON 对象');
+      body.price_config = pc; // 编辑：缺省字段 = 不修改，{} = 清空；新建：留空即无
+    }
+    return body;
+  };
+
+  document.getElementById('new').onclick = () => dialog('新建令牌', form(), async (dlg) => {
+    const t = await api('/tokens', { method: 'POST', body: collect(dlg) });
+    await navigator.clipboard.writeText('sk-' + t.key).catch(() => {});
+    toast('令牌已创建，密钥已复制到剪贴板', 'ok');
+    pageTokens(view);
+  });
+
+  view.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => {
+    const t = rows.find((r) => r.id === Number(b.dataset.edit));
+    dialog('编辑令牌', form(t), async (dlg) => {
+      await api('/tokens/' + t.id, { method: 'PUT', body: collect(dlg) });
+      toast('已保存', 'ok'); pageTokens(view);
+    });
+  }));
+
+  view.querySelectorAll('[data-del]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('确定删除该令牌？')) return;
+    await api('/tokens/' + b.dataset.del, { method: 'DELETE' });
+    toast('已删除', 'ok'); pageTokens(view);
+  }));
+}
+
+// ---------------------------------------------------------------- 渠道
+
+async function pageChannels(view) {
+  const [rows, meta] = await Promise.all([api('/channels'), api('/channels/meta')]);
+  const STATUS = { 1: ['启用', 'ok'], 2: ['手动禁用', 'err'], 3: ['自动禁用', 'warn'] };
+
+  view.replaceChildren($(`<div class="card">
+    <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">渠道</h2><button class="primary" id="new">新建渠道</button></div>
+    ${table(['ID', '名称', '类型', '状态', '优先级/权重', '模型', '已用', '响应', '操作'], rows, (ch) => `<tr>
+      <td>${ch.id}</td><td>${esc(ch.name)}</td><td>${esc(ch.type)}</td>
+      <td><span class="tag ${STATUS[ch.status]?.[1] || ''}">${STATUS[ch.status]?.[0] || ch.status}</span></td>
+      <td>${ch.priority} / ${ch.weight}</td>
+      <td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${esc(ch.models)}</td>
+      <td>${usd(ch.used_quota)}</td><td>${ch.response_time ? ch.response_time + 'ms' : '—'}</td>
+      <td style="white-space:nowrap"><button data-test="${ch.id}">测试</button> <button data-edit="${ch.id}">编辑</button> <button class="danger" data-del="${ch.id}">删除</button></td></tr>`)}
+  </div>`));
+
+  const form = (ch = {}) => `
+    <div class="grid">
+      <div><label>名称</label><input id="name" value="${esc(ch.name || '')}"></div>
+      <div><label>类型</label><select id="type">${meta.adaptors.map((a) => `<option value="${a.name}"${ch.type === a.name ? ' selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
+    </div>
+    <label>API Key${ch.id ? '（留空表示不修改）' : ''}</label><input id="key" placeholder="${ch.id ? esc(ch.key) : ''}">
+    <label>Base URL（留空使用默认；OpenAI 兼容厂商可选下面预设）</label>
+    <div class="row"><input id="base_url" value="${esc(ch.base_url || '')}" style="flex:1">
+      <select id="preset" style="width:150px"><option value="">预设…</option>${Object.entries(meta.presets).map(([k, v]) => `<option value="${esc(v)}">${esc(k)}</option>`).join('')}</select></div>
+    <label>模型列表（逗号分隔）</label><textarea id="models">${esc(ch.models || '')}</textarea>
+    <div class="row"><button type="button" id="fill" style="margin-top:6px">填入内置价格表中的常见模型</button></div>
+    <div class="grid">
+      <div><label>优先级（大者优先）</label><input id="priority" type="number" value="${ch.priority ?? 0}"></div>
+      <div><label>权重（同优先级内随机）</label><input id="weight" type="number" min="1" value="${ch.weight ?? 1}"></div>
+      <div><label>状态</label><select id="status"><option value="1"${ch.status === 1 ? ' selected' : ''}>启用</option><option value="2"${ch.status === 2 ? ' selected' : ''}>禁用</option></select></div>
+    </div>
+    <label>模型重定向 JSON（可选，如 {"gpt-4":"gpt-4o"}）</label><textarea id="model_mapping">${esc(ch.model_mapping || '')}</textarea>
+    <label>渠道额外配置 JSON（可选，如 {"api_version":"2024-10-21"}）</label><textarea id="config">${esc(ch.config || '')}</textarea>
+    <label>系统提示词（可选，注入到每个请求）</label><textarea id="system_prompt">${esc(ch.system_prompt || '')}</textarea>`;
+
+  const wire = (dlg) => {
+    dlg.querySelector('#preset').onchange = (e) => { if (e.target.value) dlg.querySelector('#base_url').value = e.target.value; };
+    dlg.querySelector('#fill').onclick = () => { dlg.querySelector('#models').value = meta.known_models.join(','); };
+  };
+
+  const collect = (dlg) => {
+    for (const f of ['model_mapping', 'config']) {
+      const v = val(dlg, f).trim();
+      if (v) { try { JSON.parse(v); } catch { throw new Error(`${f} 不是合法 JSON`); } }
+    }
+    return {
+      name: val(dlg, 'name'), type: val(dlg, 'type'), key: val(dlg, 'key'),
+      base_url: val(dlg, 'base_url').trim(), models: val(dlg, 'models').trim(),
+      priority: Number(val(dlg, 'priority')) || 0, weight: Number(val(dlg, 'weight')) || 1,
+      status: Number(val(dlg, 'status')),
+      model_mapping: val(dlg, 'model_mapping').trim(), config: val(dlg, 'config').trim(),
+      system_prompt: val(dlg, 'system_prompt'),
+    };
+  };
+
+  document.getElementById('new').onclick = () => {
+    const dlg = dialog('新建渠道', form(), async (d) => {
+      await api('/channels', { method: 'POST', body: collect(d) });
+      toast('渠道已创建', 'ok'); pageChannels(view);
+    });
+    wire(dlg);
+  };
+
+  view.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => {
+    const ch = rows.find((r) => r.id === Number(b.dataset.edit));
+    const dlg = dialog('编辑渠道 #' + ch.id, form(ch), async (d) => {
+      await api('/channels/' + ch.id, { method: 'PUT', body: collect(d) });
+      toast('已保存', 'ok'); pageChannels(view);
+    });
+    wire(dlg);
+  }));
+
+  view.querySelectorAll('[data-test]').forEach((b) => (b.onclick = async () => {
+    b.disabled = true; b.textContent = '测试中…';
+    try {
+      await api('/channels/' + b.dataset.test + '/test', { method: 'POST' });
+      toast('测试通过', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+    pageChannels(view);
+  }));
+
+  view.querySelectorAll('[data-del]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('确定删除该渠道？')) return;
+    await api('/channels/' + b.dataset.del, { method: 'DELETE' });
+    toast('已删除', 'ok'); pageChannels(view);
+  }));
+}
+
+// ---------------------------------------------------------------- 价格
+
+async function pagePricing(view) {
+  await loadPricing(view);
+}
+
+async function loadPricing(view) {
+  const p = await api('/pricing');
+  const builtIn = p.built_in || {};
+  const loadedOverrides = p.global_overrides || {};
+  const dp = p.default_price || {};
+  const aliases = p.alias_prefixes || [];
+
+  function mkRow(name, spec, isNew) {
+    const s = spec || {};
+    if (Object.prototype.hasOwnProperty.call(s, 'expr')) {
+      return { name, isNew, mode: 'expr', expr: String(s.expr ?? '').trim(), in: '', out: '', cached_in: '', err: '' };
+    }
+    return { name, isNew, mode: 'fixed', expr: '', in: s.in ?? '', out: s.out ?? '', cached_in: s.cached_in ?? '', err: '' };
+  }
+
+  // 本地可编辑状态：合并 built_in ∪ global_overrides；所有编辑先落在 rows，点「保存全部」才提交。
+  const rows = [...new Set([...Object.keys(builtIn), ...Object.keys(loadedOverrides)])]
+    .sort((a, b) => a.localeCompare(b))
+    .map((name) => mkRow(name, loadedOverrides[name] ?? builtIn[name], false));
+  const filter = { q: '', coveredOnly: false };
+
+  // 行当前表示的 PriceSpec。
+  function specOf(r) {
+    if (r.mode === 'expr') return { expr: (r.expr || '').trim() };
+    const spec = { in: r.in === '' ? null : Number(r.in), out: r.out === '' ? null : Number(r.out) };
+    if (r.cached_in !== '') spec.cached_in = Number(r.cached_in);
+    return spec;
+  }
+
+  function sameSpec(a, b) {
+    if (!a || !b) return false;
+    const ea = typeof a.expr === 'string', eb = typeof b.expr === 'string';
+    if (ea || eb) return ea && eb && a.expr.trim() === b.expr.trim();
+    const n = (x) => (x === undefined || x === null || x === '' ? null : Number(x));
+    return n(a.in) === n(b.in) && n(a.out) === n(b.out) && n(a.cached_in) === n(b.cached_in);
+  }
+
+  // 会作为覆盖提交的行：不在内置表，或当前值 ≠ 内置值（「恢复默认」即清除覆盖）。
+  const isOverriding = (r) => !builtIn[r.name] || !sameSpec(specOf(r), builtIn[r.name]);
+  const rowDirty = (r) => r.isNew || !sameSpec(specOf(r), loadedOverrides[r.name] ?? builtIn[r.name]);
+
+  view.replaceChildren($(`<div>
+    <div class="card">
+      <div class="row" style="margin-bottom:12px">
+        <h2 style="margin:0;flex:1">模型价格</h2>
+        <button class="primary" id="addModel">＋ 新增模型</button>
+        <input id="q" placeholder="按模型名过滤…" style="width:200px">
+        <label style="margin:0"><input type="checkbox" id="coveredOnly" style="width:auto"> 仅看已覆盖</label>
+      </div>
+      <p class="muted" style="margin:0 0 10px">生效价优先级：令牌 price_config &gt; 全局覆盖（标「已覆盖」）&gt; 内置表（标「内置」）。
+      前缀别名：${aliases.length ? aliases.map((a) => `<code>${esc(a)}</code>`).join('、') + ' —— 请求的模型名命中前缀时先剥掉前缀再查表' : '无'}。
+      内部额度：1 美元 = ${p.quota_per_usd ?? QUOTA_PER_USD} quota。保存为<b>整包替换</b>：与内置值相同的行、被删除的行都会从覆盖里清除。</p>
+      <div id="tbl"></div>
+    </div>
+
+    <div class="card"><h2>默认兜底价（未知模型）</h2>
+      <div class="row">
+        <div><label style="margin:0 0 4px">输入 $/1M</label><input id="dpIn" type="number" step="any" min="0" value="${esc(dp.in ?? '')}" style="width:140px"></div>
+        <div><label style="margin:0 0 4px">输出 $/1M</label><input id="dpOut" type="number" step="any" min="0" value="${esc(dp.out ?? '')}" style="width:140px"></div>
+      </div>
+      <p class="muted" style="margin:8px 0 0">请求的模型在内置表和覆盖里都找不到时按此价计费（仅支持固定价），随「保存全部」一起提交。</p>
+    </div>
+
+    <div class="card"><h2>表达式计费</h2>
+      <p class="muted">价格可写成表达式代替固定单价。表达式的<b>结果单位是微美元</b>，系数即美元/百万 tokens：<code>p * 2.5</code> 表示每百万输入 tokens 收 $2.50。</p>
+      <h2 style="margin-top:14px;font-size:13px">变量</h2>
+      ${table(['变量', '含义'], [['p', '输入 tokens'], ['c', '输出 tokens'], ['cr', '缓存命中 tokens'], ['len', '输入总长']],
+        ([k, v]) => `<tr><td class="mono">${k}</td><td>${v}</td></tr>`)}
+      <h2 style="margin-top:14px;font-size:13px">函数</h2>
+      ${table(['函数', '说明'], [
+        ['min max abs ceil floor', '常规数学函数'],
+        ['fixed(美元)', '按次收费，如 fixed(0.01) 表示每次请求固定收 $0.01'],
+        ['tier("档名", 值)', '把命中的档位记进日志，便于审计，不影响金额'],
+        ['hour("Asia/Shanghai") / weekday / day / month', '当前时间的时 / 星期 / 日 / 月；时区参数可省，默认 UTC'],
+      ], ([k, v]) => `<tr><td class="mono">${esc(k)}</td><td>${esc(v)}</td></tr>`)}
+      <h2 style="margin-top:14px;font-size:13px">运算符</h2>
+      <p class="mono" style="margin:4px 0 0">+ - * / %&nbsp;&nbsp;·&nbsp;&nbsp;比较 &gt; &gt;= &lt; &lt;= == !=&nbsp;&nbsp;·&nbsp;&nbsp;逻辑 &amp;&amp; || !&nbsp;&nbsp;·&nbsp;&nbsp;三目 ? :&nbsp;&nbsp;·&nbsp;&nbsp;括号</p>
+      <h2 style="margin-top:14px;font-size:13px">示例</h2>
+      <p class="mono" style="margin:4px 0">基础按量：${esc('p * 3 + c * 15 + cr * 0.3')}</p>
+      <p class="mono" style="margin:4px 0">按次收费：${esc('tier("request", fixed(0.01))')}</p>
+      <p class="mono" style="margin:4px 0">分时定价：${esc('hour("Asia/Shanghai") >= 22 || hour("Asia/Shanghai") < 6 ? p * 1 : p * 2')}</p>
+    </div>
+
+    <div class="row" style="position:sticky;bottom:0;background:var(--bg);padding:10px 0;z-index:5">
+      <button class="primary" id="saveAll">保存全部</button>
+      <span id="saveHint" class="muted"></span>
+    </div>
+  </div>`));
+
+  const tbl = document.getElementById('tbl');
+  const saveHint = document.getElementById('saveHint');
+
+  const rowHtml = (r, i) => {
+    const overriding = isOverriding(r);
+    const tag = r.isNew ? '<span class="tag" style="color:var(--accent)">新增</span>'
+      : overriding ? '<span class="tag warn">已覆盖</span>' : '<span class="tag">内置</span>';
+    const dot = rowDirty(r) ? `<span class="dot" style="color:var(--accent)" title="未保存的修改">· </span>` : '';
+    const nameCell = r.isNew
+      ? `<input data-field="name" class="mono" value="${esc(r.name)}" placeholder="新模型名">`
+      : `<span class="mono">${esc(r.name)}</span>`;
+    const priceCell = r.mode === 'expr'
+      ? `<input data-field="expr" class="mono" style="width:100%" value="${esc(r.expr)}" placeholder="p * 3 + c * 15 + cr * 0.3">${r.err ? `<div style="color:var(--err);font-size:12px;margin-top:4px">${esc(r.err)}</div>` : ''}`
+      : `<div class="row" style="flex-wrap:nowrap;gap:6px">
+          <input type="number" step="any" min="0" data-field="in" value="${esc(r.in)}" placeholder="输入" title="输入 $/1M" style="width:100px">
+          <input type="number" step="any" min="0" data-field="out" value="${esc(r.out)}" placeholder="输出" title="输出 $/1M" style="width:100px">
+          <input type="number" step="any" min="0" data-field="cached_in" value="${esc(r.cached_in)}" placeholder="缓存·可空" title="缓存命中 $/1M，留空 = 无" style="width:110px">
+        </div>${r.err ? `<div style="color:var(--err);font-size:12px;margin-top:4px">${esc(r.err)}</div>` : ''}`;
+    const act = builtIn[r.name]
+      ? (overriding ? `<button data-act="restore" data-idx="${i}">恢复默认</button>` : '<span class="muted">—</span>')
+      : `<button class="danger" data-act="delrow" data-idx="${i}">删除行</button>`;
+    return `<tr data-idx="${i}">
+      <td>${dot}${nameCell}</td>
+      <td><select data-field="mode" style="width:auto">
+        <option value="fixed"${r.mode === 'fixed' ? ' selected' : ''}>固定</option>
+        <option value="expr"${r.mode === 'expr' ? ' selected' : ''}>表达式</option></select></td>
+      <td>${priceCell}</td>
+      <td>${tag}</td>
+      <td style="white-space:nowrap">${act}</td></tr>`;
+  };
+
+  const renderRows = () => {
+    const q = filter.q.trim().toLowerCase();
+    const shown = rows.map((r, i) => ({ r, i }))
+      .filter(({ r }) => (!filter.coveredOnly || r.isNew || isOverriding(r)) && (!q || r.name.toLowerCase().includes(q)));
+    tbl.innerHTML = `<div class="scroll"><table><thead><tr>
+        <th>模型</th><th style="width:96px">类型</th><th style="min-width:360px">价格</th><th style="width:86px">状态</th><th style="width:110px">操作</th></tr></thead>
+      <tbody>${shown.length ? shown.map(({ r, i }) => rowHtml(r, i)).join('') : '<tr><td colspan="5" class="muted">无匹配行</td></tr>'}</tbody></table></div>`;
+    saveHint.textContent = `共 ${rows.length} 个模型，${rows.filter(rowDirty).length} 行未保存`;
+  };
+
+  // 只更新行首 dirty 点，不整表重渲染，避免输入框失焦。
+  const refreshDot = (tr, r) => {
+    const td = tr.firstElementChild;
+    let dot = td.querySelector('span.dot');
+    if (rowDirty(r) && !dot) {
+      dot = document.createElement('span');
+      dot.className = 'dot'; dot.style.color = 'var(--accent)'; dot.title = '未保存的修改'; dot.textContent = '· ';
+      td.prepend(dot);
+    } else if (!rowDirty(r) && dot) dot.remove();
+  };
+
+  tbl.addEventListener('input', (e) => {
+    const field = e.target.dataset.field;
+    if (!field || field === 'mode') return;
+    const tr = e.target.closest('tr');
+    const r = rows[Number(tr?.dataset.idx)];
+    if (!r) return;
+    r[field] = e.target.value;
+    r.err = '';
+    refreshDot(tr, r);
+    saveHint.textContent = `共 ${rows.length} 个模型，${rows.filter(rowDirty).length} 行未保存`;
+  });
+
+  tbl.addEventListener('change', (e) => {
+    if (e.target.dataset.field !== 'mode') return;
+    const r = rows[Number(e.target.closest('tr').dataset.idx)];
+    if (!r) return;
+    r.mode = e.target.value;
+    r.err = '';
+    renderRows();
+  });
+
+  tbl.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-act]');
+    if (!b) return;
+    const i = Number(b.dataset.idx);
+    if (b.dataset.act === 'delrow') rows.splice(i, 1);
+    else if (b.dataset.act === 'restore') Object.assign(rows[i], mkRow(rows[i].name, builtIn[rows[i].name], false));
+    renderRows();
+  });
+
+  document.getElementById('addModel').onclick = () => {
+    rows.push(mkRow('', null, true));
+    renderRows();
+    tbl.querySelector(`tr[data-idx="${rows.length - 1}"] input[data-field="name"]`)?.focus();
+  };
+  document.getElementById('q').oninput = (e) => { filter.q = e.target.value; renderRows(); };
+  document.getElementById('coveredOnly').onchange = (e) => { filter.coveredOnly = e.target.checked; renderRows(); };
+
+  document.getElementById('saveAll').onclick = async () => {
+    const overrides = {};
+    const errs = [];
+    const seen = new Set();
+    for (const r of rows) {
+      const name = (r.name || '').trim();
+      if (!name) { r.err = '模型名不能为空'; errs.push(r); continue; }
+      if (seen.has(name)) { r.err = '模型名重复'; errs.push(r); continue; }
+      seen.add(name);
+      const spec = specOf(r);
+      if (r.mode === 'expr') {
+        if (!spec.expr) { r.err = '表达式不能为空'; errs.push(r); continue; }
+      } else {
+        const bad = spec.in === null || spec.out === null || !Number.isFinite(spec.in) || !Number.isFinite(spec.out)
+          || spec.in < 0 || spec.out < 0
+          || (spec.cached_in !== undefined && (!Number.isFinite(spec.cached_in) || spec.cached_in < 0));
+        if (bad) { r.err = '输入/输出价必填且 ≥ 0'; errs.push(r); continue; }
+      }
+      r.err = '';
+      // 整包替换语义：与内置值相同的行不进 overrides（含「恢复默认」=清除覆盖）。
+      if (!builtIn[name] || !sameSpec(spec, builtIn[name])) overrides[name] = spec;
+    }
+    const dpIn = document.getElementById('dpIn').value.trim();
+    const dpOut = document.getElementById('dpOut').value.trim();
+    if (errs.length || dpIn === '' || dpOut === '' || !Number.isFinite(Number(dpIn)) || !Number.isFinite(Number(dpOut))) {
+      renderRows();
+      toast(errs.length ? '有未填完整的行，见表格内红色提示' : '默认兜底价的输入/输出为必填数字', 'err');
+      return;
+    }
+    try {
+      // 400 时后端 message 会原样出现在 toast 里（含模型名与原因）。
+      await api('/pricing/overrides', {
+        method: 'PUT',
+        body: { overrides, default_price: { in: Number(dpIn), out: Number(dpOut) } },
+      });
+      toast('价格已保存', 'ok');
+      loadPricing(view); // 保存成功后重新拉取，刷新表格与状态 tag
+    } catch (e) { toast(e.message, 'err'); }
+  };
+
+  renderRows();
+}
+
+// ---------------------------------------------------------------- 健康
+
+/*
+ * 健康页。数据来自 logs(成功) ∪ relay_events(失败)，见 lib/health.ts。
+ *
+ * 顶上那块「路由缺口」是这个页面存在的直接理由：请求了但一个渠道都匹配不上的
+ * 模型，以前只会变成一次 503 消失在空气里。
+ */
+const HEALTH_STATE = {
+  ok: ['正常', 'ok'],
+  degraded: ['降级', 'warn'],
+  down: ['故障', 'err'],
+  unknown: ['样本不足', ''],
+};
+const ms = (v) => (v ? (v >= 1000 ? (v / 1000).toFixed(1) + 's' : v + 'ms') : '—');
+const pct = (v) => (v === null || v === undefined ? '—' : (v * 100).toFixed(1) + '%');
+const stateTag = (s) => `<span class="tag ${HEALTH_STATE[s]?.[1] || ''}">${HEALTH_STATE[s]?.[0] || s}</span>`;
+
+async function pageHealth(view) {
+  await loadHealth(view);
+  autoRefresh(() => loadHealth(view));
+}
+
+async function loadHealth(view) {
+  const [ch, md, events] = await Promise.all([
+    api('/health/channels?window=60m'),
+    api('/health/models?window=24h'),
+    api('/health/events?limit=50'),
+  ]);
+
+  const worst = ['down', 'degraded', 'ok', 'unknown'].find((s) => ch.channels.some((x) => x.state === s)) || 'unknown';
+  const gaps = md.missing || [];
+
+  view.replaceChildren($(`<div>
+    <div class="stats" style="margin-bottom:16px">
+      <div class="stat"><div class="k">整体</div><div class="v">${HEALTH_STATE[worst]?.[0] || worst}</div></div>
+      <div class="stat"><div class="k">近 1 小时请求</div><div class="v">${ch.channels.reduce((n, x) => n + x.requests, 0)}</div></div>
+      <div class="stat"><div class="k">近 1 小时失败</div><div class="v">${ch.channels.reduce((n, x) => n + x.failures, 0)}</div></div>
+      <div class="stat"><div class="k">路由缺口</div><div class="v">${gaps.length}</div></div>
+    </div>
+
+    ${gaps.length ? `<div class="card" style="border-color:var(--err)">
+      <h2 style="color:var(--err)">路由缺口：有请求指向了没有渠道的模型</h2>
+      <p class="muted">这些请求直接收到 503。<b>declared=0</b> 表示没有任何渠道声明过该模型（去渠道页把模型加进「模型」列表）；<b>declared&gt;0 而 enabled=0</b> 表示声明它的渠道都被禁用了。</p>
+      ${table(['模型', '次数', '最近一次', '声明/启用'], gaps, (g) => `<tr>
+        <td class="mono">${esc(g.model_name || '(空)')}</td>
+        <td>${g.n}</td><td>${ts(g.last_at)}</td>
+        <td>${g.declared} / ${g.enabled}</td></tr>`)}
+    </div>` : ''}
+
+    <div class="card"><h2>渠道（近 1 小时）</h2>
+      ${table(['ID', '名称', '类型', '状态', '请求', '成功率', 'p50', 'p95', '冷却', '最近错误'], ch.channels, (x) => `<tr>
+        <td>${x.id}</td><td>${esc(x.name)}</td><td class="mono">${esc(x.type)}</td>
+        <td>${stateTag(x.state)}</td>
+        <td>${x.requests}${x.attempts_failed > x.failures ? ` <span class="muted">(+${x.attempts_failed - x.failures} 重试)</span>` : ''}</td>
+        <td>${pct(x.success_rate)}</td><td>${ms(x.p50_ms)}</td><td>${ms(x.p95_ms)}</td>
+        <td>${x.cooldown.cooling ? `<span class="tag warn">${x.cooldown.secondsLeft}s</span>` : '—'}</td>
+        <td class="mono" style="max-width:320px;overflow:hidden;text-overflow:ellipsis">${x.last_error ? esc((x.last_error.status || '') + ' ' + (x.last_error.text || '').slice(0, 120)) : '—'}</td>
+        </tr>`)}
+      <p class="muted" style="margin:10px 0 0">成功率的分母只算「最终结果」：中途重试掉的那几次单独记在括号里。样本少于 5 时不下结论。</p>
+    </div>
+
+    <div class="card"><h2>模型（近 24 小时）</h2>
+      ${table(['模型', '状态', '请求', '成功', '失败', '成功率'], md.models, (m) => `<tr>
+        <td class="mono">${esc(m.model)}</td><td>${stateTag(m.state)}</td>
+        <td>${m.requests}</td><td>${m.successes}</td><td>${m.failures}</td><td>${pct(m.success_rate)}</td></tr>`)}
+    </div>
+
+    <div class="card"><h2>最近失败事件</h2>
+      ${table(['时间', '阶段', '状态码', '模型', '渠道', '最终', '耗时', '报文'], events, (e) => `<tr>
+        <td>${ts(e.created_at)}</td><td class="mono">${esc(e.stage)}</td><td>${e.status || '—'}</td>
+        <td class="mono">${esc(e.model_name || '—')}</td><td>${e.channel_id || '—'}</td>
+        <td>${e.final ? '是' : ''}</td><td>${ms(e.elapsed_ms)}</td>
+        <td class="mono" style="max-width:420px;overflow:hidden;text-overflow:ellipsis">${esc(e.error_text || e.error_code || '')}</td></tr>`)}
+    </div>
+  </div>`));
+}
+
+// ---------------------------------------------------------------- 日志
+
+async function pageLogs(view) {
+  const rows = await api('/logs?limit=200');
+  const TYPE = { 1: '充值', 2: '消费', 3: '管理', 4: '系统' };
+
+  view.replaceChildren($(`<div class="card">
+    <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">日志</h2><span class="muted">全站视角 · 最近 200 条</span></div>
+    ${table(['时间', '类型', '用户', '令牌', '模型', '输入', '输出', '耗时', '消耗', '详情'], rows, (l) => `<tr>
+      <td>${ts(l.created_at)}</td><td>${TYPE[l.type] || l.type}</td><td>${esc(l.username)}</td><td>${esc(l.token_name)}</td>
+      <td class="mono">${esc(l.model_name)}</td><td>${l.prompt_tokens}</td><td>${l.completion_tokens}</td>
+      <td>${l.elapsed_ms ? l.elapsed_ms + 'ms' : '—'}</td><td>${usd(l.quota)}</td>
+      <td class="muted" style="max-width:280px">${esc(l.content)}</td></tr>`)}
+  </div>`));
+}
+
+// ---------------------------------------------------------------- 终端
+
+async function pageTerminal(view) {
+  view.replaceChildren($(`<div class="card">
+    <h2>终端</h2>
+    <p class="muted" style="margin-bottom:6px">终端里的命令与 REST 完全等价（同一套库函数），也可以在真终端里用 curl 调：</p>
+    <p class="mono" style="white-space:pre-wrap;word-break:break-all;margin:0 0 12px">curl -X POST ${esc(location.origin)}/api/cli -H "Authorization: Bearer &lt;管理令牌&gt;" -H "Content-Type: application/json" -d '{"command":"status"}'</p>
+    <div class="term">
+      <div class="term-out" id="termOut"><div class="term-hint">输入 help 查看可用命令。</div></div>
+      <div class="term-in"><span class="ps">oneapi&gt;&nbsp;</span><input id="termIn" autocomplete="off" spellcheck="false"></div>
+    </div>
+  </div>`));
+
+  const out = document.getElementById('termOut');
+  const input = document.getElementById('termIn');
+  const hist = [];   // 本页输入历史，仅存内存
+  let histPos = -1;  // -1 = 不在历史中；↑ 从末尾往前翻，↓ 翻过开头回到空行
+
+  const append = (text, cls = '') => {
+    const el = document.createElement('div');
+    if (cls) el.className = cls;
+    el.textContent = text; // 纯文本追加，不做 HTML 渲染
+    out.append(el);
+    out.scrollTop = out.scrollHeight;
+  };
+
+  const run = async (line) => {
+    append(`oneapi> ${line}`);
+    if (line === 'clear') { out.replaceChildren(); return; } // 本地清屏，不发给后端
+    try {
+      const r = await api('/cli', { method: 'POST', body: { command: line } });
+      append(r?.output ?? '', r?.ok === false ? 'term-err' : '');
+    } catch (e) {
+      append(e.message || String(e), 'term-err'); // 网络/401 等异常也进输出区
+    }
+  };
+
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') {
+      const line = input.value.trim();
+      input.value = '';
+      histPos = -1;
+      if (!line) return;
+      hist.push(line);
+      run(line);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!hist.length) return;
+      histPos = histPos === -1 ? hist.length - 1 : Math.max(0, histPos - 1);
+      input.value = hist[histPos];
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (histPos === -1) return;
+      histPos += 1;
+      if (histPos >= hist.length) { histPos = -1; input.value = ''; }
+      else input.value = hist[histPos];
+    }
+  };
+
+  input.focus();
+}
+
+// ---------------------------------------------------------------- 设置
+
+async function pageSettings(view) {
+  const opts = await api('/options');
+  const cur = opts.current || {}, defs = opts.defaults || {};
+
+  view.replaceChildren($(`<div>
+    <div class="card"><h2>系统设置</h2>
+      <label>站点名称</label><input id="SystemName" value="${esc(cur.SystemName)}">
+      <div class="grid">
+        <div><label>预扣额度下限（quota）</label><input id="PreConsumedQuota" type="number" value="${cur.PreConsumedQuota ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.PreConsumedQuota ?? '—')}</p></div>
+        <div><label>失败重试次数</label><input id="RetryTimes" type="number" min="0" max="10" value="${cur.RetryTimes ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.RetryTimes ?? '—')}</p></div>
+        <div><label>渠道冷却基数（秒）</label><input id="ChannelCooldownBaseSec" type="number" min="0" value="${cur.ChannelCooldownBaseSec ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.ChannelCooldownBaseSec ?? '—')}</p></div>
+        <div><label>渠道冷却上限（秒）</label><input id="ChannelCooldownMaxSec" type="number" min="0" value="${cur.ChannelCooldownMaxSec ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.ChannelCooldownMaxSec ?? '—')}</p></div>
+      </div>
+      <label><input type="checkbox" id="HealthEventsEnabled" style="width:auto" ${cur.HealthEventsEnabled ? 'checked' : ''}> 记录健康事件（失败请求写入 relay_events，供健康页统计）</label>
+      <label>仅决策接口的模型（JSON 数组，如 ["~typesafe/jev-latest"]）</label>
+      <textarea id="DecisionOnlyModels">${esc(JSON.stringify(cur.DecisionOnlyModels ?? [], null, 2))}</textarea>
+      <p class="muted" style="margin:4px 0 0">列在这里的模型不会出现在 <code>/v1/models</code>，发去 <code>/v1/chat/completions</code> 会被明确拒绝，只能走 <code>POST /v1/decisions</code>。内置规则已覆盖 Jev，这里<b>只能追加</b>。</p>
+      <div style="margin-top:12px"><button class="primary" id="saveOpts">保存系统设置</button></div>
+    </div>
+    <div class="card"><h2>自检</h2>
+      <div class="row"><button id="runWd">运行自检</button><span class="muted">执行一次 watchdog 检查，结果显示在下方（原始 JSON）。</span></div>
+      <pre id="wdOut" class="mono" style="white-space:pre-wrap;margin:10px 0 0"></pre>
+    </div>
+  </div>`));
+
+  document.getElementById('saveOpts').onclick = async () => {
+    try {
+      const body = {
+        SystemName: val(document, 'SystemName'),
+        PreConsumedQuota: num(val(document, 'PreConsumedQuota')),
+        RetryTimes: num(val(document, 'RetryTimes')),
+        ChannelCooldownBaseSec: num(val(document, 'ChannelCooldownBaseSec')),
+        ChannelCooldownMaxSec: num(val(document, 'ChannelCooldownMaxSec')),
+        HealthEventsEnabled: document.getElementById('HealthEventsEnabled').checked,
+        DecisionOnlyModels: JSON.parse(val(document, 'DecisionOnlyModels') || '[]'),
+      };
+      await api('/options', { method: 'PUT', body });
+      state.status = await api('/status');
+      toast('已保存', 'ok'); render();
+    } catch (e) { toast(e.message, 'err'); }
+  };
+
+  document.getElementById('runWd').onclick = async () => {
+    const out = document.getElementById('wdOut');
+    try {
+      out.textContent = '运行中…';
+      const r = await api('/watchdog/run', { method: 'POST' });
+      out.textContent = JSON.stringify(r, null, 2);
+    } catch (e) { out.textContent = ''; toast(e.message, 'err'); }
+  };
+}
+
+boot();
+</script>
+</body>
+</html>

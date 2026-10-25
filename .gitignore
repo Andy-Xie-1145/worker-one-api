@@ -1,0 +1,17 @@
+node_modules/
+dist/
+build/
+target/
+.worktrees/
+.DS_Store
+
+.wrangler/
+node_modules/.cache/
+
+# 本地 secret，绝不入库
+.dev.vars
+.dev.vars.*
+
+# AI Studio 本地运行状态
+.ai-studio/
+.npm-cache/

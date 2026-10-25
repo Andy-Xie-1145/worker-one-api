@@ -1,0 +1,36 @@
+{
+  "name": "oneapi-workers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute oneapi --remote --file=./migrations/0001_init.sql",
+    "db:init:local": "wrangler d1 execute oneapi --local --file=./migrations/0001_init.sql",
+    "typecheck": "tsc --noEmit",
+    "test": "esbuild test/stream.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test.mjs --log-level=error && node node_modules/.cache/test.mjs && npm run test:expr && npm run test:pricing && npm run test:responses && npm run test:gemini && npm run test:cli && npm run test:cooldown && npm run test:health && npm run test:decisions && npm run test:auto-disable && npm run test:403-fallback && npm run test:route-alert && npm run test:query-plan",
+    "test:d1": "bash test/d1-guard.sh",
+    "db:migrate": "for f in migrations/*.sql; do npx wrangler d1 execute oneapi --remote -y --file=$f; done",
+    "test:expr": "esbuild test/expr.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/expr.mjs --log-level=error && node node_modules/.cache/expr.mjs",
+    "test:health": "esbuild test/health.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/health.mjs --log-level=error && node node_modules/.cache/health.mjs",
+    "test:pricing": "esbuild test/pricing.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/pricing.mjs --log-level=error && node node_modules/.cache/pricing.mjs",
+    "test:responses": "esbuild test/responses.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/responses.mjs --log-level=error && node node_modules/.cache/responses.mjs",
+    "test:gemini": "esbuild test/gemini-inbound.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/gemini.mjs --log-level=error && node node_modules/.cache/gemini.mjs",
+    "test:cli": "esbuild test/cli.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/cli.mjs --log-level=error && node node_modules/.cache/cli.mjs",
+    "test:cooldown": "esbuild test/cooldown.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/cooldown.mjs --log-level=error && node node_modules/.cache/cooldown.mjs",
+    "test:decisions": "esbuild test/decisions.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/decisions.mjs --log-level=error && node node_modules/.cache/decisions.mjs",
+    "test:auto-disable": "esbuild test/auto-disable.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/auto-disable.mjs --log-level=error && node node_modules/.cache/auto-disable.mjs",
+    "test:403-fallback": "esbuild test/403-fallback.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/403-fallback.mjs --log-level=error && node node_modules/.cache/403-fallback.mjs",
+    "test:route-alert": "esbuild test/route-alert.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/route-alert.mjs --log-level=error && node node_modules/.cache/route-alert.mjs",
+    "test:query-plan": "esbuild test/query-plan.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/query-plan.mjs --log-level=error && node --no-warnings node_modules/.cache/query-plan.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260820.1",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.125.0"
+  }
+}

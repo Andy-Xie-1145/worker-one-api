@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service Status</title>
+<!--
+  公开状态页。**无鉴权**，全世界可见。
+
+  它只吃 /api/status/public 的输出，那个接口只回引擎名和状态枚举——渠道、模型 id、
+  上游报文都在管理面后面。这里也刻意不写任何 fetch 之外的逻辑：页面越薄，越不容易
+  在某次改动里不小心把排障信息漏到公网上。
+
+  文案两套，跟随浏览器语言，默认英文——用户遍布全球（日志里就有 Accept-Language: ar
+  的真实用户），只写中文等于对多数人没显示。
+-->
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#fff; --border:#e3e6ea; --text:#1b1f24; --muted:#6b7480;
+  --accent:#2f6feb; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e;
+  --radius:10px; --shadow:0 1px 2px rgba(0,0,0,.05),0 4px 14px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0d1117; --panel:#161b22; --border:#2a313a; --text:#e6edf3; --muted:#8b949e;
+  --accent:#3b82f6; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  --shadow:0 1px 2px rgba(0,0,0,.4);
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:32px 20px 60px}
+header{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+h1{font-size:19px;margin:0;font-weight:600;flex:1}
+button{font:inherit;cursor:pointer;border:1px solid var(--border);background:var(--panel);color:var(--muted);padding:4px 10px;border-radius:8px}
+button:hover{border-color:var(--accent)}
+.banner{background:var(--panel);border:1px solid var(--border);border-left:4px solid var(--muted);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow);margin-bottom:18px}
+.banner.ok{border-left-color:var(--ok)} .banner.degraded{border-left-color:var(--warn)} .banner.down{border-left-color:var(--err)}
+.banner .h{font-size:18px;font-weight:600}
+.banner .s{color:var(--muted);font-size:12.5px;margin-top:3px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.eng{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border)}
+.eng:last-child{border-bottom:none}
+.eng .name{flex:1;font-weight:500}
+.eng .meta{color:var(--muted);font-size:12px;text-align:right;min-width:120px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
+.dot.ok{background:var(--ok)} .dot.degraded{background:var(--warn)} .dot.down{background:var(--err)}
+.tag{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11.5px;border:1px solid currentColor}
+.tag.ok{color:var(--ok)} .tag.degraded{color:var(--warn)} .tag.down{color:var(--err)} .tag.unknown{color:var(--muted);border-color:var(--border)}
+.hist{display:flex;gap:2px;margin-top:16px}
+.hist i{flex:1;height:26px;border-radius:2px;background:var(--border)}
+.hist i.ok{background:var(--ok)} .hist i.degraded{background:var(--warn)} .hist i.down{background:var(--err)}
+.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:10px}
+.muted{color:var(--muted);font-size:12.5px;margin-top:18px}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1 id="title">Service Status</h1>
+    <button id="lang"></button>
+  </header>
+  <div id="app"><p class="muted">…</p></div>
+</div>
+
+<script>
+const I18N = {
+  en: {
+    title: 'Service Status', switch: '中文',
+    ok: 'Operational', degraded: 'Degraded', down: 'Outage', unknown: 'No data',
+    allOk: 'All translation engines are operating normally',
+    someDegraded: 'Some translation engines are degraded',
+    someDown: 'Translation engines are experiencing an outage',
+    noData: 'Not enough recent traffic to report a status',
+    latency_fast: 'fast', latency_normal: 'normal', latency_slow: 'slow', latency_unknown: '',
+    success: 'success', samples: 'requests', last24h: 'Past 24 hours', now: 'now',
+    window: (m) => `Based on the past ${m} minutes.`,
+    updated: (t) => `Updated ${t}`,
+    insufficient: 'Fewer than 5 requests in the window — no status is inferred rather than guessing from a tiny sample.',
+  },
+  zh: {
+    title: '服务状态', switch: 'EN',
+    ok: '正常', degraded: '降级', down: '故障', unknown: '暂无数据',
+    allOk: '所有翻译引擎运行正常',
+    someDegraded: '部分翻译引擎处于降级状态',
+    someDown: '翻译引擎出现故障',
+    noData: '近期流量不足，无法判断状态',
+    latency_fast: '快', latency_normal: '正常', latency_slow: '较慢', latency_unknown: '',
+    success: '成功率', samples: '请求', last24h: '过去 24 小时', now: '现在',
+    window: (m) => `基于最近 ${m} 分钟的数据。`,
+    updated: (t) => `更新于 ${t}`,
+    insufficient: '窗口内请求少于 5 次时不下结论——样本太小时猜出来的状态没有意义。',
+  },
+};
+
+/* 语言选择：显式 ?lang= > 上次的选择 > 浏览器 > 英文兜底 */
+const params = new URLSearchParams(location.search);
+let lang = params.get('lang') || localStorage.getItem('statusLang')
+  || ((navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+if (!I18N[lang]) lang = 'en';
+
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const app = document.getElementById('app');
+let latest = null;
+
+document.getElementById('lang').onclick = () => {
+  lang = lang === 'zh' ? 'en' : 'zh';
+  localStorage.setItem('statusLang', lang);
+  render();
+};
+
+function render() {
+  const t = I18N[lang];
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  document.title = t.title;
+  document.getElementById('title').textContent = t.title;
+  document.getElementById('lang').textContent = t.switch;
+  if (!latest) return;
+
+  const d = latest;
+  const headline = d.overall === 'ok' ? t.allOk : d.overall === 'degraded' ? t.someDegraded : d.overall === 'down' ? t.someDown : t.noData;
+  const anyUnknown = d.engines.some((e) => e.state === 'unknown');
+
+  app.innerHTML = `
+    <div class="banner ${esc(d.overall)}">
+      <div class="h">${esc(headline)}</div>
+      <div class="s">${esc(t.window(d.window_minutes))}</div>
+    </div>
+
+    <div class="card">
+      ${d.engines.length ? d.engines.map((e) => `
+        <div class="eng">
+          <span class="dot ${esc(e.state)}"></span>
+          <span class="name">${esc(e.label)}</span>
+          <span class="meta">${e.state === 'unknown' ? '' :
+            `${(e.success_rate * 100).toFixed(1)}% ${esc(t.success)} · ${e.samples} ${esc(t.samples)}` +
+            (t['latency_' + e.latency] ? ` · ${esc(t['latency_' + e.latency])}` : '')}</span>
+          <span class="tag ${esc(e.state)}">${esc(t[e.state])}</span>
+        </div>`).join('') : `<div class="eng"><span class="name muted">${esc(t.noData)}</span></div>`}
+    </div>
+
+    <div class="hist">${d.history.map((h) => `<i class="${esc(h.state)}" title="${esc(h.hour)}"></i>`).join('')}</div>
+    <div class="foot"><span>${esc(t.last24h)}</span><span>${esc(t.now)}</span></div>
+    ${anyUnknown ? `<p class="muted">${esc(t.insufficient)}</p>` : ''}
+    <p class="muted">${esc(t.updated(new Date(d.generated_at * 1000).toLocaleString()))}</p>`;
+}
+
+async function load() {
+  try {
+    const res = await fetch('/api/status/public');
+    const json = await res.json();
+    if (json.success) { latest = json.data; render(); }
+  } catch { /* 拉不到就保持上一次的画面，状态页自己不该变成一个错误页 */ }
+}
+
+render();
+load();
+// 后台标签页不发请求：状态页经常被开着放一整天
+setInterval(() => { if (!document.hidden) load(); }, 60000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+</script>
+</html>

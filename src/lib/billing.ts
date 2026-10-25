@@ -1,0 +1,146 @@
+import { type Env, type TokenRow, type UserRow, LogTypeConsume, TokenStatusExhausted } from '../types';
+import { invalidateTokenCache } from './auth';
+import { calcQuotaDetailed, quotaToUSD } from './pricing';
+import { applyCredit } from './ledger';
+import type { Options } from './options';
+import type { PriceSpec } from './pricing/llm';
+
+export interface Usage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens?: number;
+  /** Subset of prompt_tokens served from the vendor's prompt cache, when reported. */
+  cached_tokens?: number;
+}
+
+/**
+ * Reserves an estimated charge before the upstream call.
+ *
+ * The reservation is what makes concurrency safe: the balance is checked and
+ * debited by a single guarded statement inside applyCredit(), so N simultaneous
+ * requests cannot each see the same balance and each spend it.
+ *
+ * `tokens.remain_quota` is a per-token spending cap, not money — the money is
+ * `users.quota`. Only the latter is guarded; a token cap can overshoot slightly
+ * under concurrency, which costs nothing and keeps this to one guarded write.
+ */
+export async function preConsume(
+  env: Env,
+  token: TokenRow,
+  user: UserRow,
+  amount: number,
+  /**
+   * 这笔预留的账本标识（`pre:<tokenId>:<uuid>`）。
+   *
+   * 它不是为了幂等——uuid 按构造不会重复——而是为了**事后能找回没结算的预留**：
+   * 客户端半路断开时整个请求会被运行时拆掉，postConsume 和 refund 都没机会跑，
+   * 那笔预扣就永远挂在账上。有了这个 ref，回收器才能把它认出来退回去
+   * （lib/watchdog.ts 的 reclaimAbandonedReservations）。
+   */
+  ref?: string,
+): Promise<{ ok: boolean; message?: string }> {
+  if (amount <= 0) return { ok: true };
+
+  // Cheap early rejection off the (possibly stale) cached token row. The
+  // authoritative check is the guarded UPDATE below; this only avoids the
+  // round trip for tokens that are obviously exhausted.
+  if (!token.unlimited_quota && token.remain_quota < amount) {
+    return { ok: false, message: '令牌额度不足' };
+  }
+
+  const also = [env.DB.prepare('UPDATE users SET request_count = request_count + 1 WHERE id = ?').bind(user.id)];
+  if (!token.unlimited_quota) {
+    also.push(env.DB.prepare('UPDATE tokens SET remain_quota = remain_quota - ? WHERE id = ?').bind(amount, token.id));
+  }
+
+  // assumeNew：ref 是刚生成的 uuid，不可能撞车，省掉热路径上那次去重查询。
+  const result = await applyCredit(env, { userId: user.id, delta: -amount, reason: 'consume', guard: true, also, ref, assumeNew: true });
+  await invalidateTokenCache(env, token.key);
+
+  if (!result.ok) {
+    return { ok: false, message: result.reason === 'insufficient' ? '用户额度不足' : '用户不存在' };
+  }
+  return { ok: true };
+}
+
+/** Settles the difference between the reservation and real usage, and writes the log row. */
+export async function postConsume(
+  env: Env,
+  args: {
+    token: TokenRow;
+    user: UserRow;
+    channelId: number;
+    modelName: string;
+    /** model_mapping 之后的真实模型名。请求名没定价时按它查价，见 pricing/llm.ts 的 resolvePrice。 */
+    upstreamModel?: string;
+    usage: Usage;
+    preConsumed: number;
+    options: Options;
+    /** 这个 Key 的按模型价格配置（tokens.price_config 解析结果），结算必须和预扣用同一份。 */
+    keyOverrides?: Record<string, PriceSpec>;
+    elapsedMs: number;
+    content?: string;
+    /**
+     * 结算标识（`fin:<tokenId>:<uuid>`，与预留的 ref 同一个后缀）。
+     *
+     * `credits.ref` 上的唯一索引让它同时成为**互斥令牌**：结算和回收器的退款抢同
+     * 一个 ref，谁先写谁赢，晚到的被当成重复跳过。所以一笔预留不可能既被退掉又被
+     * 扣掉——这正是回收器敢在 15 分钟后无条件退款的前提。
+     */
+    settleRef?: string;
+  },
+): Promise<number> {
+  const { token, user, channelId, modelName, usage, preConsumed, options, elapsedMs } = args;
+  const detail = calcQuotaDetailed(modelName, usage, options, args.upstreamModel, args.keyOverrides);
+  const quota = detail.quota;
+  const delta = quota - preConsumed;
+  const now = Math.floor(Date.now() / 1000);
+
+  const pricePart =
+    detail.trace?.billingUnit === 'request' && detail.trace.fixedPrice !== undefined
+      ? `，按次计费 $${detail.trace.fixedPrice}`
+      : detail.trace?.matchedTier
+        ? `，计费档「${detail.trace.matchedTier}」`
+        : '';
+  const content =
+    args.content ??
+    `输入 ${usage.prompt_tokens} tokens${usage.cached_tokens ? `（缓存命中 ${usage.cached_tokens}）` : ''}，` +
+      `输出 ${usage.completion_tokens} tokens${pricePart}，消耗 $${quotaToUSD(quota).toFixed(6)}`;
+
+  const also: D1PreparedStatement[] = [
+    env.DB.prepare('UPDATE users SET used_quota = used_quota + ? WHERE id = ?').bind(quota, user.id),
+    env.DB.prepare('UPDATE tokens SET used_quota = used_quota + ?, accessed_time = ? WHERE id = ?').bind(quota, now, token.id),
+    env.DB.prepare('UPDATE channels SET used_quota = used_quota + ? WHERE id = ?').bind(quota, channelId),
+    env.DB.prepare(
+      `INSERT INTO logs (user_id, created_at, type, content, username, token_name, model_name, quota, prompt_tokens, completion_tokens, channel_id, elapsed_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(user.id, now, LogTypeConsume, content, user.username, token.name, modelName, quota, usage.prompt_tokens, usage.completion_tokens, channelId, elapsedMs),
+  ];
+  if (delta !== 0 && !token.unlimited_quota) {
+    also.push(env.DB.prepare('UPDATE tokens SET remain_quota = remain_quota - ? WHERE id = ?').bind(delta, token.id));
+  }
+
+  // Unguarded on purpose: the response was already delivered, so the charge has
+  // to land even when the real usage overran the reservation and overdraws the
+  // balance. Blocking here would mean giving the call away for free.
+  const settled = await applyCredit(env, { userId: user.id, delta: -delta, reason: 'consume', guard: false, also, ref: args.settleRef });
+  // 回收器已经把这笔预留退掉了（迟到的结算）。钱和日志都不再写，否则会双重记账。
+  if ('duplicate' in settled && settled.duplicate) return 0;
+  await invalidateTokenCache(env, token.key);
+
+  if (!token.unlimited_quota) {
+    await env.DB.prepare('UPDATE tokens SET status = ? WHERE id = ? AND remain_quota <= 0').bind(TokenStatusExhausted, token.id).run();
+  }
+  return quota;
+}
+
+/** Returns a reservation when the upstream call failed outright. */
+export async function refund(env: Env, token: TokenRow, user: UserRow, amount: number, ref?: string): Promise<void> {
+  if (amount <= 0) return;
+  const also = token.unlimited_quota
+    ? []
+    : [env.DB.prepare('UPDATE tokens SET remain_quota = remain_quota + ? WHERE id = ?').bind(amount, token.id)];
+  // 用结算 ref 退款：和 postConsume 抢同一个唯一键，退过就扣不成、扣过就退不了。
+  await applyCredit(env, { userId: user.id, delta: amount, reason: 'refund', also, ref });
+  await invalidateTokenCache(env, token.key);
+}

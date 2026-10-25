@@ -40,12 +40,30 @@ export const PRICE_TABLE: Record<string, Price> = {
   'gpt-3.5-turbo': { in: 0.5, out: 1.5 },
   'gpt-5-mini': { in: 0.25, out: 2 },
   'gpt-5': { in: 1.25, out: 10 },
+
+  // GPT-6 家族——官方 standard（短上下文 ≤272K 输入）档，2026-10 核对
+  // https://developers.openai.com/api/docs/pricing 。长上下文（>272K 输入：
+  // 输入 2 倍、输出 1.5 倍）要用就写表达式：
+  //   {"expr": "len <= 272000 ? p * 10 + c * 50 : p * 20 + c * 75"}
+  'gpt-6-astra': { in: 10, out: 50, cached_in: 1 },
+  'gpt-6.1-sol': { in: 2, out: 10, cached_in: 0.1 },
+  'gpt-6-sol': { in: 2, out: 10, cached_in: 0.2 },
+  'gpt-6-luna': { in: 0.1, out: 0.5, cached_in: 0.01 },
+
   'o4-mini': { in: 1.1, out: 4.4 },
   'o3-mini': { in: 1.1, out: 4.4 },
   o3: { in: 2, out: 8 },
   o1: { in: 15, out: 60 },
   'text-embedding-3-large': { in: 0.13, out: 0 },
   'text-embedding-3-small': { in: 0.02, out: 0 },
+
+  // 生图模型——token 计费（Images API 响应自带 usage，按实际 token 结算）。
+  // 官方：文本输入 $5 / 缓存 $1.25 / 图像输出 $30；图像输入（编辑/参考图）$8，
+  // 混在 `in` 里按文本价 $5 计——重编辑工作流想要精确就用表达式覆盖。
+  // gpt-image-1 已于 2026-10-23 退役，不收录。
+  'gpt-image-2': { in: 5, out: 30, cached_in: 1.25 },
+  'gpt-image-2.5-flare': { in: 5, out: 30, cached_in: 1.25 },
+  'gpt-image-2.5-sunburst': { in: 5, out: 30, cached_in: 1.25 },
 
   // Anthropic
   'claude-3-haiku': { in: 0.25, out: 1.25 },

@@ -158,6 +158,21 @@ test('pricing: longest-prefix match and quota arithmetic, no ratios anywhere', (
   assert.equal(resolvePrice('some-unknown-model').source, 'default');
 });
 
+test('pricing: GPT-6 家族与生图模型按官方 standard 档计价', () => {
+  // 2026-10 官方定价页：astra $10/$50，6.1-sol $2/$10，luna $0.10/$0.50。
+  assert.deepEqual(resolvePrice('gpt-6-astra').spec, { in: 10, out: 50, cached_in: 1 });
+  assert.deepEqual(resolvePrice('gpt-6.1-sol').spec, { in: 2, out: 10, cached_in: 0.1 });
+  assert.deepEqual(resolvePrice('gpt-6-luna').spec, { in: 0.1, out: 0.5, cached_in: 0.01 });
+  // gpt-6-sol 是 6.1 的前代：in/out 同价，缓存 $0.20（6.1 降到 $0.10）。
+  assert.deepEqual(resolvePrice('gpt-6-sol').spec, { in: 2, out: 10, cached_in: 0.2 });
+  // 长前缀优先：gpt-image-2.5-flare 不得命中 gpt-image-2 的条目（同价，但匹配必须正确）。
+  assert.deepEqual(resolvePrice('gpt-image-2.5-flare').spec, { in: 5, out: 30, cached_in: 1.25 });
+  assert.deepEqual(resolvePrice('gpt-image-2.5-sunburst').spec, { in: 5, out: 30, cached_in: 1.25 });
+  assert.deepEqual(resolvePrice('gpt-image-2').spec, { in: 5, out: 30, cached_in: 1.25 });
+  // 1M 输入 + 1M 输出的 astra = $60 = 30_000_000 quota。
+  assert.equal(calcQuota('gpt-6-astra', { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }), 30_000_000);
+});
+
 // ---------------------------------------------------------------- DeepSeek
 
 test('deepseek: model line-up is priced, legacy V3 aliases are not guessed at', () => {

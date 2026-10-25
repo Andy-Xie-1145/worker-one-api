@@ -503,7 +503,19 @@ async function handleRelay(
     const message = typeof (lastError?.body as any)?.error?.message === 'string' ? (lastError!.body as any).error.message : '上游渠道全部失败';
     return c.json(anthropicError(message, 'api_error'), (lastError?.status ?? 502) as any);
   }
-  return c.json(lastError?.body ?? errorBody('上游渠道全部失败', 'upstream_error'), (lastError?.status ?? 502) as any);
+  // 错误信息统一过滤：只透传上游 error.message（可读原因），丢弃响应体其余字段——
+  // 防止上游在错误里意外回显密钥、请求体等敏感内容（审计建议）。
+  const safe = lastError ? clientSafeErrorBody(lastError.body, lastError.status) : errorBody('上游渠道全部失败', 'upstream_error');
+  return c.json(safe, (lastError?.status ?? 502) as any);
+}
+
+/** 上游错误体 → 客户端安全的错误形状：只保留 message/type/code，其余一律丢弃。 */
+function clientSafeErrorBody(body: unknown, status: number) {
+  const err = (body as any)?.error;
+  const message = typeof err?.message === 'string' && err.message ? err.message.slice(0, 2000) : `上游返回 ${status}`;
+  const type = typeof err?.type === 'string' && err.type ? err.type : 'upstream_error';
+  const code = typeof err?.code === 'string' ? err.code : typeof err?.code === 'number' ? String(err.code) : null;
+  return errorBody(message, type, code);
 }
 
 interface AttemptArgs {

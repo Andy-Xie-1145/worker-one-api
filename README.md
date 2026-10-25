@@ -122,12 +122,16 @@ watchdog [run]            查看自检心跳 / 立即跑一次自检
 # 渠道（类型：openai | openai-responses | anthropic | gemini | azure）
 channel list                                        渠道列表
 channel add <类型> <名称> <base_url> <key> --models m1,m2 [--priority N] [--weight N]
+channel set <id> name=... type=... base_url=... key=... models=a,b priority=N weight=N status=1
+                                                    按字段修改（改 models 自动重建路由索引）
 channel show <id>                                   详情（密钥打码）
 channel on <id> / off <id> / del <id>               启用 / 停用 / 删除
 
 # 令牌
 token list                                          令牌列表
 token new <名称> [--usd N | --unlimited] [--models a,b] [--price JSON]
+token set <id> name=... models=a,b usd=N unlimited=1|0 status=1|2 expired=<unix>
+                                                    按字段修改（价格用 token price）
 token key <id>                                      显示完整密钥
 token on <id> / off <id> / del <id>                 启用 / 停用 / 删除
 token price <id> [JSON | --clear]                   该 Key 的按模型价格（JSON 同全局覆盖形状）

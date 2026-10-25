@@ -186,6 +186,36 @@ test('未知命令给出指引', async () => {
   assert.match(r.output, /help/);
 });
 
+test('channel set：按字段修改并重建路由索引', async () => {
+  const env = envOf();
+  const added = await run(env, 'channel add openai ds https://api.deepseek.com sk-ds --models deepseek-v4-flash');
+  const id = /#(\d+)/.exec(added.output)![1];
+  const renamed = await run(env, `channel set ${id} name=主力 models=gpt-4o,claude-sonnet-5-5 priority=5`);
+  assert.ok(renamed.ok, renamed.output);
+  assert.match(renamed.output, /gpt-4o,claude-sonnet-5-5/);
+  const models = await run(env, 'models');
+  assert.match(models.output, /gpt-4o/);
+  assert.ok(!models.output.includes('deepseek-v4-flash'), '旧模型应随路由索引重建消失');
+  const bad = await run(env, `channel set ${id} type=nonsense`);
+  assert.ok(!bad.ok && /非法/.test(bad.output));
+  const unknown = await run(env, `channel set ${id} nonsense=1`);
+  assert.ok(!unknown.ok && /不可修改的字段/.test(unknown.output));
+});
+
+test('token set：改名/改额度/改模型限制；价格要走专门子命令', async () => {
+  const env = envOf();
+  await run(env, 'token new 测试');
+  const id = /^\s*(\d+)\s/m.exec((await run(env, 'token list')).output)![1];
+  const renamed = await run(env, `token set ${id} name=笔记本 models=gpt-4o usd=12.5 unlimited=0`);
+  assert.ok(renamed.ok, renamed.output);
+  assert.match(renamed.output, /笔记本/);
+  assert.match(renamed.output, /\$12\.5000/);
+  const list = await run(env, 'token list');
+  assert.match(list.output, /gpt-4o/);
+  const bad = await run(env, `token set ${id} price={"m":{"in":1}}`);
+  assert.ok(!bad.ok && /不可修改的字段/.test(bad.output));
+});
+
 // ---------------------------------------------------------------- runner
 
 let failed = 0;

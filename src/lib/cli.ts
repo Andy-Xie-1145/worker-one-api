@@ -11,6 +11,31 @@ import {
 } from './pricing/llm';
 import { TokenStatusEnabled, TokenStatusDisabled, ChannelStatusEnabled, ChannelStatusManuallyDisabled, LogTypeManage } from '../types';
 
+/** channel set 允许修改的字段 → 归一化（返回 null 表示值非法）。 */
+const CHANNEL_FIELDS: Record<string, (v: string) => unknown> = {
+  name: (v) => v,
+  type: (v) => ['openai', 'openai-responses', 'anthropic', 'gemini', 'azure'].includes(v) ? v : null,
+  base_url: (v) => v,
+  key: (v) => v,
+  models: (v) => v,
+  priority: (v) => Number(v),
+  weight: (v) => Math.max(1, Number(v)),
+  status: (v) => ({ '1': 1, on: 1, enable: 1, '2': 2, off: 2, disable: 2 })[v] ?? null,
+  model_mapping: (v) => v,
+  config: (v) => v,
+  system_prompt: (v) => v,
+};
+
+/** token set 允许修改的字段 → SQL 列名 + 归一化（usd 是 CLI 别名，落在 remain_quota 上）。 */
+const TOKEN_FIELDS: Record<string, { column: string; norm: (v: string) => unknown }> = {
+  name: { column: 'name', norm: (v) => v },
+  models: { column: 'models', norm: (v) => v },
+  usd: { column: 'remain_quota', norm: (v) => Math.max(0, Math.round((Number(v.replace(/^\$/, '')) || 0) * QUOTA_PER_USD)) },
+  unlimited: { column: 'unlimited_quota', norm: (v) => (['1', 'true', 'on', 'yes'].includes(v.toLowerCase()) ? 1 : 0) },
+  status: { column: 'status', norm: (v) => ({ '1': 1, on: 1, enable: 1, '2': 2, off: 2, disable: 2 })[v] ?? null },
+  expired: { column: 'expired_time', norm: (v) => Number(v) },
+};
+
 /**
  * 内置命令行界面（服务端）。
  *
@@ -218,6 +243,31 @@ async function channelCmd(env: Env, args: string[]): Promise<CliResult> {
       await deleteAbilities(env, id);
       return { ok: true, output: `渠道 #${id} 已删除` };
     }
+    case 'set': {
+      const id = Number(rest[0]);
+      const ch = await env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
+      if (!ch) return { ok: false, output: `渠道 #${rest[0]} 不存在` };
+      const kv = kvOf(rest.slice(1));
+      if (!kv.size) return { ok: false, output: `用法：channel set <id> name=新名称 type=openai base_url=... key=... models=a,b priority=0 weight=1 status=1 model_mapping=... config=... system_prompt=...\n可改字段：${Object.keys(CHANNEL_FIELDS).join(', ')}` };
+      const sets: string[] = [];
+      const binds: unknown[] = [];
+      for (const [field, raw2] of kv) {
+        const norm = CHANNEL_FIELDS[field];
+        if (!norm) return { ok: false, output: `不可修改的字段 "${field}"。可改：${Object.keys(CHANNEL_FIELDS).join(', ')}` };
+        const value = norm(raw2);
+        if (value === null || (typeof value === 'number' && !Number.isFinite(value))) {
+          return { ok: false, output: `字段 ${field} 的值 "${raw2}" 非法` };
+        }
+        sets.push(`${field} = ?`);
+        binds.push(value);
+      }
+      if (!sets.length) return { ok: false, output: '没有可保存的修改' };
+      binds.push(id);
+      await env.DB.prepare(`UPDATE channels SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+      const updated = await env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
+      await rebuildAbilities(env, updated!);
+      return { ok: true, output: `渠道 #${id}「${updated!.name}」已更新（模型：${updated!.models || '—'}，状态=${updated!.status}）` };
+    }
     case 'test': {
       // 复用管理接口的测试逻辑太重（要 fetch 上游）；这里只报告渠道状态。
       const id = Number(rest[0]);
@@ -226,7 +276,7 @@ async function channelCmd(env: Env, args: string[]): Promise<CliResult> {
       return { ok: true, output: `渠道 #${ch.id}「${ch.name}」状态=${ch.status} 上次响应=${ch.response_time || '—'}ms 测试时间=${ch.test_time ? new Date(ch.test_time * 1000).toISOString() : '—'}（在线测试请用后台「渠道」页的测试按钮）` };
     }
     default:
-      return { ok: false, output: '用法：channel list | add <类型> <名称> <base_url> <api_key> --models a,b | show <id> | on <id> | off <id> | del <id>' };
+      return { ok: false, output: '用法：channel list | add <类型> <名称> <base_url> <api_key> --models a,b | set <id> name=... models=... | show <id> | on <id> | off <id> | del <id>' };
   }
 }
 
@@ -268,6 +318,34 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
         .bind(owner.id, key, TokenStatusEnabled, name, now(), now(), unlimited ? 0 : Math.round((Number.isFinite(usdAmount) ? usdAmount : 0) * QUOTA_PER_USD), unlimited, flags.get('--models') ?? '', priceJson)
         .run();
       return { ok: true, output: `令牌已创建：sk-${key}${unlimited ? '（无限额度）' : Number.isFinite(usdAmount) ? `（$${usdAmount}）` : '（0 额度，可用 --usd/--unlimited 调整）'}\n请立即保存，密钥只显示这一次。` };
+    }
+    case 'set': {
+      const id = Number(rest[0]);
+      const t = await env.DB.prepare('SELECT * FROM tokens WHERE id = ?').bind(id).first<TokenRow>();
+      if (!t) return { ok: false, output: `令牌 #${rest[0]} 不存在` };
+      const kv = kvOf(rest.slice(1));
+      if (!kv.size) return { ok: false, output: `用法：token set <id> name=新名称 models=a,b usd=10 unlimited=1|0 status=1|2 expired=-1\n可改字段：${Object.keys(TOKEN_FIELDS).join(', ')}（价格用 token price 子命令）` };
+      const sets: string[] = [];
+      const binds: unknown[] = [];
+      for (const [field, raw2] of kv) {
+        const def = TOKEN_FIELDS[field];
+        if (!def) return { ok: false, output: `不可修改的字段 "${field}"。可改：${Object.keys(TOKEN_FIELDS).join(', ')}；价格请用 token price` };
+        const value = def.norm(raw2);
+        if (value === null || (typeof value === 'number' && !Number.isFinite(value))) {
+          return { ok: false, output: `字段 ${field} 的值 "${raw2}" 非法` };
+        }
+        sets.push(`${def.column} = ?`);
+        binds.push(value);
+      }
+      if (!sets.length) return { ok: false, output: '没有可保存的修改' };
+      binds.push(id);
+      await env.DB.prepare(`UPDATE tokens SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+      await invalidateTokenCache(env, t.key);
+      const updated = await env.DB.prepare('SELECT * FROM tokens WHERE id = ?').bind(id).first<TokenRow>();
+      return {
+        ok: true,
+        output: `令牌 #${id}「${updated!.name}」已更新（${updated!.unlimited_quota ? '无限' : usd(updated!.remain_quota)}，模型：${updated!.models || '全部'}，状态=${updated!.status}）`,
+      };
     }
     case 'key': {
       const id = Number(rest[0]);
@@ -316,7 +394,7 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
       return { ok: true, output: priceJson ? `令牌 #${id} 定制价已更新` : `令牌 #${id} 定制价已清空` };
     }
     default:
-      return { ok: false, output: '用法：token list | new <名称> [--usd N|--unlimited] [--models a,b] [--price JSON] | key <id> | on <id> | off <id> | del <id> | price <id> [JSON|--clear]' };
+      return { ok: false, output: '用法：token list | new <名称> [--usd N|--unlimited] [--models a,b] [--price JSON] | set <id> name=... models=... usd=N | key <id> | on <id> | off <id> | del <id> | price <id> [JSON|--clear]' };
   }
 }
 
@@ -469,12 +547,15 @@ function helpText(command?: string): string {
       'channel list                             渠道列表',
       'channel add <类型> <名称> <base_url> <key> --models m1,m2 [--priority N] [--weight N]',
       '                                         类型：openai | openai-responses | anthropic | gemini | azure',
+      'channel set <id> name=... type=... base_url=... key=... models=a,b priority=N weight=N status=1',
+      '                                         按字段修改渠道（改 models 自动重建路由索引）',
       'channel show <id>                        渠道详情（密钥打码）',
       'channel on <id> / off <id> / del <id>    启用 / 停用 / 删除',
     ].join('\n'),
     token: [
       'token list                               令牌列表',
       'token new <名称> [--usd N | --unlimited] [--models a,b] [--price {"模型":{"in":1,"out":2}}]',
+      'token set <id> name=... models=a,b usd=N unlimited=1|0 status=1|2 expired=<unix>',
       'token key <id>                           显示完整密钥',
       'token on <id> / off <id> / del <id>      启用 / 停用 / 删除',
       'token price <id> [JSON | --clear]        查看设置清除该 Key 的按模型价格',

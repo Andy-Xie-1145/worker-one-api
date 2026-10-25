@@ -66,6 +66,10 @@ export const PRICE_TABLE: Record<string, Price> = {
   'gpt-image-2.5-sunburst': { in: 5, out: 30, cached_in: 1.25 },
 
   // Anthropic
+  // Claude 5.5 家族——官方定价页 2026-10 核对。Opus 5.5 缓存命中 $0.20（$4 的 5%）；
+  // Sonnet 5.5 缓存命中 $0.10（官方表，较 Sonnet 5 减半）。
+  'claude-opus-5-5': { in: 4, out: 20, cached_in: 0.2 },
+  'claude-sonnet-5-5': { in: 2, out: 10, cached_in: 0.1 },
   'claude-3-haiku': { in: 0.25, out: 1.25 },
   'claude-3-5-haiku': { in: 0.8, out: 4 },
   'claude-3-5-sonnet': { in: 3, out: 15 },

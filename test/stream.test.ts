@@ -173,6 +173,16 @@ test('pricing: GPT-6 家族与生图模型按官方 standard 档计价', () => {
   assert.equal(calcQuota('gpt-6-astra', { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }), 30_000_000);
 });
 
+test('pricing: Claude 5.5 家族按官方价计价', () => {
+  // 2026-10 官方：Opus 5.5 $4/$20（缓存 $0.20），Sonnet 5.5 $2/$10（缓存 $0.10）。
+  assert.deepEqual(resolvePrice('claude-opus-5-5').spec, { in: 4, out: 20, cached_in: 0.2 });
+  assert.deepEqual(resolvePrice('claude-sonnet-5-5').spec, { in: 2, out: 10, cached_in: 0.1 });
+  // 前缀不串门：opus-5-5 不得命中 claude-opus-4 / claude-3-opus 的条目。
+  assert.equal(resolvePrice('claude-opus-5-5').source, 'builtin');
+  // 1M 输入 + 1M 输出的 Opus 5.5 = $24 = 12_000_000 quota。
+  assert.equal(calcQuota('claude-opus-5-5', { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }), 12_000_000);
+});
+
 // ---------------------------------------------------------------- DeepSeek
 
 test('deepseek: model line-up is priced, legacy V3 aliases are not guessed at', () => {

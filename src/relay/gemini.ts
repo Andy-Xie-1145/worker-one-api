@@ -151,13 +151,24 @@ function toGeminiContents(messages: any[], channelSystemPrompt: string): { syste
   if (channelSystemPrompt) systemParts.push(channelSystemPrompt);
   const contents: any[] = [];
 
+  // Gemini 的 functionResponse 用**函数名**配对，而中枢的工具结果只有
+  // tool_call_id——先扫一遍历史里的 assistant.tool_calls，建 call_id → 函数名
+  // 的映射，工具结果就能找回自己的函数名（找不到才退回用 id 顶名）。
+  const nameByCallId = new Map<string, string>();
+  for (const m of messages) {
+    for (const tc of m.tool_calls ?? []) {
+      if (tc?.id && tc.function?.name) nameByCallId.set(String(tc.id), String(tc.function.name));
+    }
+  }
+
   for (const m of messages) {
     if (m.role === 'system' || m.role === 'developer') {
       systemParts.push(textOf(m.content));
       continue;
     }
     if (m.role === 'tool') {
-      contents.push({ role: 'user', parts: [{ functionResponse: { name: m.name ?? m.tool_call_id, response: { result: textOf(m.content) } } }] });
+      const name = nameByCallId.get(String(m.tool_call_id)) ?? m.name ?? String(m.tool_call_id);
+      contents.push({ role: 'user', parts: [{ functionResponse: { name, response: { result: textOf(m.content) } } }] });
       continue;
     }
     if (m.role === 'assistant' && m.tool_calls?.length) {

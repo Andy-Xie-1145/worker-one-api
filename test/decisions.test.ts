@@ -79,7 +79,7 @@ function makeDB(w: World) {
     if (/^SELECT 1 AS hit FROM credits WHERE ref/.test(one)) return w.credits.some((c) => c.ref === binds[0]) ? { hit: 1 } : null;
     if (/^SELECT quota FROM users WHERE id/.test(one)) return { quota: w.user.quota };
 
-    if (/^UPDATE users SET quota = quota \+ \?1/.test(one)) {
+    if (/^UPDATE users SET quota = quota \+ \?/.test(one)) {
       const [delta, id] = binds;
       if (w.user.id !== id) return null;
       const guarded = /quota \+ \?1 >= 0/.test(one);
@@ -92,6 +92,8 @@ function makeDB(w: World) {
       // credits.ref 上有唯一索引——结算和退款正靠它互斥，替身必须也守这条。
       if (ref && w.credits.some((c) => c.ref === ref)) throw new Error('UNIQUE constraint failed: credits.ref');
       w.credits.push({ delta: binds[1], reason: binds[2], ref });
+      // applyCreditGated 的账本行是 INSERT ... SELECT ... RETURNING id——回行让「已插入」判定成立。
+      if (/RETURNING id/.test(one)) return { results: [{ id: 1 }] };
       return {};
     }
 

@@ -443,18 +443,19 @@ async function handleRelay(
       // 401 与其它有限重试的错误一样占配额：key 失效重试几个渠道就该到头了。
       quotaAttempts++;
       await autoDisableChannel(c.env, channel, result.status);
-    } else if (result.status === 403) {
+    } else if (result.status === 402 || result.status === 403) {
       /*
-       * 403 软熔断（lib/deny403.ts）：记下 channel+model+colo 这个组合被拒，
-       * 30 分钟内同组合的选路直接绕开；本次请求继续走循环里的下一个渠道。
+       * 402（渠道余额不足）/ 403 软熔断（lib/deny403.ts）：记下
+       * channel+model+colo 这个组合被拒，30 分钟内同组合的选路直接绕开；
+       * 本次请求继续走循环里的下一个渠道。
        *
        * **不占 RetryTimes 配额**：拒掉的渠道再多，只要还有未尝试且未熔断的候选
        * 就继续试——配额耗尽时的「漏掉第 4 个可用渠道」正是这里要避免的。
        *
        * 必须 await：紧接着的下一个请求要立刻看到这条记录，异步写会跟它赛跑，
        * 让熔断在最需要它的头几秒里形同虚设。KV 写失败在 markDenied403 内部
-       * 已经 fail-open，await 不会把网关打挂。403 也不下线 abilities——渠道
-       * 对别的模型/机房可能完全正常。
+       * 已经 fail-open，await 不会把网关打挂。402/403 也不下线 abilities——渠道
+       * 对别的模型/机房可能完全正常（402 常见于聚合器单渠道欠费：换一家就好）。
        */
       await markDenied403(c.env, channel.id, requestedModel, colo, extractDeniedMessage(result.body));
     } else if (result.status === 429) {
@@ -471,7 +472,12 @@ async function handleRelay(
      * 其余 4xx（400/404…）是调用方的错，换渠道无济于事，立刻停止（无需占配额，
      * 循环马上就要退出了）。
      */
-    else if (result.status < 500 && result.status !== 408 && result.status !== 403) break;
+    /*
+     * 其它 4xx（400/404…，以及 402/403——它们上面已经处理完软熔断/换渠道）
+     * 是调用方或渠道侧的确定性错误，换渠道无济于事，立刻停止（无需占配额，
+     * 循环马上就要退出了）。
+     */
+    else if (result.status < 500 && result.status !== 408 && result.status !== 402 && result.status !== 403) break;
     // 5xx/408：上游侧/超时问题，占配额的有限重试。
     else quotaAttempts++;
   }
@@ -578,7 +584,16 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
   }
 
   if (!upstream.ok) {
-    const text = await upstream.text();
+    /*
+     * 错误响应体读取/解析也可能失败（空响应、连接中断）——同样的兜底，
+     * 保证错误路径总能拿到一个可回给客户端的形状。
+     */
+    let text = '';
+    try {
+      text = await upstream.text();
+    } catch {
+      text = '';
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -589,7 +604,18 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
   }
 
   if (!body.stream || !upstream.body) {
-    const json = await upstream.json<any>();
+    /*
+     * 成功状态下的响应体读取/解析同样可能失败（空体、截断、非 JSON）。
+     * 这类失败按 502 计入既有重试/退款路径——上游可能已经为这次生成扣了费，
+     * 但响应丢了就等于没交付，换下一个渠道重试是正确语义。
+     */
+    let json: any;
+    try {
+      json = await upstream.json<any>();
+    } catch (e: any) {
+      const message = `渠道 ${channel.name} 响应体读取/解析失败: ${e?.message ?? e}`;
+      return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'upstream', errorText: message };
+    }
     const { body: converted, usage } = adaptor.convertResponse(json, ctx);
     /*
      * 上游没报 usage 时的兜底。Decisions 走自己的估算：它的提示词在 state/

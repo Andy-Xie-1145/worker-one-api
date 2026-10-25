@@ -74,12 +74,14 @@ function makeDB(w: World) {
     if (/^SELECT \* FROM users WHERE id/.test(one)) return w.user.id === binds[0] ? w.user : null;
     if (/^SELECT 1 AS hit FROM credits WHERE ref/.test(one)) return w.credits.some((c) => c.ref === binds[0]) ? { hit: 1 } : null;
     if (/^SELECT quota FROM users WHERE id/.test(one)) return { quota: w.user.quota };
-    if (/^UPDATE users SET quota = quota \+ \?1/.test(one)) {
+    if (/^UPDATE users SET quota = quota \+ \?/.test(one)) {
       w.user.quota += binds[0];
       return { quota: w.user.quota };
     }
     if (/^INSERT INTO credits/.test(one)) {
       w.credits.push({ delta: binds[1], ref: binds[3] });
+      // applyCreditGated 的账本行是 INSERT ... SELECT ... RETURNING id——回行让「已插入」判定成立。
+      if (/RETURNING id/.test(one)) return { results: [{ id: 1 }] };
       return {};
     }
     if (/FROM abilities WHERE model = \? AND enabled = 1/.test(one)) {

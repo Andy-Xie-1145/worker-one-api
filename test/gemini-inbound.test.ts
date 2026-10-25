@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import {
   geminiToChatRequest, chatResponseToGemini, newGeminiEncoder, encodeGeminiChunk, finishGeminiStream,
 } from '../src/relay/gemini-inbound';
+import { geminiAdaptor } from '../src/relay/gemini';
 
 const tests: Array<[string, () => Promise<void> | void]> = [];
 const test = (name: string, fn: () => Promise<void> | void) => tests.push([name, fn]);
@@ -77,6 +78,40 @@ test('出站：流——文本增量直通，工具参数累积到 finish 才整
   assert.match(c2, /"finishReason":"STOP"/);
   const c3 = finishGeminiStream(enc, 'm', { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 });
   assert.match(c3, /"promptTokenCount":2/);
+});
+
+test('入站：同一条消息的多个 functionResponse 全部保留', () => {
+  const chat = geminiToChatRequest(
+    { contents: [{ role: 'user', parts: [{ functionResponse: { name: 'a', response: { r: 1 } } }, { functionResponse: { name: 'b', response: { r: 2 } } }] }] },
+    'm',
+  );
+  assert.equal(chat.messages.length, 2, '两个结果都必须进上下文');
+  assert.deepEqual(chat.messages.map((x) => x.tool_call_id), ['a', 'b']);
+});
+
+test('出站：tool 结果按 call_id 从历史 tool_calls 找回函数名', () => {
+  const built = geminiAdaptor.buildRequest(
+    {
+      model: 'm',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: null, tool_calls: [{ id: 'call_9', type: 'function', function: { name: 'weather', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'call_9', content: '{"r":1}' },
+      ],
+    },
+    {
+      channel: { id: 1, type: 'gemini', key: 'k', status: 1, name: 'g', weight: 1, priority: 0, created_time: 0, test_time: 0, response_time: 0, base_url: 'https://g.test', balance: 0, models: '', used_quota: 0, model_mapping: '', config: '', system_prompt: '' } as any,
+      upstreamModel: 'm',
+      requestedModel: 'm',
+      mode: 'chat',
+      path: 'chat/completions',
+      config: {},
+    },
+  );
+  const body = JSON.parse(built.body);
+  const last = body.contents.at(-1);
+  assert.equal(last.role, 'user');
+  assert.equal(last.parts[0].functionResponse.name, 'weather', 'tool_call_id 要映射回函数名');
 });
 
 // ---------------------------------------------------------------- runner

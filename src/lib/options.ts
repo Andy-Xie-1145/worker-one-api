@@ -55,9 +55,15 @@ export const DEFAULT_OPTIONS: Options = {
   DecisionOnlyModels: [],
 };
 
-/** Options are read on nearly every request, so they are KV-cached for KV_TTL seconds. */
+/** Options are read on nearly every request, so they are KV-cached for KV_TTL seconds.
+ *  KV 故障时降级到 D1 直读/放弃缓存写——配置读取不允许因缓存层故障而失败。 */
 export async function getOptions(env: Env): Promise<Options> {
-  const cached = await env.CACHE.get(KV_KEY, 'json');
+  let cached: Options | null = null;
+  try {
+    cached = (await env.CACHE.get(KV_KEY, 'json')) as Options | null;
+  } catch {
+    // 读失败 → 走 D1。
+  }
   if (cached) return { ...DEFAULT_OPTIONS, ...(cached as Partial<Options>) };
   const rows = await env.DB.prepare('SELECT key, value FROM options').all<{ key: string; value: string }>();
   const stored: Record<string, unknown> = {};
@@ -69,7 +75,11 @@ export async function getOptions(env: Env): Promise<Options> {
     }
   }
   const merged = { ...DEFAULT_OPTIONS, ...stored } as Options;
-  await env.CACHE.put(KV_KEY, JSON.stringify(stored), { expirationTtl: KV_TTL });
+  try {
+    await env.CACHE.put(KV_KEY, JSON.stringify(stored), { expirationTtl: KV_TTL });
+  } catch {
+    // 写失败不影响本次请求（下一条请求重读 D1）。
+  }
   return merged;
 }
 
@@ -81,5 +91,9 @@ export async function setOptions(env: Env, patch: Record<string, unknown>): Prom
     ),
   );
   if (stmts.length) await env.DB.batch(stmts);
-  await env.CACHE.delete(KV_KEY);
+  try {
+    await env.CACHE.delete(KV_KEY);
+  } catch {
+    // 缓存删除失败：KV_TTL 内的旧配置会被 TTL 兜底冲掉。
+  }
 }

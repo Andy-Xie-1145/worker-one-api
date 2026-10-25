@@ -93,7 +93,22 @@ export async function applyCredit(env: Env, args: ApplyCreditArgs): Promise<Appl
     ),
     ...also,
   ];
-  await env.DB.batch(stmts);
+  try {
+    await env.DB.batch(stmts);
+  } catch (error) {
+    /*
+     * 并发同 ref 的自愈：去重检查和余额 UPDATE 之间存在毫秒级窗口——两个同 ref
+     * 的调用可能都通过了检查、都改了余额，然后只有一个 INSERT 能挤进唯一索引。
+     * 撞索引的这一笔把余额**反向补回**，让"账本行唯一 ⇒ 余额只动一次"在竞态后
+     * 依然成立（漂移只存在于窗口内的瞬态，reconcile 不再看到永久偏差）。
+     */
+    if (ref && isUniqueViolation(error)) {
+      await env.DB.prepare('UPDATE users SET quota = quota - ?1 WHERE id = ?2').bind(delta, userId).run();
+      const balance = await getBalance(env, userId);
+      return { ok: true, balance, duplicate: true };
+    }
+    throw error;
+  }
 
   return { ok: true, balance: row.quota };
 }
@@ -187,7 +202,7 @@ export async function applyCreditGated(env: Env, args: ApplyCreditGatedArgs): Pr
   try {
     results = await env.DB.batch(stmts);
   } catch (error) {
-    if (isDuplicateRef(error)) return { applied: false, duplicate: true };
+    if (isUniqueViolation(error)) return { applied: false, duplicate: true };
     throw error;
   }
 
@@ -196,16 +211,17 @@ export async function applyCreditGated(env: Env, args: ApplyCreditGatedArgs): Pr
 }
 
 /**
- * 这次失败是不是「这个 ref 已经用过了」。
- *
- * D1 客户端把 SQLite 的报错包成 `Error("D1_ERROR: UNIQUE constraint failed: credits.ref")`，
- * 所以只能认字符串。认得宽一点（不要求 `credits.ref` 全名）：批里唯一带唯一索引的
- * 就是账本行那一条，认错的余地很小，而认不出会把一次重试变成 500。
+ * 这次失败是不是「这个 ref 已经用过了」。认 D1 包出来的 UNIQUE 约束报错。
+ * 认得宽一点（不要求 `credits.ref` 全名）：批里唯一带唯一索引的就是账本行那一条，
+ * 认错的余地很小，而认不出会把一次重试变成 500。
  */
-function isDuplicateRef(error: unknown): boolean {
+function isUniqueViolation(error: unknown): boolean {
   const message = error instanceof Error ? `${error.message} ${(error.cause as Error | undefined)?.message ?? ''}` : String(error);
   return /UNIQUE constraint failed/i.test(message);
 }
+
+/** 兼容旧名。 */
+const isDuplicateRef = isUniqueViolation;
 
 async function isDuplicate(env: Env, ref: string): Promise<boolean> {
   const row = await env.DB.prepare('SELECT 1 AS hit FROM credits WHERE ref = ?').bind(ref).first<{ hit: number }>();
@@ -226,17 +242,19 @@ export interface Reconciliation {
 }
 
 /**
- * Compares the materialized balance against the ledger. A non-zero drift means
- * some write bypassed applyCredit() — that is the bug to hunt, not the number.
+ * Compares each account's materialized balance against the ledger. A non-zero
+ * drift means some write bypassed applyCredit() — that is the bug to hunt, not
+ * the number.
  *
- * Users created before the ledger existed have no entries and are skipped;
- * their opening balance is not a drift.
+ * LEFT JOIN（而不是内连接）：让「有余额却完全没有账本行」的账户也现形——
+ * 恰恰是那种「余额 UPDATE 成功、账本 INSERT 失败」的事故形态。合法的零余额
+ * 无账本账户（quota=0）不会误报。
  */
 export async function reconcile(env: Env): Promise<Reconciliation[]> {
   const rows = await env.DB.prepare(
     `SELECT u.id AS user_id, u.username, u.quota AS materialized, COALESCE(SUM(c.delta), 0) AS ledger_sum
      FROM users u
-     JOIN credits c ON c.user_id = u.id
+     LEFT JOIN credits c ON c.user_id = u.id
      GROUP BY u.id
      HAVING u.quota != COALESCE(SUM(c.delta), 0)`,
   ).all<Omit<Reconciliation, 'drift'>>();

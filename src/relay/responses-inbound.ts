@@ -164,12 +164,51 @@ export interface ResponsesEncoder {
   messageOpened: boolean;
   /** 正在流式输出的 function_call（chat 侧 index → 输出序号）。 */
   callIndex: Map<number, number>;
-  textOpened: boolean;
+  /** 按 chat 侧 index 累积的工具调用——最终 output 里要给出完整 function_call。 */
+  calls: Map<number, { callId: string; name: string; args: string }>;
+  textAcc: string;
+  reasoningAcc: string;
+  hasText: boolean;
+  hasReasoning: boolean;
+  messageItemId: string;
+  /** 中枢侧的 finish_reason（'length' → 最终事件是 response.incomplete）。 */
+  finishReason: string | null;
+  /** 上游失败透传（chat chunk 带 error）时的错误信息。 */
+  errorMsg: string | null;
   finished: boolean;
 }
 
 export function newResponsesEncoder(): ResponsesEncoder {
-  return { responseId: '', outputIndex: 0, messageOpened: false, callIndex: new Map(), textOpened: false, finished: false };
+  return {
+    responseId: '',
+    outputIndex: 0,
+    messageOpened: false,
+    callIndex: new Map(),
+    calls: new Map(),
+    textAcc: '',
+    reasoningAcc: '',
+    hasText: false,
+    hasReasoning: false,
+    messageItemId: 'msg_1',
+    finishReason: null,
+    errorMsg: null,
+    finished: false,
+  };
+}
+
+/** 编码器累积出的 output items——最终响应对象要带完整内容，不能是空数组。 */
+function encoderOutput(enc: ResponsesEncoder): any[] {
+  const items: any[] = [];
+  if (enc.hasReasoning) {
+    items.push({ type: 'reasoning', summary: [{ type: 'summary_text', text: enc.reasoningAcc }] });
+  }
+  if (enc.hasText) {
+    items.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: enc.textAcc, annotations: [] }] });
+  }
+  for (const call of enc.calls.values()) {
+    items.push({ type: 'function_call', id: `fc_${call.callId}`, call_id: call.callId, name: call.name, arguments: call.args || '{}', status: 'completed' });
+  }
+  return items;
 }
 
 function sse(event: string, data: unknown): string {
@@ -190,6 +229,16 @@ export function encodeResponsesChunk(enc: ResponsesEncoder, chatChunk: any, mode
   let out = '';
   const delta = chatChunk?.choices?.[0]?.delta;
 
+  // 中枢 chunk 携带 error（上游失败透传）→ 立即以 response.failed 终止。
+  if (chatChunk?.error) {
+    enc.finished = true;
+    enc.errorMsg = String(chatChunk.error.message ?? 'upstream error');
+    return sse('response.failed', {
+      type: 'response.failed',
+      response: { ...baseResponse(enc.responseId || `resp_${Date.now()}`, model, 'failed'), error: { code: chatChunk.error.code ?? 'upstream_error', message: enc.errorMsg } },
+    });
+  }
+
   if (!enc.responseId) {
     enc.responseId = String(chatChunk?.id ?? `resp_${Date.now()}`);
     out += sse('response.created', {
@@ -198,8 +247,14 @@ export function encodeResponsesChunk(enc: ResponsesEncoder, chatChunk: any, mode
     });
   }
 
+  // finish_reason：'length' 在最终事件里表达为 response.incomplete（截断不是成功）。
+  const finish = chatChunk?.choices?.[0]?.finish_reason;
+  if (finish) enc.finishReason = String(finish);
+
   // 推理内容（Claude Code 等客户端把它当 thinking 展示）
   if (typeof delta?.reasoning_content === 'string' && delta.reasoning_content) {
+    enc.hasReasoning = true;
+    enc.reasoningAcc += delta.reasoning_content;
     out += sse('response.reasoning_summary_text.delta', {
       type: 'response.reasoning_summary_text.delta', item_id: 'rs_1', output_index: 0, summary_index: 0, delta: delta.reasoning_content,
     });
@@ -209,62 +264,67 @@ export function encodeResponsesChunk(enc: ResponsesEncoder, chatChunk: any, mode
   if (typeof delta?.content === 'string' && delta.content) {
     if (!enc.messageOpened) {
       enc.messageOpened = true;
+      enc.hasText = true;
       const idx = enc.outputIndex++;
       out += sse('response.output_item.added', {
         type: 'response.output_item.added', output_index: idx,
         item: { type: 'message', role: 'assistant', status: 'in_progress', content: [] },
       });
       out += sse('response.content_part.added', {
-        type: 'response.content_part.added', item_id: 'msg_1', output_index: idx, content_index: 0,
+        type: 'response.content_part.added', item_id: enc.messageItemId, output_index: idx, content_index: 0,
         part: { type: 'output_text', text: '', annotations: [] },
       });
     }
+    enc.textAcc += delta.content;
     out += sse('response.output_text.delta', {
-      type: 'response.output_text.delta', item_id: 'msg_1', output_index: enc.outputIndex - 1, content_index: 0, delta: delta.content,
+      type: 'response.output_text.delta', item_id: enc.messageItemId, output_index: enc.outputIndex - 1, content_index: 0, delta: delta.content,
     });
   }
 
-  // 工具调用增量
+  // 工具调用增量：按 chat 侧 index 累积完整参数——function_call 不做增量，
+  // 输出项在流末尾的 output 数组里整体给出。
   for (const tc of delta?.tool_calls ?? []) {
     const idx = Number(tc.index ?? 0);
-    let outIdx = enc.callIndex.get(idx);
-    if (outIdx === undefined) {
-      outIdx = enc.outputIndex++;
-      enc.callIndex.set(idx, outIdx);
-      out += sse('response.output_item.added', {
-        type: 'response.output_item.added', output_index: outIdx,
-        item: { type: 'function_call', id: `fc_${String(tc.id ?? idx)}`, call_id: String(tc.id ?? ''), name: String(tc.function?.name ?? ''), arguments: '', status: 'in_progress' },
-      });
+    let entry = enc.calls.get(idx);
+    if (!entry) {
+      entry = { callId: String(tc.id ?? ''), name: String(tc.function?.name ?? ''), args: '' };
+      enc.calls.set(idx, entry);
     }
-    if (tc.function?.arguments) {
-      out += sse('response.function_call_arguments.delta', {
-        type: 'response.function_call_arguments.delta', item_id: `fc_${String(tc.id ?? idx)}`, output_index: outIdx, delta: tc.function.arguments,
-      });
-    }
+    if (tc.function?.name) entry.name = String(tc.function.name);
+    if (tc.id) entry.callId = String(tc.id);
+    if (tc.function?.arguments) entry.args += tc.function.arguments;
   }
 
-  // finish_reason：中间态（tool_calls 结束、长度截断）原样跳过——Responses
-  // 没有 per-choice 的 finish 概念，状态只在 response.completed 里给。
   return out;
 }
 
-/** 流末尾：response.completed（带 usage）。 */
+/** 流末尾：失败 → response.failed；截断 → response.incomplete；否则 completed（output 带完整内容）。 */
 export function finishResponsesStream(enc: ResponsesEncoder, model: string, usage?: Usage): string {
   if (enc.finished) return '';
   enc.finished = true;
   const u = usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-  return sse('response.completed', {
-    type: 'response.completed',
-    response: {
-      ...baseResponse(enc.responseId, model, 'completed'),
-      usage: {
-        input_tokens: Number(u.prompt_tokens ?? 0),
-        output_tokens: Number(u.completion_tokens ?? 0),
-        total_tokens: Number(u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0)),
-        input_tokens_details: { cached_tokens: 0 },
-        output_tokens_details: { reasoning_tokens: 0 },
-      },
+  if (enc.errorMsg) {
+    return sse('response.failed', {
+      type: 'response.failed',
+      response: { ...baseResponse(enc.responseId || `resp_${Date.now()}`, model, 'failed'), error: { code: 'upstream_error', message: enc.errorMsg } },
+    });
+  }
+  const incomplete = enc.finishReason === 'length';
+  const response: any = {
+    ...baseResponse(enc.responseId || `resp_${Date.now()}`, model, incomplete ? 'incomplete' : 'completed'),
+    output: encoderOutput(enc),
+    usage: {
+      input_tokens: Number(u.prompt_tokens ?? 0),
+      output_tokens: Number(u.completion_tokens ?? 0),
+      total_tokens: Number(u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0)),
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: 0 },
     },
+  };
+  if (incomplete) response.incomplete_details = { reason: 'max_output_tokens' };
+  return sse(incomplete ? 'response.incomplete' : 'response.completed', {
+    type: incomplete ? 'response.incomplete' : 'response.completed',
+    response,
   });
 }
 

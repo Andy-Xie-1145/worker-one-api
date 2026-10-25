@@ -192,6 +192,75 @@ test('入站：finish_reason 在流里不产生 per-choice 事件，状态只在
   assert.equal(out, '');
 });
 
+test('出站：response.failed 透传错误 chunk（不得伪装成功），usage 照计', () => {
+  const state = { id: 'r1', created: 0, textAcc: '', promptTokens: 0, completionTokens: 0 };
+  const r = openaiResponsesAdaptor.convertStreamEvent(
+    { event: 'response.failed', data: JSON.stringify({ type: 'response.failed', response: { status: 'failed', error: { message: 'quota exceeded', code: 'insufficient' }, usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 } } }) },
+    ctx(),
+    state,
+  );
+  assert.equal(r.done, true, '失败要结束本次流');
+  assert.equal((r.chunks[0] as any).error.message, 'quota exceeded');
+  assert.equal(r.usage?.prompt_tokens, 100, '失败前消耗照计');
+});
+
+test('出站：response.incomplete → finish_reason=length（截断不是成功）', () => {
+  const state = { id: 'r2', created: 0, textAcc: '', promptTokens: 0, completionTokens: 0 };
+  const r = openaiResponsesAdaptor.convertStreamEvent(
+    { event: 'response.incomplete', data: JSON.stringify({ type: 'response.incomplete', response: { usage: { input_tokens: 50, output_tokens: 20, total_tokens: 70 } } }) },
+    ctx(),
+    state,
+  );
+  assert.equal(r.done, true);
+  assert.equal(r.chunks[0].choices[0].finish_reason, 'length');
+  assert.equal(r.usage.completion_tokens, 20);
+});
+
+test('出站：并行工具调用的参数增量按 item_id 归位，交错不串线', () => {
+  const state = { id: '', created: 0, textAcc: '', promptTokens: 0, completionTokens: 0 };
+  const ev = (data: any) => openaiResponsesAdaptor.convertStreamEvent({ event: 'x', data: JSON.stringify(data) }, ctx(), state);
+  ev({ type: 'response.output_item.added', item: { type: 'function_call', id: 'item_1', call_id: 'c1', name: 'weather' } });
+  ev({ type: 'response.output_item.added', item: { type: 'function_call', id: 'item_2', call_id: 'c2', name: 'time' } });
+  // 交错到达：先 item_2 的参数，再 item_1 的参数。
+  const d2 = ev({ type: 'response.function_call_arguments.delta', item_id: 'item_2', delta: '{"tz"' });
+  const d1 = ev({ type: 'response.function_call_arguments.delta', item_id: 'item_1', delta: '{"city"' });
+  assert.equal(d2.chunks[0].choices[0].delta.tool_calls[0].index, 1);
+  assert.equal(d2.chunks[0].choices[0].delta.tool_calls[0].function.arguments, '{"tz"');
+  assert.equal(d1.chunks[0].choices[0].delta.tool_calls[0].index, 0);
+  assert.equal(d1.chunks[0].choices[0].delta.tool_calls[0].function.arguments, '{"city"');
+});
+
+test('入站：error chunk → 立即 response.failed（失败不得伪装 completed）', () => {
+  const enc = newResponsesEncoder();
+  const out = encodeResponsesChunk(enc, { id: 'ch_1', error: { message: 'boom', code: 'insufficient' } }, 'm');
+  assert.match(out, /event: response\.failed/);
+  assert.match(out, /"message":"boom"/);
+  // 终态已发出，finish 不再重复。
+  assert.equal(finishResponsesStream(enc, 'm', { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 }), '');
+});
+
+test('入站：finish_reason=length → response.incomplete 且 output 带完整文本', () => {
+  const enc = newResponsesEncoder();
+  encodeResponsesChunk(enc, { id: 'ch_1', choices: [{ delta: { role: 'assistant' } }] }, 'm');
+  encodeResponsesChunk(enc, { id: 'ch_1', choices: [{ delta: { content: 'hi' } }] }, 'm');
+  encodeResponsesChunk(enc, { id: 'ch_1', choices: [{ delta: {}, finish_reason: 'length' }] }, 'm');
+  const tail = finishResponsesStream(enc, 'm', { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 });
+  assert.match(tail, /event: response\.incomplete/);
+  assert.match(tail, /"text":"hi"/, '最终响应必须带已生成的 output');
+  assert.match(tail, /max_output_tokens/);
+});
+
+test('入站：并行工具调用——function_call 在最终 output 里完整给出', () => {
+  const enc = newResponsesEncoder();
+  encodeResponsesChunk(enc, { id: 'ch_1', choices: [{ delta: { role: 'assistant' } }] }, 'm');
+  encodeResponsesChunk(enc, { id: 'ch_1', choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'weather', arguments: '' } }] } }] }, 'm');
+  encodeResponsesChunk(enc, { id: 'ch_1', choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"city":' } }] } }] }, 'm');
+  encodeResponsesChunk(enc, { id: 'ch_1', choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"SZ"}' } }] } }] }, 'm');
+  const tail = finishResponsesStream(enc, 'm', { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+  assert.match(tail, /"name":"weather"/);
+  assert.match(tail, /\\"city\\":\\"SZ\\"/);
+});
+
 // ---------------------------------------------------------------- runner
 
 let failed = 0;

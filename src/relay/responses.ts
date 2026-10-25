@@ -121,10 +121,14 @@ export const openaiResponsesAdaptor: Adaptor = {
       case 'response.output_item.added': {
         const item = json.item;
         if (item?.type === 'function_call') {
+          const itemId = String(item.id ?? '');
           const index = Number(state.toolIndex ?? 0);
           state.toolIndex = index + 1;
+          // 并行工具调用按 item_id（及 call_id）建档——后续参数增量按它路由，
+          // 否则两个工具的参数会互相串线。
+          state.callByItem = { ...(state.callByItem ?? {}), [itemId]: index, [String(item.call_id ?? '')]: index };
           return {
-            chunks: [chunk({ tool_calls: [{ index, id: String(item.call_id ?? item.id ?? ''), type: 'function', function: { name: String(item.name ?? ''), arguments: '' } }] })],
+            chunks: [chunk({ tool_calls: [{ index, id: String(item.call_id ?? itemId), type: 'function', function: { name: String(item.name ?? ''), arguments: '' } }] })],
           };
         }
         return { chunks: [] };
@@ -142,17 +146,43 @@ export const openaiResponsesAdaptor: Adaptor = {
       }
       case 'response.function_call_arguments.delta': {
         if (typeof json.delta !== 'string' || !json.delta) return { chunks: [] };
-        const index = Math.max(0, Number(state.toolIndex ?? 1) - 1);
+        // 并行工具调用的参数增量按上游标注的 item_id 归位；缺标注才退回「最近一个」。
+        const byItem = (state.callByItem ?? {}) as Record<string, number>;
+        const index = byItem[String(json.item_id ?? '')] ?? Math.max(0, Number(state.toolIndex ?? 1) - 1);
         return { chunks: [chunk({ tool_calls: [{ index, function: { arguments: json.delta } }] })] };
       }
-      case 'response.completed':
-      case 'response.incomplete': {
+      case 'response.completed': {
         const usage = responsesUsage(json.response?.usage);
         // 收尾：给 include_usage 的客户端一个空 choices 的 usage chunk。
         return { chunks: [{ id: state.id, object: 'chat.completion.chunk', created: state.created, model: ctx.requestedModel, choices: [], usage }], usage, done: true };
       }
+      /*
+       * response.incomplete：截断不是成功。给 chat 客户端诚实的
+       * finish_reason='length'（Responses 入站据此生成 response.incomplete），
+       * usage 照带。
+       */
+      case 'response.incomplete': {
+        const usage = responsesUsage(json.response?.usage);
+        return {
+          chunks: [{ id: state.id, object: 'chat.completion.chunk', created: state.created, model: ctx.requestedModel, choices: [{ index: 0, delta: {}, finish_reason: 'length' }], ...(usage ? { usage } : {}) }],
+          usage,
+          done: true,
+        };
+      }
+      /*
+       * response.failed：上游明确报告失败。绝不能伪装成正常收尾——错误作为
+       * chunk 的 error 字段透传（chat 协议没有标准的流内错误形状），失败前
+       * 消耗的 token 照计（usage 有就带），done 结束本次流。
+       */
       case 'response.failed': {
-        return { chunks: [], done: true };
+        const err = json.response?.error ?? json.error;
+        const message = String(err?.message ?? json.response?.status ?? '上游响应失败');
+        const usage = json.response?.usage ? responsesUsage(json.response.usage) : undefined;
+        return {
+          chunks: [{ id: state.id, object: 'chat.completion.chunk', created: state.created, model: ctx.requestedModel, choices: [], error: { message, type: 'upstream_error', code: err?.code ?? null }, ...(usage ? { usage } : {}) }],
+          ...(usage ? { usage } : {}),
+          done: true,
+        };
       }
       default:
         return { chunks: [] };

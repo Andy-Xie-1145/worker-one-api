@@ -1,7 +1,7 @@
 import { type Env, type TokenRow, type UserRow, LogTypeConsume, TokenStatusExhausted } from '../types';
-import { invalidateTokenCache } from './auth';
+import { invalidateTokenCache, parseTokenPriceConfig } from './auth';
 import { calcQuotaDetailed, quotaToUSD } from './pricing';
-import { applyCredit } from './ledger';
+import { applyCreditGated, applyCredit } from './ledger';
 import type { Options } from './options';
 import type { PriceSpec } from './pricing/llm';
 
@@ -16,13 +16,14 @@ export interface Usage {
 /**
  * Reserves an estimated charge before the upstream call.
  *
- * The reservation is what makes concurrency safe: the balance is checked and
- * debited by a single guarded statement inside applyCredit(), so N simultaneous
- * requests cannot each see the same balance and each spend it.
+ * The reservation is what makes concurrency safe: 预扣是一条**原子链**
+ * （applyCreditGated：账本行先行，账户余额守卫和 Key 硬上限守卫都长在同一个
+ * WHERE 上），N 个并发请求不可能各自通过检查、各花各的——任何一个守卫失败，
+ * 整条链一个字节都不写。
  *
- * `tokens.remain_quota` is a per-token spending cap, not money — the money is
- * `users.quota`. Only the latter is guarded; a token cap can overshoot slightly
- * under concurrency, which costs nothing and keeps this to one guarded write.
+ * `tokens.remain_quota` 是这把 Key 的**硬消费上限**：不限额令牌（unlimited）
+ * 完全不受约束；限额令牌在预扣那一刻就被守卫挡住，并发下也不许越过 0。
+ * 结算（postConsume）仍允许找平时把 Key 扣成负数——服务已交付，钱必须入账。
  */
 export async function preConsume(
   env: Env,
@@ -42,23 +43,49 @@ export async function preConsume(
   if (amount <= 0) return { ok: true };
 
   // Cheap early rejection off the (possibly stale) cached token row. The
-  // authoritative check is the guarded UPDATE below; this only avoids the
+  // authoritative check is the guarded chain below; this only avoids the
   // round trip for tokens that are obviously exhausted.
   if (!token.unlimited_quota && token.remain_quota < amount) {
     return { ok: false, message: '令牌额度不足' };
   }
 
-  const also = [env.DB.prepare('UPDATE users SET request_count = request_count + 1 WHERE id = ?').bind(user.id)];
-  if (!token.unlimited_quota) {
-    also.push(env.DB.prepare('UPDATE tokens SET remain_quota = remain_quota - ? WHERE id = ?').bind(amount, token.id));
-  }
-
-  // assumeNew：ref 是刚生成的 uuid，不可能撞车，省掉热路径上那次去重查询。
-  const result = await applyCredit(env, { userId: user.id, delta: -amount, reason: 'consume', guard: true, also, ref, assumeNew: true });
+  /*
+   * 原子预扣：账本行（INSERT ... SELECT，带全部守卫）先行，余额/计数/Key 扣减
+   * 全部 EXISTS 门控在它身上——前缀提交不产生任何效果。
+   *
+   * 守卫（guardSql 里的 ? 依次为 guardBinds）：
+   *   u.quota + delta >= 0            账户余额不许扣穿
+   *   unlimited = 1                   不限额令牌跳过 Key 守卫
+   *   t.remain_quota >= amount        Key 硬上限：并发下同样不许越过
+   */
+  const unlimited = token.unlimited_quota ? 1 : 0;
+  const result = await applyCreditGated(env, {
+    userId: user.id,
+    delta: -amount,
+    reason: 'consume',
+    ref: ref ?? '',
+    guardSql: 'u.quota + ? >= 0 AND (? = 1 OR (SELECT t.remain_quota FROM tokens t WHERE t.id = ?) >= ?)',
+    guardBinds: [-amount, unlimited, token.id, amount],
+    also: [
+      { sql: 'UPDATE users SET request_count = request_count + 1 WHERE id = ?', binds: [user.id] },
+      {
+        sql: 'UPDATE tokens SET remain_quota = remain_quota - ? WHERE id = ? AND unlimited_quota = ? AND remain_quota >= ?',
+        binds: [amount, token.id, unlimited, amount],
+      },
+    ],
+  });
   await invalidateTokenCache(env, token.key);
 
-  if (!result.ok) {
-    return { ok: false, message: result.reason === 'insufficient' ? '用户额度不足' : '用户不存在' };
+  if (!result.applied) {
+    if (result.duplicate) return { ok: true }; // uuid ref 不可能重复；防御性放行
+    // 守卫失败：查一眼是谁拦的，错误信息点名责任方。
+    const tk = !token.unlimited_quota
+      ? await env.DB.prepare('SELECT remain_quota FROM tokens WHERE id = ?').bind(token.id).first<{ remain_quota: number }>()
+      : null;
+    if (tk && tk.remain_quota < amount) return { ok: false, message: '令牌额度不足' };
+    const fresh = await env.DB.prepare('SELECT quota FROM users WHERE id = ?').bind(user.id).first<{ quota: number }>();
+    if ((fresh?.quota ?? 0) < amount) return { ok: false, message: '用户额度不足' };
+    return { ok: false, message: '用户不存在' };
   }
   return { ok: true };
 }

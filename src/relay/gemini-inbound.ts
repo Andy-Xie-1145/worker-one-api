@@ -30,7 +30,9 @@ export function geminiToChatRequest(raw: any, model: string): ChatRequest {
     const textParts: string[] = [];
     const images: any[] = [];
     let functionCalls: any[] | undefined;
-    let functionResponse: { name: string; response: any } | undefined;
+    // 一条 Gemini 消息可以同时携带多个 functionResponse（并行工具调用）——
+    // 全部保留，每个生成一条 tool 消息，不能后者覆盖前者。
+    const functionResponses: { name: string; response: any }[] = [];
 
     for (const p of c.parts ?? []) {
       if (typeof p?.text === 'string') {
@@ -48,18 +50,20 @@ export function geminiToChatRequest(raw: any, model: string): ChatRequest {
         });
       } else if (p?.functionResponse || p?.function_response) {
         const fr = p.functionResponse ?? p.function_response;
-        functionResponse = { name: String(fr.name ?? ''), response: fr.response };
+        functionResponses.push({ name: String(fr.name ?? ''), response: fr.response });
       }
     }
 
-    if (functionResponse) {
+    if (functionResponses.length) {
       // Gemini 用**函数名**配对工具结果；中枢用 tool_call_id，直接拿名字当 id。
-      messages.push({
-        role: 'tool',
-        tool_call_id: functionResponse.name,
-        name: functionResponse.name,
-        content: JSON.stringify(functionResponse.response ?? {}),
-      });
+      for (const fr of functionResponses) {
+        messages.push({
+          role: 'tool',
+          tool_call_id: fr.name,
+          name: fr.name,
+          content: JSON.stringify(fr.response ?? {}),
+        });
+      }
       continue;
     }
 

@@ -74,7 +74,7 @@ function makeDB(w: World) {
     if (/^SELECT 1 AS hit FROM credits WHERE ref/.test(one)) return w.credits.some((c) => c.ref === binds[0]) ? { hit: 1 } : null;
     if (/^SELECT quota FROM users WHERE id/.test(one)) return { quota: w.user.quota };
 
-    if (/^UPDATE users SET quota = quota \+ \?1/.test(one)) {
+    if (/^UPDATE users SET quota = quota \+ \?/.test(one)) {
       const [delta, id] = binds;
       if (w.user.id !== id) return null;
       w.user.quota += delta;
@@ -83,6 +83,8 @@ function makeDB(w: World) {
     if (/^INSERT INTO credits/.test(one)) {
       if (binds[3] && w.credits.some((c) => c.ref === binds[3])) throw new Error('UNIQUE constraint failed: credits.ref');
       w.credits.push({ delta: binds[1], reason: binds[2], ref: binds[3] });
+      // applyCreditGated 的账本行是 INSERT ... SELECT ... RETURNING id——回行让「已插入」判定成立。
+      if (/RETURNING id/.test(one)) return { results: [{ id: 1 }] };
       return {};
     }
 
@@ -204,9 +206,29 @@ test('策略本身：只有 401 自动禁用', () => {
   assert.equal(shouldAutoDisable(401), true);
   // 403 是地区/模型受限（OpenRouter 访问 OpenAI/Claude 就是这个形状），渠道没坏。
   assert.equal(shouldAutoDisable(403), false, '403 不得自动禁用渠道');
+  // 402 是渠道余额不足（聚合器单渠道欠费），换一家就好，也不禁用。
+  assert.equal(shouldAutoDisable(402), false, '402 不得自动禁用渠道');
   assert.equal(shouldAutoDisable(429), false, '限流走冷却，不是禁用');
   assert.equal(shouldAutoDisable(500), false);
   assert.equal(shouldAutoDisable(408), false);
+});
+
+/* ---------------------------------------------------------------- 402 方向 */
+
+test('上游 402：渠道余额不足——进软熔断、换下一个渠道，渠道保持启用', async () => {
+  const w = makeWorld();
+  // 渠道 6 返回 402（欠费）；同模型下没有第二个渠道——402 应按 4xx 语义结束，
+  // 但渠道必须保持启用（abilities 不动），预扣全额退回。
+  const first = await call(w, [{ status: 402, body: { error: { message: 'insufficient credits' } } }]);
+  assert.equal(first.res.status, 402, '按 4xx 语义结束本次请求');
+  assert.equal(w.channels[0].status, 1, '402 不代表渠道失效，必须保持启用');
+  assert.equal(w.abilities.every((a) => a.enabled === 1), true, '402 不得下线 abilities');
+  assert.equal(net(w), 0, '失败的请求要全额退款');
+
+  // 与 403 同语义：再请求一次会因软熔断直接 402（0 fetch），且不占重试配额——
+  // 若同模型下还有其它渠道，则会被继续尝试（此场景由 403-fallback 套件覆盖结构）。
+  const second = await call(w, [{ status: 402, body: { error: { message: 'insufficient credits' } } }]);
+  assert.equal(second.res.status, 402);
 });
 
 /* ---------------------------------------------------------------- 401 方向 */

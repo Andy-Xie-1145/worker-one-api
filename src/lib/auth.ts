@@ -103,10 +103,26 @@ export async function authenticateToken(env: Env, raw: string): Promise<TokenAut
   if (!key) return { error: '未提供令牌', status: 401 };
 
   const cacheKey = `token:${key}`;
-  let token = (await env.CACHE.get(cacheKey, 'json')) as TokenRow | null;
+  /*
+   * KV 只是加速层，不允许它变成单点：读失败回退 D1 直读，写失败静默放弃
+   * （最多损失 60 秒缓存收益）。令牌的有效期/状态/额度检查仍全部照做——
+   * 降级的只是速度，不是校验。
+   */
+  let token: TokenRow | null = null;
+  try {
+    token = (await env.CACHE.get(cacheKey, 'json')) as TokenRow | null;
+  } catch (error) {
+    console.error('[auth] KV 读失败，回退 D1：', error);
+  }
   if (!token) {
     token = await env.DB.prepare('SELECT * FROM tokens WHERE key = ?').bind(key).first<TokenRow>();
-    if (token) await env.CACHE.put(cacheKey, JSON.stringify(token), { expirationTtl: TOKEN_CACHE_TTL });
+    if (token) {
+      try {
+        await env.CACHE.put(cacheKey, JSON.stringify(token), { expirationTtl: TOKEN_CACHE_TTL });
+      } catch {
+        // 缓存写失败不影响本次请求。
+      }
+    }
   }
   if (!token) return { error: '无效的令牌', status: 401 };
 
@@ -117,12 +133,20 @@ export async function authenticateToken(env: Env, raw: string): Promise<TokenAut
   const now = Math.floor(Date.now() / 1000);
   if (token.expired_time !== -1 && token.expired_time < now) {
     await env.DB.prepare('UPDATE tokens SET status = ? WHERE id = ?').bind(TokenStatusExpired, token.id).run();
-    await env.CACHE.delete(cacheKey);
+    try {
+      await env.CACHE.delete(cacheKey);
+    } catch {
+      // KV 删除失败：条目 60 秒后自然过期，短暂读到旧状态可接受。
+    }
     return { error: '该令牌已过期', status: 403 };
   }
   if (!token.unlimited_quota && token.remain_quota <= 0) {
     await env.DB.prepare('UPDATE tokens SET status = ? WHERE id = ?').bind(TokenStatusExhausted, token.id).run();
-    await env.CACHE.delete(cacheKey);
+    try {
+      await env.CACHE.delete(cacheKey);
+    } catch {
+      // 同上：删除失败只影响缓存新鲜度。
+    }
     return { error: '该令牌额度已用尽', status: 403 };
   }
 
@@ -139,8 +163,13 @@ export async function authenticateToken(env: Env, raw: string): Promise<TokenAut
   return { token, user };
 }
 
+/** 缓存失效是 best-effort：KV 抖动不拦路（条目有 TTL 兜底）。 */
 export async function invalidateTokenCache(env: Env, key: string): Promise<void> {
-  await env.CACHE.delete(`token:${key}`);
+  try {
+    await env.CACHE.delete(`token:${key}`);
+  } catch {
+    // KV 故障时静默——TTL 到期自然一致。
+  }
 }
 
 /**

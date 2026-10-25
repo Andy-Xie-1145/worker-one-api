@@ -38,6 +38,25 @@ const RETRY_AFTER_FAIL_SEC = 60;
 /** 最近这么久内还有 no_channel，就不算恢复。和清扫 cron 的周期对齐。 */
 const RECOVERY_QUIET_SEC = 300;
 const DEFAULT_COOLDOWN_MIN = 30;
+/**
+ * 全局告警间隔（所有模型共享）。每模型的冷却挡不住「换着模型名刷告警」——
+ * 一把泄露的 Key 轮询不存在的模型就能灌满企业微信群。全局闸是兜底：
+ * 任何 120 秒内最多发出一条路由缺口告警。
+ */
+const GLOBAL_MIN_INTERVAL_SEC = 120;
+const GLOBAL_KEY = 'alert:routegap:__global__';
+
+/**
+ * 模型名来自 API 请求体，是攻击者可控的输入——进告警前剥掉换行/Markdown
+ * 结构字符并限长，防注入也防刷屏长名。
+ */
+function safeModelName(model: string): string {
+  const cleaned = String(model ?? '').replace(/[\r\n>*_`|[\]#]/g, ' ').trim();
+  return (cleaned.slice(0, 64)) || '(空模型名)';
+}
+
+/** 本 isolate 内的全局闸（KV 之前的第一道）。 */
+let lastGlobalAlertMs = 0;
 
 export interface GapState {
   model: string;
@@ -61,7 +80,8 @@ export interface GapDiagnosis {
 export type AlertOutcome = 'sent' | 'cooldown' | 'failed' | 'disabled';
 
 export function gapKey(model: string): string {
-  return `${KEY_PREFIX}${encodeURIComponent(model)}`;
+  // 模型名可能是任意请求输入：截断 + 编码，防 KV 键膨胀。
+  return `${KEY_PREFIX}${encodeURIComponent(safeModelName(model)).slice(0, 160)}`;
 }
 
 export function cooldownSec(env: Env): number {

@@ -30,6 +30,4 @@
   "triggers": {
     "crons": ["0 19 * * *", "*/5 * * * *"]
   }
-  // 自定义域按需配置（公开仓库不暴露线上域名）：
-  // "routes": [{ "pattern": "你的域名", "custom_domain": true }]
 }

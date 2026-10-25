@@ -163,6 +163,9 @@ test('pricing: longest-prefix match and quota arithmetic, no ratios anywhere', (
 test('deepseek: model line-up is priced, legacy V3 aliases are not guessed at', () => {
   assert.deepEqual(resolvePrice('deepseek-v4-flash').spec, { in: 0.44, out: 1.32, cached_in: 0.014 });
   assert.deepEqual(resolvePrice('deepseek-v4-pro').spec, { in: 1.32, out: 3.96, cached_in: 0.044 });
+  // V4.1 Flash（API 名 deepseek-flash）：两个名字同价，2026-09-10 官方价。
+  assert.deepEqual(resolvePrice('deepseek-v4.1-flash').spec, { in: 0.3, out: 1.2, cached_in: 0.006 });
+  assert.deepEqual(resolvePrice('deepseek-flash').spec, { in: 0.3, out: 1.2, cached_in: 0.006 });
   // The vision model must win the prefix match over plain -flash.
   assert.equal((resolvePrice('deepseek-v4-flash-vision-exp').spec as Price).in, 0.44);
   // deepseek-chat/-reasoner are gone from the docs; they fall back to the

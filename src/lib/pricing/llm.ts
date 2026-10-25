@@ -85,6 +85,11 @@ export const PRICE_TABLE: Record<string, Price> = {
   // DeepSeek — 官方公示价（$ / 1M tokens）。峰谷时段差异如需体现，用表达式配置：
   //   {"expr": "tier('offpeak', p * 0.22 + c * 0.66 + cr * 0.007)"}
   // Verified against https://api-docs.deepseek.com/quick_start/pricing
+  //
+  // V4.1 Flash（API 名 deepseek-flash，2026-09-10 起）：peak $0.30 / $1.20，
+  // 缓存命中 $0.006；off-peak 全线减半——要按谷时计费就用上面的表达式写法。
+  'deepseek-v4.1-flash': { in: 0.3, out: 1.2, cached_in: 0.006 },
+  'deepseek-flash': { in: 0.3, out: 1.2, cached_in: 0.006 },
   'deepseek-v4-flash-vision-exp': { in: 0.44, out: 1.32, cached_in: 0.014 },
   'deepseek-v4-flash': { in: 0.44, out: 1.32, cached_in: 0.014 },
   'deepseek-v4-pro': { in: 1.32, out: 3.96, cached_in: 0.044 },

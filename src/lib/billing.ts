@@ -1,6 +1,6 @@
 import { type Env, type TokenRow, type UserRow, LogTypeConsume, TokenStatusExhausted } from '../types';
 import { invalidateTokenCache, parseTokenPriceConfig } from './auth';
-import { calcQuotaDetailed, quotaFromRates, quotaToUSD } from './pricing';
+import { calcQuotaDetailed, quotaFromRates, quotaToUSD, LLM_PRICING_VERSION } from './pricing';
 import type { RateSet, PriceSource } from './pricing/llm';
 import type { ExprTrace } from './pricing/expr';
 import { applyCreditGated, applyCredit } from './ledger';
@@ -17,6 +17,11 @@ export interface Usage {
   cache_write_5m_tokens?: number;
   /** 1 小时 TTL 缓存写入 token（Anthropic cache_creation.ephemeral_1h_input_tokens）。 */
   cache_write_1h_tokens?: number;
+  /**
+   * OpenRouter / OpenAI 报的缓存**写入**（prompt_tokens_details.cache_write_tokens）。
+   * 只进 billing_meta 供审计，按普通输入价计——绝不当成缓存命中，也绝不让它影响金额。
+   */
+  cache_write_tokens?: number;
 }
 
 /**
@@ -126,7 +131,7 @@ export async function postConsume(
      * 不再重新查价——两次解析之间配置/时间函数可能变化，前后不一致会让找平出错。
      * 缺省时回退到重新解析（老调用方/测试的兼容路径）。
      */
-    billing?: { rates: RateSet; source: PriceSource; via?: 'requested' | 'upstream'; trace?: ExprTrace };
+    billing?: { rates: RateSet; source: PriceSource; via?: 'requested' | 'upstream'; billingModel?: string; trace?: ExprTrace };
   },
 ): Promise<number> {
   const { token, user, channelId, modelName, usage, preConsumed, options, elapsedMs } = args;
@@ -152,9 +157,25 @@ export async function postConsume(
     env.DB.prepare('UPDATE tokens SET used_quota = used_quota + ?, accessed_time = ? WHERE id = ?').bind(quota, now, token.id),
     env.DB.prepare('UPDATE channels SET used_quota = used_quota + ? WHERE id = ?').bind(quota, channelId),
     env.DB.prepare(
-      `INSERT INTO logs (user_id, created_at, type, content, username, token_name, model_name, quota, prompt_tokens, completion_tokens, channel_id, elapsed_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(user.id, now, LogTypeConsume, content, user.username, token.name, modelName, quota, usage.prompt_tokens, usage.completion_tokens, channelId, elapsedMs),
+      `INSERT INTO logs (user_id, created_at, type, content, username, token_name, model_name, quota, prompt_tokens, completion_tokens, channel_id, elapsed_ms, billing_meta)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      user.id, now, LogTypeConsume, content, user.username, token.name, modelName, quota,
+      usage.prompt_tokens, usage.completion_tokens, channelId, elapsedMs,
+      // billing_meta（0016）：「模型计费」页的缓存命中/价格版本都从这列聚合。
+      // 部署顺序是先迁移后发版，这里不做缺列兼容分支。
+      JSON.stringify({
+        pricing_version: LLM_PRICING_VERSION,
+        billing_model: args.billing?.billingModel ?? modelName,
+        source: args.billing?.source ?? detail.source,
+        via: args.billing?.via ?? null,
+        cached_tokens: usage.cached_tokens ?? 0,
+        cache_write_5m_tokens: usage.cache_write_5m_tokens ?? 0,
+        cache_write_1h_tokens: usage.cache_write_1h_tokens ?? 0,
+        cache_write_tokens: usage.cache_write_tokens ?? 0,
+        ...(args.billing?.trace?.matchedTier ? { tier: args.billing.trace.matchedTier } : {}),
+      }),
+    ),
   ];
   if (delta !== 0 && !token.unlimited_quota) {
     also.push(env.DB.prepare('UPDATE tokens SET remain_quota = remain_quota - ? WHERE id = ?').bind(delta, token.id));

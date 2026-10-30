@@ -400,3 +400,38 @@ export async function loadModelBilling(
   const channels = (await channelsP).results ?? [];
   return buildModelBilling({ channels, usage, options, now, billingMetaAvailable });
 }
+
+// ------------------------------------------------------------------ 未定价审计
+
+export interface UnpricedRow {
+  channelId: number;
+  channelName: string;
+  channelType: string;
+  /** 请求方会用的名字（渠道 models 里写的）。 */
+  requested: string;
+  /** model_mapping 之后要查价的上游名；没有映射时与 requested 相同。 */
+  upstream: string;
+}
+
+/** 兜底价是否在起作用（决定未定价是「拒绝」还是「按默认价记账」）。 */
+export function fallbackActive(options?: Options): boolean {
+  return !!options?.DefaultPrice;
+}
+
+/**
+ * 找出启用渠道上查不到价的 (渠道, 模型) 组合——严格计费下这些组合会以
+ * model_price_not_configured 拒绝，部署前必须清零（审计脚本与 CLI 的 `billing check`）。
+ */
+export function findUnpricedChannelModels(channels: ChannelRow[], options?: Options): UnpricedRow[] {
+  const out: UnpricedRow[] = [];
+  for (const channel of channels) {
+    if (channel.status !== 1) continue;
+    for (const requested of (channel.models ?? '').split(',').map((m) => m.trim()).filter(Boolean)) {
+      const upstream = mapModel(channel, requested);
+      if (!resolveBillableModel(requested, upstream, options)) {
+        out.push({ channelId: channel.id, channelName: channel.name, channelType: channel.type, requested, upstream });
+      }
+    }
+  }
+  return out;
+}

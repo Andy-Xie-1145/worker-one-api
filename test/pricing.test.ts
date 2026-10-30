@@ -43,6 +43,52 @@ test('别名剥前缀在每一级都生效', () => {
   assert.equal(stripAliasPrefix('meta/llama-3'), 'meta/llama-3', '无关斜杠不被剥');
 });
 
+// ---------------------------------------------------------------- 别名表 / 快照 / 无前缀（v2.1）
+
+test('PRICE_ALIASES：拼写变体显式指到规范名（点号 vs 短横线）', () => {
+  // 聚合器写 claude-opus-5.5（点号），表里是官方的 claude-opus-5-5（短横线）——同一模型
+  assert.deepEqual(resolvePrice('claude-opus-5.5').spec, { in: 4, out: 20, cached_in: 0.2, cache_write_5m: 5, cache_write_1h: 8 });
+  assert.deepEqual(resolvePrice('claude-sonnet-5.5').spec, { in: 2, out: 10, cached_in: 0.1, cache_write_5m: 2.5, cache_write_1h: 4 });
+  // Azure 部署名就是 gpt-3.5-turbo
+  assert.deepEqual(resolvePrice('gpt-35-turbo').spec, { in: 0.5, out: 1.5 });
+  // 别名也能被覆盖盖掉（Key 覆盖同样按别名命中的规范名/原名查）
+  const key = { 'claude-opus-5.5': { in: 99, out: 99 } };
+  assert.deepEqual(resolvePrice('claude-opus-5.5', undefined, undefined, key).spec, { in: 99, out: 99 });
+});
+
+test('快照后缀：只剥结尾日期，版本号永不剥', () => {
+  assert.deepEqual(resolvePrice('gpt-4o-2024-11-20').spec, { in: 2.5, out: 10 });
+  assert.deepEqual(resolvePrice('claude-sonnet-4-20250514').spec, { in: 3, out: 15, cache_write_5m: 3.75, cache_write_1h: 6 });
+  // 带日期的快照也可以配独立覆盖（按剥离后的名字写）
+  const key = { 'gpt-4o': { in: 1, out: 1 } };
+  assert.deepEqual(resolvePrice('gpt-4o-2024-11-20', undefined, undefined, key).spec, { in: 1, out: 1 });
+  // 版本号不是日期：gpt-4.1-mini 不会被剥成 gpt-4
+  assert.deepEqual(resolvePrice('gpt-4.1-mini').spec, { in: 0.4, out: 1.6 });
+});
+
+test('最长前缀已删除：名字不在表/别名里就是查不到，绝不"看起来像"', () => {
+  // claude-opus-4-7 不在表里：旧行为会按 claude-opus-4 的 $15/$75 三倍误收（上游 264 笔事故同类），
+  // 现在如实回落默认价——宁可报警补价，也不猜
+  assert.equal(resolvePrice('claude-opus-4-7').source, 'default');
+  assert.equal(findPrice('claude-opus-4-7'), null);
+  assert.equal(findPrice('kimi-k2.6'), null, '点号版本同样不被 kimi-k2 前缀猜到');
+  // 精确命中不受影响
+  assert.equal(resolvePrice('claude-opus-4').source, 'builtin');
+});
+
+test('映射改名后只认上游名：请求名的表价不再兜底', () => {
+  // gpt-4o 有内置价 $2.5/$10；映射把它指到 gpt-4o-mini（$0.15/$0.6）——计价跟着映射走
+  assert.deepEqual(
+    resolvePrice('gpt-4o', undefined, 'gpt-4o-mini').spec,
+    { in: 0.15, out: 0.6 },
+  );
+  // 但管理员给请求名显式定的价仍然最优先（对外价是明确决定，映射不能偷偷改它）
+  const key = { 'gpt-4o': { in: 9, out: 9 } };
+  assert.deepEqual(resolvePrice('gpt-4o', undefined, 'gpt-4o-mini', key).spec, { in: 9, out: 9 });
+  // 映射指向无价模型 + 有兜底价 → 兜底；严格计费 → default 之外还有 null（resolveBillableModel）
+  assert.deepEqual(resolvePrice('deepseek-v4-flash', undefined, 'deepseek/deepseek-v4.1-flash', { 'deepseek/deepseek-v4.1-flash': { in: 0.13, out: 0.52 } }).spec, { in: 0.13, out: 0.52 });
+});
+
 test('上游模型名兜底：请求名查不到时按 model_mapping 之后的真实名字查', () => {
   const global = opts({ 'gemini-3.1-flash-lite': { in: 0.25, out: 1.5 } });
   const r = resolvePrice('gemini-flash-lite-latest', global, 'gemini-3.1-flash-lite');

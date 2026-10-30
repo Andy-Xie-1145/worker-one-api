@@ -1,18 +1,12 @@
 /**
- * LLM 计费审计的纯逻辑：只读 SQL 守卫 + 未定价模型判定。
+ * LLM 计费审计的纯逻辑：只读 SQL 守卫（本地）+ 未定价判定（转发 src/lib/model-billing）。
  *
  * 不碰网络、不碰 D1——scripts/audit-llm-billing.ts 负责取数，这里只做判断，
  * 好让 test/audit-billing.test.ts 能逐条钉死。
  *
- * （上游 webclaw-api 的同名文件还包含一段「修复前旧计价规则复刻」的历史回放逻辑，
- * 那是他们生产账目的一次性补偿工具，与本项目无关，没有移植。）
+ * 判定逻辑本体（findUnpricedChannelModels / fallbackActive）放在 src/lib/model-billing.ts，
+ * CLI 的 `billing check` 与本脚本共用同一份，绝不各自实现。
  */
-import { findPrice, resolveBillableModel } from '../../src/lib/pricing/llm';
-import { mapModel } from '../../src/lib/channel';
-import type { ChannelRow } from '../../src/types';
-import type { Options } from '../../src/lib/options';
-
-/* ------------------------------------------------------------ 只读守卫 */
 
 const FORBIDDEN =
   /\b(INSERT|UPDATE|DELETE|REPLACE|UPSERT|ALTER|DROP|CREATE|TRUNCATE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
@@ -36,40 +30,4 @@ export const AUDIT_SQL = {
   options: "SELECT key, value FROM options WHERE key IN ('ModelPriceOverride', 'DefaultPrice')",
 };
 
-/* ------------------------------------------------------------ 未定价判定 */
-
-export interface UnpricedRow {
-  channelId: number;
-  channelName: string;
-  channelType: string;
-  /** 请求方会用的名字（渠道 models 里写的）。 */
-  requested: string;
-  /** model_mapping 之后要查价的上游名；没有映射时与 requested 相同。 */
-  upstream: string;
-}
-
-/**
- * 找出启用渠道上查不到价的 (渠道, 模型) 组合——严格计费下这些组合会以
- * model_price_not_configured 拒绝，部署前必须清零。
- */
-export function findUnpricedChannelModels(channels: ChannelRow[], options?: Options): UnpricedRow[] {
-  const out: UnpricedRow[] = [];
-  for (const channel of channels) {
-    if (channel.status !== 1) continue;
-    for (const requested of (channel.models ?? '').split(',').map((m) => m.trim()).filter(Boolean)) {
-      const upstream = mapModel(channel, requested);
-      if (!resolveBillableModel(requested, upstream, options)) {
-        out.push({ channelId: channel.id, channelName: channel.name, channelType: channel.type, requested, upstream });
-      }
-    }
-  }
-  return out;
-}
-
-/** 兜底价是否在起作用（决定未定价是「拒绝」还是「按默认价记账」）。 */
-export function fallbackActive(options?: Options): boolean {
-  return !!options?.DefaultPrice;
-}
-
-/** 便利重导出：watchdog 的按声明扫描与这里共用 findPrice 的「查不到就是查不到」。 */
-export { findPrice };
+export { findUnpricedChannelModels, fallbackActive } from '../../src/lib/model-billing';

@@ -830,6 +830,7 @@ let billingFilter = { q: '', unconfOnly: false };
 
 async function pageModelBilling(view) {
   await loadModelBilling(view);
+  autoRefresh(() => loadModelBilling(view)); // 与手动「刷新」按钮共存：按钮只触发单次重拉，不叠加定时器
 }
 
 async function loadModelBilling(view) {
@@ -840,6 +841,14 @@ async function loadModelBilling(view) {
   const fb = d.fallback_price;
   const fmtCost = (n) => '$' + Number(n || 0).toFixed(4);
   const fmtNum = (n) => (n === null || n === undefined ? '—' : Number(n).toLocaleString('en-US'));
+  // generated_at 是 unix 秒 → 本地时间 YYYY-MM-DD HH:mm
+  const fmtDateTime = (sec) => {
+    if (sec === null || sec === undefined || sec === '') return '—';
+    const dt = new Date(Number(sec) * 1000);
+    if (Number.isNaN(dt.getTime())) return '—';
+    const p2 = (n) => String(n).padStart(2, '0');
+    return `${dt.getFullYear()}-${p2(dt.getMonth() + 1)}-${p2(dt.getDate())} ${p2(dt.getHours())}:${p2(dt.getMinutes())}`;
+  };
   // 字段值：数字直接显示；费率表达式字符串用 mono 截断显示（title 全文）。
   const pcell = (spec, f) => {
     const v = spec?.[f];
@@ -907,7 +916,7 @@ async function loadModelBilling(view) {
         <button id="brefresh">刷新</button>
       </div>
       <div id="btbl"></div>
-      <p class="muted" style="margin:10px 0 0">计费版本 <span class="mono">${esc(d.current_pricing_version || '—')}</span> · 排序：未配置在前、花费降序${d.billing_meta_available ? '' : ' · <b>部分模型缺少计费元数据</b>'}。</p>
+      <p class="muted" style="margin:10px 0 0">计费版本 <span class="mono">${esc(d.current_pricing_version || '—')}</span> · 生成于 ${fmtDateTime(d.generated_at)} · 排序：未配置在前、花费降序${d.billing_meta_available ? '' : ' · <b>部分模型缺少计费元数据</b>'}。</p>
     </div>
   </div>`));
 
@@ -915,10 +924,11 @@ async function loadModelBilling(view) {
   const renderTable = () => {
     const q = billingFilter.q.trim().toLowerCase();
     const shown = models.filter((m) => (!billingFilter.unconfOnly || m.configured === false) && (!q || m.model.toLowerCase().includes(q)));
-    tbl.innerHTML = table(['模型', '状态', '输入 $/1M', '缓存读', '缓存写5m/1h', '特殊规则', '7天请求', '7天消费', '来源', '操作'], shown, (m) => `<tr>
-      <td class="mono">${esc(m.model)}</td>
+    tbl.innerHTML = table(['模型', '状态', '输入 $/1M', '输出 $/1M', '缓存读', '缓存写5m/1h', '特殊规则', '7天请求', '7天消费', '来源', '操作'], shown, (m) => `<tr${m.configured ? '' : ' style="background:color-mix(in srgb, var(--err) 7%, transparent)"'}>
+      <td class="mono">${esc(m.model)}${m.active === false ? ' <span class="tag warn" title="近 7 天日志里出现，但没有启用渠道声明它">无启用渠道</span>' : ''}</td>
       <td>${statusTag(m)}</td>
       <td>${pcell(m.price, 'in')}</td>
+      <td>${pcell(m.price, 'out')}</td>
       <td>${pcell(m.price, 'cached_in')}</td>
       <td>${pcell(m.price, 'cache_write_5m')} / ${pcell(m.price, 'cache_write_1h')}</td>
       <td class="muted" style="max-width:240px">${m.rules?.length ? esc(m.rules.join('、')) : '—'}</td>

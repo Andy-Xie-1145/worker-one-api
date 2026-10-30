@@ -89,11 +89,15 @@ export function normalizeUsage(u: any): Usage {
   // DeepSeek reports prompt_cache_hit_tokens; OpenAI nests it under
   // prompt_tokens_details.cached_tokens. Both are a subset of prompt_tokens.
   const cached = Number(u?.prompt_cache_hit_tokens ?? u?.prompt_tokens_details?.cached_tokens ?? 0) || 0;
+  // OpenRouter / OpenAI 报的缓存**写入**，同样是 prompt_tokens 的子集。只进 billing_meta
+  // 供审计，按普通输入价计——绝不当成缓存命中，也不影响金额。
+  const cacheWrite = Number(u?.prompt_tokens_details?.cache_write_tokens ?? 0) || 0;
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: prompt + completion,
     ...(cached > 0 ? { cached_tokens: Math.min(cached, prompt) } : {}),
+    ...(cacheWrite > 0 ? { cache_write_tokens: Math.min(cacheWrite, prompt) } : {}),
   };
 }
 

@@ -223,6 +223,99 @@ test('token set：改名/改额度/改模型限制；价格要走专门子命令
   assert.ok(!bad.ok && /不可修改的字段/.test(bad.output));
 });
 
+/* ------------------------------------------------- 新增：pull / test / billing / default */
+
+function mockUpstream(models: string[], status = 200) {
+  const original = globalThis.fetch;
+  let body = '';
+  globalThis.fetch = (async (_url: any, init: any) => {
+    body = String(init?.body ?? '');
+    return new Response(JSON.stringify({ data: models.map((id) => ({ id })) }), { status });
+  }) as any;
+  return { restore: () => (globalThis.fetch = original), get body() { return body; } };
+}
+
+test('channel pull：拉上游列表；--add 合并去重进渠道 models', async () => {
+  const env = envOf();
+  const added = await run(env, 'channel add openai 上游 https://up.test/v1 sk-up --models gpt-4o');
+  const id = /#(\d+)/.exec(added.output)![1];
+
+  const s = mockUpstream(['gpt-4o', 'gpt-5.5', 'o4-mini']);
+  try {
+    const pull = await run(env, `channel pull ${id}`);
+    assert.ok(pull.ok, pull.output);
+    assert.match(pull.output, /gpt-5\.5/);
+
+    const add = await run(env, `channel pull ${id} --add`);
+    assert.ok(add.ok, add.output);
+    assert.match(add.output, /新增 2/);
+    const list = await run(env, 'channel list');
+    assert.match(list.output, /gpt-4o,gpt-5\.5,o4-mini/, '手工项保留 + 追加去重');
+    // 模型真的进了路由索引
+    assert.match((await run(env, 'models')).output, /o4-mini/);
+  } finally {
+    s.restore();
+  }
+});
+
+test('channel test：显式模型必须属于该渠道；成功回写测试时间', async () => {
+  const env = envOf();
+  const added = await run(env, 'channel add openai 上游 https://up.test sk-up --models gpt-4o');
+  const id = /#(\d+)/.exec(added.output)![1];
+
+  const bad = await run(env, `channel test ${id} claude-x`);
+  assert.ok(!bad.ok && /不属于该渠道/.test(bad.output));
+
+  const s = mockUpstream(['gpt-4o']);
+  try {
+    const okRun = await run(env, `channel test ${id} gpt-4o`);
+    assert.ok(okRun.ok, okRun.output);
+    assert.match(okRun.output, /测试成功/);
+    assert.match(okRun.output, /gpt-4o/);
+  } finally {
+    s.restore();
+  }
+});
+
+test('billing：list / get / check 与严格开关', async () => {
+  const env = envOf();
+  await run(env, 'channel add openai 主力 https://up.test sk-up --models gpt-4o,mystery');
+
+  // 宽松模式（有兜底价）：一切"已配置"，mystery 按兜底价记账
+  const list = await run(env, 'billing list');
+  assert.ok(list.ok, list.output);
+  assert.match(list.output, /宽松计费/);
+  assert.match(list.output, /未配置 0/);
+
+  // 清掉兜底价 → 严格计费：mystery 变为未配置且排在最前
+  const cleared = await run(env, 'price default --clear');
+  assert.ok(cleared.ok, cleared.output);
+  const mode = await run(env, 'price default');
+  assert.match(mode.output, /严格计费/);
+
+  const listStrict = await run(env, 'billing list');
+  assert.match(listStrict.output, /严格计费/);
+  assert.match(listStrict.output, /未配置 1/);
+  assert.match(listStrict.output.split('\n').slice(-3).join('\n'), /mystery/, '未配置的排最前');
+
+  const got = await run(env, 'billing get mystery');
+  assert.ok(got.ok, got.output);
+  assert.match(got.output, /未配置/);
+  assert.match(got.output, /上游=mystery/);
+
+  const checkStrict = await run(env, 'billing check');
+  assert.ok(!checkStrict.ok, '严格计费下有未定价组合应当非零退出');
+  assert.match(checkStrict.output, /model_price_not_configured/);
+
+  // gpt-4o 有内置价，不受影响；设回兜底价恢复宽松
+  const gotPriced = await run(env, 'billing get gpt-4o');
+  assert.match(gotPriced.output, /已配置/);
+  assert.match(gotPriced.output, /来源=table/);
+  const back = await run(env, 'price default in=1 out=3');
+  assert.ok(back.ok, back.output);
+  assert.match((await run(env, 'billing check')).output, /宽松计费/);
+});
+
 // ---------------------------------------------------------------- runner
 
 let failed = 0;

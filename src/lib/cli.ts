@@ -2,11 +2,15 @@ import type { Env, TokenRow, ChannelRow } from '../types';
 import { getOptions, setOptions, DEFAULT_OPTIONS } from './options';
 import { ensureOwner, invalidateTokenCache } from './auth';
 import { applyCredit, reconcile } from './ledger';
-import { rebuildAbilities, deleteAbilities, listModels } from './channel';
+import { rebuildAbilities, deleteAbilities, listModels, resolveTestModel, parseConfig } from './channel';
 import { getHeartbeat, runWatchdog } from './watchdog';
 import { randomKey } from './crypto';
+import { getAdaptor } from '../relay';
+import type { AdaptorContext } from '../relay/adaptor';
+import { listUpstreamModels } from './upstream-models';
+import { loadModelBilling, findUnpricedChannelModels, fallbackActive } from './model-billing';
 import {
-  PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, QUOTA_PER_USD, quotaToUSD,
+  PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, PRICE_ALIASES, QUOTA_PER_USD, quotaToUSD,
   validatePriceSpec, resolvePrice, type PriceSpec,
 } from './pricing/llm';
 import { TokenStatusEnabled, TokenStatusDisabled, ChannelStatusEnabled, ChannelStatusManuallyDisabled, LogTypeManage } from '../types';
@@ -139,6 +143,7 @@ async function dispatch(env: Env, tokens: string[]): Promise<CliResult> {
     case 'channel': return channelCmd(env, tokens.slice(1));
     case 'token': return tokenCmd(env, tokens.slice(1));
     case 'price': return priceCmd(env, tokens.slice(1));
+    case 'billing': return billingCmd(env, tokens.slice(1));
     case 'opt': return optCmd(env, tokens.slice(1));
     case 'logs': return logs(env, Number(tokens[1]) || 10);
     case 'health': return health(env);
@@ -269,14 +274,63 @@ async function channelCmd(env: Env, args: string[]): Promise<CliResult> {
       return { ok: true, output: `渠道 #${id}「${updated!.name}」已更新（模型：${updated!.models || '—'}，状态=${updated!.status}）` };
     }
     case 'test': {
-      // 复用管理接口的测试逻辑太重（要 fetch 上游）；这里只报告渠道状态。
+      // 真测试：与后台按钮同一语义——显式 model 必须 ∈ 渠道 models（堵 key 后门），
+      // 直连上游发一个 1-token 请求，回写 test_time / response_time。
       const id = Number(rest[0]);
-      const ch = await env.DB.prepare('SELECT id, name, status, response_time, test_time FROM channels WHERE id = ?').bind(id).first<any>();
+      const ch = await env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
       if (!ch) return { ok: false, output: `渠道 #${rest[0]} 不存在` };
-      return { ok: true, output: `渠道 #${ch.id}「${ch.name}」状态=${ch.status} 上次响应=${ch.response_time || '—'}ms 测试时间=${ch.test_time ? new Date(ch.test_time * 1000).toISOString() : '—'}（在线测试请用后台「渠道」页的测试按钮）` };
+      const picked = resolveTestModel(ch, rest[1]);
+      if ('error' in picked) return { ok: false, output: picked.error };
+      const model = picked.model;
+
+      const adaptor = getAdaptor(ch.type);
+      const ctx: AdaptorContext = {
+        channel: ch,
+        upstreamModel: model,
+        requestedModel: model,
+        mode: 'chat',
+        path: 'chat/completions',
+        config: (() => { try { return JSON.parse(ch.config || '{}'); } catch { return {}; } })(),
+      };
+      const started = Date.now();
+      try {
+        const built = adaptor.buildRequest({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }, ctx);
+        const resp = await fetch(built.url, { method: 'POST', headers: built.headers, body: built.body, signal: AbortSignal.timeout(30_000) });
+        const elapsed = Date.now() - started;
+        const text = await resp.text().catch(() => '');
+        await env.DB.prepare('UPDATE channels SET test_time = ?, response_time = ? WHERE id = ?').bind(Math.floor(Date.now() / 1000), elapsed, id).run();
+        if (!resp.ok) return { ok: false, output: `测试失败 (${resp.status})：${text.slice(0, 300)}` };
+        return { ok: true, output: `测试成功：模型 ${model}，耗时 ${elapsed}ms` };
+      } catch (e: any) {
+        return { ok: false, output: `测试失败：${e?.message ?? e}` };
+      }
+    }
+    case 'pull': {
+      // 从上游拉取模型列表：用库存 key 请求上游 /models（5 种类型各自适配）。
+      // 默认只打印；--add 把列表合并进渠道 models（与现有项去重，手工项保留）。
+      const id = Number(rest[0]);
+      const ch = await env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
+      if (!ch) return { ok: false, output: `渠道 #${rest[0]} 不存在` };
+      let models: string[];
+      try {
+        models = await listUpstreamModels({ type: ch.type, baseUrl: ch.base_url ?? '', key: ch.key, config: parseConfig(ch) });
+      } catch (e: any) {
+        return { ok: false, output: `拉取失败：${e?.message ?? e}` };
+      }
+      if (!models.length) return { ok: false, output: '上游返回空列表' };
+      if (rest.includes('--add')) {
+        const existing = (ch.models ?? '').split(',').map((m) => m.trim()).filter(Boolean);
+        const merged = [...new Set([...existing, ...models])];
+        await env.DB.prepare('UPDATE channels SET models = ? WHERE id = ?').bind(merged.join(','), id).run();
+        const updated = await env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
+        await rebuildAbilities(env, updated!);
+        const added = merged.length - existing.length;
+        return { ok: true, output: `已合并 ${models.length} 个上游模型（新增 ${added}，去重后共 ${merged.length}）；路由索引已重建` };
+      }
+      return { ok: true, output: `上游模型 ${models.length} 个（--add 合并进渠道 models）：\n` + models.join(', ') };
     }
     default:
-      return { ok: false, output: '用法：channel list | add <类型> <名称> <base_url> <api_key> --models a,b | set <id> name=... models=... | show <id> | on <id> | off <id> | del <id>' };
+      return { ok: false, output: '用法：channel list | add <类型> <名称> <base_url> <api_key> --models a,b | set <id> name=... models=... | show <id> | test <id> [模型] | pull <id> [--add] | on <id> | off <id> | del <id>' };
   }
 }
 
@@ -482,19 +536,99 @@ async function priceCmd(env: Env, args: string[]): Promise<CliResult> {
       return { ok: true, output: `模型 ${model} 的覆盖已清除，回到内置价` };
     }
     case 'default': {
+      // 无参数 = 查看当前模式；--clear = 清除兜底价（严格计费）；in=/out= = 设置。
+      if (rest.includes('--clear') || rest.includes('off')) {
+        await setOptions(env, { DefaultPrice: null });
+        return { ok: true, output: '已清除兜底价：严格计费启用——查不到价的请求将以 503 model_price_not_configured 拒绝（价格页或 price default in=X out=Y 可随时设回）' };
+      }
+      if (!rest.length) {
+        const dp = options.DefaultPrice;
+        return { ok: true, output: dp ? `当前兜底价 $${dp.in} / $${dp.out}（宽松计费：未定价模型按它记账）` : '未设兜底价：严格计费（未定价模型 503 model_price_not_configured）' };
+      }
       const kv = kvOf(rest);
-      if (!kv.has('in') || !kv.has('out')) return { ok: false, output: '用法：price default in=1 out=3（未知模型的兜底价，只支持常量）' };
+      if (!kv.has('in') || !kv.has('out')) return { ok: false, output: '用法：price default in=1 out=3（未知模型的兜底价，只支持常量）| price default --clear（清除，启用严格计费）' };
       const v = validatePriceSpec({ in: Number(kv.get('in')), out: Number(kv.get('out')) });
       if (!v.ok) return { ok: false, output: `兜底价有误：${v.error}` };
       await setOptions(env, { DefaultPrice: v.spec });
-      return { ok: true, output: `兜底价已设为 $${v.spec.in} / $${v.spec.out}` };
+      return { ok: true, output: `兜底价已设为 $${v.spec.in} / $${v.spec.out}（宽松计费）` };
     }
     case 'aliases': {
-      return { ok: true, output: `别名前缀（查价前剥掉）：${ALIAS_PREFIXES.join('  ')}` };
+      const prefixPart = `厂商前缀（查价前剥掉）：${ALIAS_PREFIXES.join('  ')}`;
+      const aliasRows = Object.entries(PRICE_ALIASES).map(([from, to]) => [from, '→', to]);
+      const aliasPart = aliasRows.length
+        ? '\n拼写别名（显式映射到规范名，不做自动猜测）：\n' + table(['别名', '', '规范名'], aliasRows)
+        : '\n（无拼写别名）';
+      return { ok: true, output: prefixPart + aliasPart };
     }
     default:
       return { ok: false, output: '用法：price list [过滤] | get <模型> | set <模型> in=X out=Y [cached=Z] [cw5=A] [cw1=B] | rm <模型> | default in=X out=Y | aliases' };
   }
+}
+
+// ---------------------------------------------------------------- billing（模型计费）
+
+async function billingCmd(env: Env, args: string[]): Promise<CliResult> {
+  const [sub, ...rest] = args;
+  const options = await getOptions(env);
+
+  if (sub === 'check') {
+    // 部署前自检：严格/宽松模式 + 启用渠道上的未定价组合。与 npm run audit:llm-billing 同源。
+    const channels = await env.DB.prepare('SELECT id, name, type, status, models, model_mapping FROM channels ORDER BY id').all<ChannelRow>();
+    const unpriced = findUnpricedChannelModels(channels.results ?? [], options);
+    const strict = !fallbackActive(options);
+    const lines = [
+      strict
+        ? '严格计费：未定价模型的请求会被 503 model_price_not_configured 拒绝'
+        : `宽松计费：未定价模型按兜底价 $${options.DefaultPrice?.in}/$${options.DefaultPrice?.out} 记账（price default --clear 可切换）`,
+      `未定价 (渠道, 模型) 组合：${unpriced.length}`,
+    ];
+    for (const r of unpriced) {
+      lines.push(`  - 渠道 #${r.channelId}「${r.channelName}」(${r.channelType})：${r.requested}${r.upstream !== r.requested ? `（上游 ${r.upstream}）` : ''}`);
+    }
+    return { ok: unpriced.length === 0 || !strict, output: lines.join('\n') };
+  }
+
+  if (sub === 'get') {
+    const model = rest[0];
+    if (!model) return { ok: false, output: '用法：billing get <模型名>' };
+    const report = await loadModelBilling(env.DB, options);
+    const row = report.models.find((m) => m.model === model);
+    if (!row) return { ok: false, output: `模型 ${model} 不在报表里（未被启用渠道声明，近 7 天也没有日志）` };
+    const lines = [
+      `${model}：${row.configured ? '已配置' : row.partially_configured ? '部分配置' : '未配置'}${row.active ? '' : '（无启用渠道声明，仅近 7 天日志）'}`,
+      `价格：输入 ${fmtRate(row.price?.in)} / 输出 ${fmtRate(row.price?.out)} / 缓存读 ${fmtRate(row.price?.cached_in)} / 写5m ${fmtRate(row.price?.cache_write_5m)} / 写1h ${fmtRate(row.price?.cache_write_1h)}${row.price_varies ? '（⚠ 各渠道价格不一致）' : ''}`,
+      `规则：${row.rules.length ? row.rules.join('；') : '—'}`,
+      `7 天：${row.usage.requests} 次 / ${row.usage.prompt_tokens}+${row.usage.completion_tokens} tokens / $${row.usage.cost_usd.toFixed(4)}` +
+        (row.usage.cache_hit_rate !== null ? ` / 缓存命中 ${(row.usage.cache_hit_rate * 100).toFixed(1)}%` : ' / 缓存未知'),
+      ...row.channels.map((ch) =>
+        `  - #${ch.id}「${ch.name}」${ch.type} ${ch.enabled ? '启用' : '停用'}${ch.declared ? '' : '（仅日志）'} 上游=${ch.upstream_model} 有价=${ch.configured ? '是' : '否'} 来源=${ch.source ?? '—'}（按${ch.via === 'upstream' ? '上游名' : '请求名'}）`),
+    ];
+    return { ok: true, output: lines.join('\n') };
+  }
+
+  if (sub === undefined || sub === 'list') {
+    const filter = rest[0]?.toLowerCase();
+    const report = await loadModelBilling(env.DB, options);
+    const rows: string[][] = [];
+    for (const m of report.models) {
+      if (filter && !m.model.toLowerCase().includes(filter)) continue;
+      rows.push([
+        m.model,
+        m.configured ? '✓' : m.partially_configured ? '部分' : '✗',
+        fmtRate(m.price?.in),
+        fmtRate(m.price?.cached_in),
+        m.usage.requests ? String(m.usage.requests) : '—',
+        m.usage.requests ? `$${m.usage.cost_usd.toFixed(4)}` : '—',
+        (m.sources ?? []).join('/') || '—',
+      ]);
+    }
+    const head =
+      `模型 ${report.totals.models} 个，未配置 ${report.totals.unconfigured}；近 7 天 ${report.totals.requests} 次 / $${report.totals.cost_usd.toFixed(4)}；` +
+      (report.strict_billing ? '严格计费（未定价拒绝）' : '宽松计费（有兜底价）');
+    return { ok: true, output: `${head}\n` + table(['模型', '状态', '输入', '缓存读', '7天请求', '7天消费', '来源'], rows) };
+  }
+
+  return { ok: false, output: '用法：billing list [过滤] | billing get <模型名> | billing check' };
 }
 
 // ---------------------------------------------------------------- opt / logs / health
@@ -575,7 +709,14 @@ function helpText(command?: string): string {
       'channel set <id> name=... type=... base_url=... key=... models=a,b priority=N weight=N status=1',
       '                                         按字段修改渠道（改 models 自动重建路由索引）',
       'channel show <id>                        渠道详情（密钥打码）',
+      'channel test <id> [模型]                 直连上游测一个模型（不传 = 列表第一个；必须属于该渠道）',
+      'channel pull <id> [--add]                用渠道 key 拉上游 /models；--add 合并进 models（去重）',
       'channel on <id> / off <id> / del <id>    启用 / 停用 / 删除',
+    ].join('\n'),
+    billing: [
+      'billing list [过滤]                      模型计费报表（状态/费率/7天用量，未配置在前）',
+      'billing get <模型>                       单模型详情：渠道明细 + 价格 + 用量 + 缓存命中',
+      'billing check                            部署前自检：严格模式 + 启用渠道未定价组合',
     ].join('\n'),
     token: [
       'token list                               令牌列表',
@@ -586,12 +727,14 @@ function helpText(command?: string): string {
       'token price <id> [JSON | --clear]        查看设置清除该 Key 的按模型价格',
     ].join('\n'),
     price: [
-      'price list [过滤]                        价格表（含来源：内置/覆盖）',
-      'price get <模型>                         查看一个模型的价格',
-      'price set <模型> in=X out=Y [cached=Z]   固定价覆盖（美元/1M）',
-      'price set <模型> expr="p * 3 + c * 15"   表达式覆盖（微美元，见价格页文档）',
+      'price list [过滤]                        价格表（含来源与缓存写 5m/1h 价）',
+      'price get <模型>                         查看一个模型的价格（表达式截断显示）',
+      'price set <模型> in=X out=Y [cached=Z] [cw5=A] [cw1=B]   常量覆盖（美元/1M）',
+      'price set <模型> in="4 * (context > 272k ? 2 : 1)"       字段费率表达式（v2，变量 context/n + 探针/时间函数）',
       'price rm <模型>                          清除覆盖，回到内置价',
-      'price default in=X out=Y                 未知模型的兜底价',
+      'price default                            查看当前兜底价与计费模式',
+      'price default in=X out=Y                 设兜底价（宽松计费）',
+      'price default --clear                    清除兜底价 = 启用严格计费（未定价 503 拒绝）',
       'price aliases                            别名前缀列表',
     ].join('\n'),
     opt: [
@@ -602,7 +745,7 @@ function helpText(command?: string): string {
   if (command && sections[command]) return sections[command];
   return [
     ...intro,
-    '命令分组：general(默认) | channel | token | price | opt',
+    '命令分组：general(默认) | channel | token | price | billing | opt',
     'help <分组名> 查看该组命令。',
     '',
     sections.general,
@@ -612,6 +755,8 @@ function helpText(command?: string): string {
     sections.token,
     '',
     sections.price,
+    '',
+    sections.billing,
     '',
     sections.opt,
   ].join('\n');

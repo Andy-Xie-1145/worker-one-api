@@ -125,6 +125,8 @@ channel add <类型> <名称> <base_url> <key> --models m1,m2 [--priority N] [--
 channel set <id> name=... type=... base_url=... key=... models=a,b priority=N weight=N status=1
                                                     按字段修改（改 models 自动重建路由索引）
 channel show <id>                                   详情（密钥打码）
+channel test <id> [模型]                            直连上游测一个模型（不传 = 第一个；必须属于该渠道）
+channel pull <id> [--add]                           用渠道 key 拉上游 /models；--add 合并进 models（去重）
 channel on <id> / off <id> / del <id>               启用 / 停用 / 删除
 
 # 令牌
@@ -137,13 +139,19 @@ token on <id> / off <id> / del <id>                 启用 / 停用 / 删除
 token price <id> [JSON | --clear]                   该 Key 的按模型价格（JSON 同全局覆盖形状）
 
 # 价格（美元 / 1M tokens；四级优先：Key 覆盖 > 全局覆盖 > 内置表 > 默认价）
-price list [过滤]                价格表（标注来源：内置 / 覆盖）
-price get <模型>                 查一个模型的生效价
-price set <模型> in=X out=Y [cached=Z]              固定价覆盖
-price set <模型> expr="p * 3 + c * 15"              表达式覆盖
+price list [过滤]                价格表（标注来源与缓存写 5m/1h 价）
+price get <模型>                 查一个模型的生效价（表达式截断显示）
+price set <模型> in=X out=Y [cached=Z] [cw5=A] [cw1=B]   常量覆盖；字段也可写费率表达式
 price rm <模型>                  清除覆盖，回到内置价
-price default in=X out=Y         未知模型的兜底价
-price aliases                    别名前缀列表
+price default                    查看当前兜底价与计费模式
+price default in=X out=Y         设兜底价（宽松计费）
+price default --clear            清除兜底价 = 启用严格计费（未定价 503 拒绝）
+price aliases                    厂商前缀 + 拼写别名表
+
+# 模型计费
+billing list [过滤]              模型计费报表（状态/费率/7天用量，未配置在前）
+billing get <模型>               单模型详情：渠道明细 + 价格 + 用量 + 缓存命中
+billing check                    部署前自检：严格模式 + 启用渠道未定价组合
 
 # 系统设置
 opt list                         全部配置项与当前值
@@ -155,9 +163,11 @@ opt set RetryTimes=3 SystemName=我的网关            修改配置（JSON 值�
 ```text
 channel add openai deepseek https://api.deepseek.com sk-ds-xxx --models deepseek-v4-flash,deepseek-v4-pro
 price set deepseek-v4-pro in=1.32 out=3.96 cached=0.044
-price set my-model expr="len <= 128000 ? fixed(0.002) : fixed(0.004)"
+price set my-model in="4 * (context > 272k ? 2 : 1)" out=20
 token new 笔记本 --unlimited
 token price 2 {"gpt-4o":{"in":1,"out":2}}
+channel pull 1 --add
+billing check
 ```
 
 ## 计费：价格表 × 用量，没有倍率
@@ -190,8 +200,8 @@ fresh = prompt − 缓存命中 − 写缓存5m − 写缓存1h
    在后台「令牌」对话框里编辑；不同 Key 配不同价，就是在这里
 2. **全局覆盖** —— `options.ModelPriceOverride`，后台「价格」页编辑
    （`PUT /api/pricing/overrides`，整包替换，逐条校验）
-3. **内置价格表** —— `src/lib/pricing/llm.ts` 的 `PRICE_TABLE`，最长前缀匹配
-   （`gpt-4o-mini-2024-07-18` 命中 `gpt-4o-mini`；`zai-coding-plan/glm-4.7` 剥前缀命中 `glm-4.7`）
+3. **内置价格表** —— `src/lib/pricing/llm.ts` 的 `PRICE_TABLE`，**精确命中**
+   （为什么不是前缀匹配，见下面「名字解析」）
 4. **默认价** —— $1 / $3（严格计费下不生效；价格页可改/可清除）
 
 `PriceSpec` 的**每个字段**（`in` / `out` / `cached_in` / `cache_write_5m` / `cache_write_1h`）
@@ -201,6 +211,23 @@ fresh = prompt − 缓存命中 − 写缓存5m − 写缓存1h
 { "in": 1.32, "out": 3.96, "cached_in": 0.044 }                      // 常量，美元/1M tokens
 { "in": "4 * (context > 272k ? 2 : 1)", "out": 20 }                  // 字段费率表达式，见下
 ```
+
+### 名字解析：别名表 + 快照后缀，没有前缀匹配
+
+同一个模型在不同提供商那里拼写不同（`claude-opus-5.5` 对官方 `claude-opus-5-5`、
+Azure 部署名 `gpt-35-turbo`、聚合器的 `openai/gpt-4o`）。解析规则（`priceNameCandidates`，
+对 Key 覆盖 / 全局覆盖 / 内置表三层统一生效）：
+
+1. **原名** → **剥厂商前缀**（`ALIAS_PREFIXES`：`openai/` `anthropic/` `google/` `deepseek/`
+   `zai/` 等）→ **拼写别名**（`PRICE_ALIASES` 显式映射到规范名，`price aliases` 可查全部）
+2. 带日期快照后缀的再剥一次：只剥**结尾**的 `-YYYY-MM-DD` / `-YYYYMMDD`
+   （`claude-sonnet-4-20250514` → `claude-sonnet-4`；版本号 `-4.5` 不是日期，永不剥）
+3. 除此之外**没有最长前缀匹配**——名字查不到就是查不到（报警/严格拒绝），
+   绝不"看起来像"就按别人的价收。上游为此付过学费：前缀匹配让 `gpt-5.4-mini`
+   命中 `gpt-5`、按错误价记了 264 笔账且毫无报警。
+
+渠道改名后（`model_mapping`）**计价只认上游名**：管理员给请求名显式定的价除外，
+映射指向的模型查不到价就如实报未定价，绝不退回请求名的表价偷偷放行。
 
 ### 表达式计费语言（v2：按字段的绝对费率）
 

@@ -8,7 +8,7 @@
  */
 import assert from 'node:assert/strict';
 import worker from '../src/index';
-import { resolveTestModel } from '../src/routes/api';
+import { resolveTestModel } from '../src/lib/channel';
 
 const tests: Array<[string, () => Promise<void> | void]> = [];
 const test = (name: string, fn: () => Promise<void> | void) => tests.push([name, fn]);

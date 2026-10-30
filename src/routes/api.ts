@@ -6,7 +6,7 @@ import {
 import { randomKey } from '../lib/crypto';
 import { requireAdmin, invalidateTokenCache, ensureOwner } from '../lib/auth';
 import { getOptions, setOptions, DEFAULT_OPTIONS } from '../lib/options';
-import { rebuildAbilities, deleteAbilities, listModels, csv, parseConfig } from '../lib/channel';
+import { rebuildAbilities, deleteAbilities, listModels, csv, parseConfig, resolveTestModel } from '../lib/channel';
 import { listUpstreamModels } from '../lib/upstream-models';
 import { loadModelBilling } from '../lib/model-billing';
 import { reconcile, applyCredit } from '../lib/ledger';
@@ -490,21 +490,6 @@ api.delete('/channels/:id', requireAdmin, async (c) => {
   await deleteAbilities(c.env, id);
   return c.json(ok(null, '已删除'));
 });
-
-/**
- * 渠道测试用哪个模型。传了就必须是该渠道 models 里的一个——测试接口直连上游、
- * 带着渠道 key，不能让它变成「拿这把 key 调任意模型」的后门。没传时回退第一个，
- * 只为兼容旧调用；后台 UI 总是显式传。
- */
-export function resolveTestModel(channel: Pick<ChannelRow, 'models'>, requested: unknown): { model: string } | { error: string } {
-  const models = csv(channel.models);
-  if (!models.length) return { error: '渠道未配置模型' };
-  if (requested !== undefined && requested !== null && typeof requested !== 'string') return { error: 'model 必须是字符串' };
-  const want = (requested ?? '').trim();
-  if (!want) return { model: models[0] };
-  if (!models.includes(want)) return { error: `模型 ${want} 不属于该渠道` };
-  return { model: want };
-}
 
 /** Sends a 1-token chat completion straight at the channel to check credentials. */
 api.post('/channels/:id/test', requireAdmin, async (c) => {

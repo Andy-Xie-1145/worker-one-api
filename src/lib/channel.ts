@@ -142,3 +142,18 @@ export async function listModels(env: Env): Promise<string[]> {
   const rows = await env.DB.prepare('SELECT DISTINCT model FROM abilities WHERE enabled = 1 ORDER BY model').all<{ model: string }>();
   return (rows.results ?? []).map((r) => r.model);
 }
+
+/**
+ * 渠道测试用哪个模型。传了就必须是该渠道 models 里的一个——测试接口直连上游、
+ * 带着渠道 key，不能让它变成「拿这把 key 调任意模型」的后门。没传时回退第一个，
+ * 只为兼容旧调用；后台 UI 和 CLI 总是显式传。
+ */
+export function resolveTestModel(channel: Pick<ChannelRow, 'models'>, requested: unknown): { model: string } | { error: string } {
+  const models = csv(channel.models);
+  if (!models.length) return { error: '渠道未配置模型' };
+  if (requested !== undefined && requested !== null && typeof requested !== 'string') return { error: 'model 必须是字符串' };
+  const want = (requested ?? '').trim();
+  if (!want) return { model: models[0] };
+  if (!models.includes(want)) return { error: `模型 ${want} 不属于该渠道` };
+  return { model: want };
+}

@@ -757,7 +757,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
         token, user, channelId: channel.id, modelName: requestedModel, upstreamModel: ctx.upstreamModel,
         usage: finalUsage, preConsumed: reservation.amount, options, elapsedMs: Date.now() - started,
         settleRef: reservation.settleRef,
-        billing: { rates: reservation.rates, source: reservation.identity.source, via: reservation.identity.via, trace: reservation.trace },
+        billing: { rates: reservation.rates, source: reservation.identity.source, via: reservation.identity.via, billingModel: reservation.identity.billingModel, trace: reservation.trace },
       }),
     );
     const payload =
@@ -803,7 +803,7 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
         token, user, channelId: channel.id, modelName: requestedModel, upstreamModel: ctx.upstreamModel,
         usage: finalUsage, preConsumed: reservation.amount, options, elapsedMs: Date.now() - started,
         settleRef: reservation.settleRef,
-        billing: { rates: reservation.rates, source: reservation.identity.source, via: reservation.identity.via, trace: reservation.trace },
+        billing: { rates: reservation.rates, source: reservation.identity.source, via: reservation.identity.via, billingModel: reservation.identity.billingModel, trace: reservation.trace },
       }),
     );
   };

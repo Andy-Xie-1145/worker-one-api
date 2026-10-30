@@ -43,7 +43,7 @@ export const DEFAULT_PRICE: Price = { in: 1, out: 3 };
  * 价格体系版本号：价格表/字段语义发生**影响计费结果**的变更时递增。
  * 它进消费日志的 billing_meta，审计时用它对齐「这笔账是按哪版价格记的」。
  */
-export const LLM_PRICING_VERSION = 'v2-2026-10-31';
+export const LLM_PRICING_VERSION = 'v2.1-alias-2026-10-31';
 
 /** Longest-prefix match, so dated snapshots (gpt-4o-2024-11-20) inherit the base price. */
 export const PRICE_TABLE: Record<string, Price> = {
@@ -208,46 +208,105 @@ export function stripAliasPrefix(model: string): string {
   return model;
 }
 
+/**
+ * 显式别名 → 规范名。供应商对同一个模型的拼写五花八门（Azure 部署名 `gpt-35-turbo`、
+ * 聚合器的点号 `claude-opus-5.5` 对官方短横线 `claude-opus-5-5`），解析时把别名翻译成
+ * 表里的规范名再查——**不做任何自动猜测**（点横线互换这种"看起来等价"的事故面太大，
+ * 拼写变体必须显式登记在这里；这也是上游 webclaw-api 的同一规矩）。
+ */
+export const PRICE_ALIASES: Record<string, string> = {
+  // 聚合器/客户端常用的点号拼法（官方 ID 是短横线）。
+  'claude-opus-5.5': 'claude-opus-5-5',
+  'claude-sonnet-5.5': 'claude-sonnet-5-5',
+  // Azure 部署名就是 OpenAI 的 gpt-3.5-turbo（$0.50/$1.50）。
+  'gpt-35-turbo': 'gpt-3.5-turbo',
+  // Google 定价页的 preview 名 ≤200K 就是 3.1-pro 的 $2/$12。
+  'gemini-3.1-pro-preview': 'gemini-3.1-pro',
+  // Jev 的浮动别名与版本号（OpenRouter: ~typesafe/jev-latest、typesafe/jev-1.13）。
+  'jev-latest': 'jev',
+  'jev-1.13': 'jev',
+};
+
+/**
+ * 受控的日期快照规则：只剥**结尾**的 `-YYYY-MM-DD` 或 `-YYYYMMDD`。
+ *
+ * `gpt-4o-2024-11-20` → `gpt-4o`、`claude-sonnet-4-20250514` → `claude-sonnet-4`。
+ * 版本号（`-5.4-mini`、`-4.5`）不是日期，永远剥不掉——所以 gpt-5.4-mini 不可能落到 gpt-5。
+ */
+export function stripSnapshotSuffix(model: string): string | null {
+  const m = /^(.+?)-(?:\d{4}-\d{2}-\d{2}|\d{8})$/.exec(model);
+  return m ? m[1] : null;
+}
+
+/**
+ * 一个名字的**候选名序列**（按解析优先级，去重）：
+ *   写的原名 → 剥厂商前缀 → 别名的规范名 → 剥快照后缀 → （快照名重复以上三步）。
+ *
+ * 查价按序列逐个**精确**命中——没有前缀匹配。上游为此付过学费：
+ * 最长前缀让 `gpt-5.4-mini` 命中 `gpt-5`、按 $1.25/$10 多收了 264 笔且毫无报警；
+ * 一个名字要么在表里、要么在别名表里显式指向、要么带受控快照后缀，否则查不到。
+ */
+function priceNameCandidates(model: string): string[] {
+  const out: string[] = [];
+  const push = (n: string | null | undefined) => {
+    if (n && !out.includes(n)) out.push(n);
+  };
+  const walk = (name: string) => {
+    push(name);
+    const bare = stripAliasPrefix(name);
+    push(bare);
+    push(PRICE_ALIASES[bare] ?? PRICE_ALIASES[name]);
+  };
+  walk(model);
+  const snapshot = stripSnapshotSuffix(model);
+  if (snapshot) walk(snapshot);
+  return out;
+}
+
 export type PriceSource = 'key' | 'global' | 'builtin' | 'default';
 
 export interface PriceResolution {
   spec: PriceSpec;
   source: PriceSource;
+  /** 实际命中的候选名（原名 / 剥前缀 / 别名规范名 / 快照剥离后），供日志与计费页展示。 */
+  canonical?: string;
 }
 
 type OverrideTable = Record<string, PriceSpec> | undefined;
 
-/** 覆盖表只按**写出的名字**精确命中（含剥前缀后的裸名），不做前缀匹配。 */
 function lookupOverride(table: OverrideTable, model: string): PriceSpec | undefined {
   if (!table) return undefined;
-  const direct = table[model];
-  if (direct) return direct;
-  const stripped = stripAliasPrefix(model);
-  if (stripped !== model) return table[stripped];
+  for (const name of priceNameCandidates(model)) {
+    if (Object.prototype.hasOwnProperty.call(table, name)) return table[name];
+  }
   return undefined;
 }
 
-/** 内置表：剥前缀后最长前缀匹配。 */
+/** 内置表：候选名逐个**精确**命中——没有前缀匹配（为什么删，见 priceNameCandidates 的注释）。 */
 function lookupBuiltin(model: string): Price | null {
-  const stripped = stripAliasPrefix(model);
-  let best: Price | null = null;
-  let bestLen = -1;
-  for (const [prefix, price] of Object.entries(PRICE_TABLE)) {
-    if (stripped.startsWith(prefix) && prefix.length > bestLen) {
-      best = price;
-      bestLen = prefix.length;
-    }
+  for (const name of priceNameCandidates(model)) {
+    if (Object.prototype.hasOwnProperty.call(PRICE_TABLE, name)) return PRICE_TABLE[name];
   }
-  return best;
+  return null;
 }
 
+/**
+ * 一个名字的整条查价链：候选名逐个走 **Key 覆盖 > 全局覆盖 > 内置表**，
+ * 第一个命中即返回（候选名的先后就是解析优先级，见 priceNameCandidates）。
+ */
 function cascade(model: string, options?: Options, keyOverrides?: OverrideTable): PriceResolution | null {
-  const key = lookupOverride(keyOverrides, model);
-  if (key) return { spec: key, source: 'key' };
-  const global = lookupOverride(options?.ModelPriceOverride, model);
-  if (global) return { spec: global, source: 'global' };
-  const builtin = lookupBuiltin(model);
-  if (builtin) return { spec: builtin, source: 'builtin' };
+  for (const name of priceNameCandidates(model)) {
+    if (keyOverrides && Object.prototype.hasOwnProperty.call(keyOverrides, name)) {
+      return { spec: keyOverrides[name], source: 'key', canonical: name };
+    }
+    const global = options?.ModelPriceOverride;
+    if (global && Object.prototype.hasOwnProperty.call(global, name)) {
+      return { spec: global[name], source: 'global', canonical: name };
+    }
+    if (Object.prototype.hasOwnProperty.call(PRICE_TABLE, name)) {
+      return { spec: PRICE_TABLE[name], source: 'builtin', canonical: name };
+    }
+  }
   return null;
 }
 
@@ -264,11 +323,16 @@ export function findPrice(model: string, options?: Options): PriceSpec | null {
 }
 
 /**
- * 查价，四级优先：**Key 覆盖 > 全局覆盖 > 内置表 > 默认价**。
+ * 查价，四级优先：**Key 覆盖 > 全局覆盖 > 内置表 > 默认价**，名字按候选序列精确解析
+ * （原名 → 剥厂商前缀 → 别名规范名 → 快照剥离，见 priceNameCandidates）。
  *
- * `upstreamModel` 是渠道 model_mapping 之后的真实模型名。**别名的含义在映射里，
- * 不在名字里**：请求名整条链查不到时，用上游名再走一遍同样的链，价格自动跟着映射走。
- * 顺序不能反：请求名优先，运维想给某个别名单独定价时才拦得住。
+ * `upstreamModel` 是渠道 model_mapping 之后的真实模型名。**实际发给上游的那个模型才是
+ * 计价真相**，三条规则：
+ *   1. 运维在覆盖里给**请求名**显式定的价最优先（对外价是管理员明确的决定）；
+ *   2. 否则映射改了名 → **只按上游名查**，查不到就是查不到，绝不退回请求名的表价——
+ *      否则 deepseek-v4-flash →（映射）→ 无价的 deepseek/deepseek-v4.1-flash 会被旧价放行；
+ *   3. 没有映射 → 按请求名查。
+ * 两边最终落到同一个规范名的别名链自然通过。
  *
  * 同一个模型名，不同的 Key（keyOverrides 来自 `tokens.price_config`）可以有不同的价格；
  * 同一个 Key 里，不同的模型也可以各配各的——这就是「Key × 模型」二维价格矩阵。
@@ -279,13 +343,16 @@ export function resolvePrice(
   upstreamModel?: string,
   keyOverrides?: OverrideTable,
 ): PriceResolution {
-  const direct = cascade(model, options, keyOverrides);
-  if (direct) return direct;
+  const adminKey = lookupOverride(keyOverrides, model);
+  if (adminKey) return { spec: adminKey, source: 'key' };
+  const adminGlobal = lookupOverride(options?.ModelPriceOverride, model);
+  if (adminGlobal) return { spec: adminGlobal, source: 'global' };
   if (upstreamModel && upstreamModel !== model) {
-    const mapped = cascade(upstreamModel, options, keyOverrides);
-    if (mapped) return mapped;
+    const hit = cascade(upstreamModel, options, keyOverrides);
+    return hit ? { spec: hit.spec, source: hit.source } : { spec: options?.DefaultPrice ?? DEFAULT_PRICE, source: 'default' };
   }
-  return { spec: options?.DefaultPrice ?? DEFAULT_PRICE, source: 'default' };
+  const hit = cascade(model, options, keyOverrides);
+  return hit ? { spec: hit.spec, source: hit.source } : { spec: options?.DefaultPrice ?? DEFAULT_PRICE, source: 'default' };
 }
 
 // ---------------------------------------------------------------- 计费身份（严格计费）
@@ -323,22 +390,33 @@ export interface BillingIdentity {
  * 以及**兜底价在这里显式判定**——`options.DefaultPrice` 未设置时返回 null
  * （请求将被 503 model_price_not_configured 拒绝），设置了则给 default 身份。
  */
+/**
+ * 解析计费身份，**查不到价时回 null**（严格计费的 fail-closed 入口）。
+ *
+ * 与 resolvePrice 同一套三条规则（管理员请求名显式价 > 映射改名只认上游名 > 请求名），
+ * 差别只有两点：多带 `via`/命中名（模型计费页与日志要展示），以及**兜底价在这里显式
+ * 判定**——`options.DefaultPrice` 未设置时返回 null（请求将被 503
+ * model_price_not_configured 拒绝），设置了则给 default 身份。
+ */
 export function resolveBillableModel(
   requested: string,
   upstreamModel: string | undefined,
   options?: Options,
   keyOverrides?: OverrideTable,
 ): BillingIdentity | null {
-  const direct = cascade(requested, options, keyOverrides);
-  if (direct) return { billingModel: requested, spec: direct.spec, source: direct.source, via: 'requested' };
-  if (upstreamModel && upstreamModel !== requested) {
-    const mapped = cascade(upstreamModel, options, keyOverrides);
-    if (mapped) return { billingModel: upstreamModel, spec: mapped.spec, source: mapped.source, via: 'upstream' };
+  const adminKey = lookupOverride(keyOverrides, requested);
+  if (adminKey) return { billingModel: requested, spec: adminKey, source: 'key', via: 'requested' };
+  const adminGlobal = lookupOverride(options?.ModelPriceOverride, requested);
+  if (adminGlobal) return { billingModel: requested, spec: adminGlobal, source: 'global', via: 'requested' };
+  const mapped = upstreamModel && upstreamModel !== requested;
+  const hit = cascade(mapped ? upstreamModel! : requested, options, keyOverrides);
+  if (!hit) {
+    if (options?.DefaultPrice) {
+      return { billingModel: requested, spec: options.DefaultPrice, source: 'default', via: 'requested' };
+    }
+    return null;
   }
-  if (options?.DefaultPrice) {
-    return { billingModel: requested, spec: options.DefaultPrice, source: 'default', via: 'requested' };
-  }
-  return null;
+  return { billingModel: hit.canonical ?? (mapped ? upstreamModel! : requested), spec: hit.spec, source: hit.source, via: mapped ? 'upstream' : 'requested' };
 }
 
 /** 两个计费身份是否等价（换渠道时用来判断要不要重开一对 pre/fin ref）。 */

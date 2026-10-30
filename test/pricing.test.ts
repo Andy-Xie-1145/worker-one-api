@@ -40,7 +40,8 @@ test('别名剥前缀在每一级都生效', () => {
   assert.deepEqual(resolvePrice('zai/glm-5', global).spec, { in: 5, out: 5 });
   // 覆盖表只按写出的名字精确命中，不做前缀匹配
   assert.equal(resolvePrice('glm-4.7-flashx', opts({ 'glm-4.7': { in: 1, out: 1 } })).source, 'builtin');
-  assert.equal(stripAliasPrefix('meta/llama-3'), 'meta/llama-3', '无关斜杠不被剥');
+  // 未登记的厂商前缀不剥（登记表见 ALIAS_PREFIXES）
+  assert.equal(stripAliasPrefix('unknown-org/llama-3'), 'unknown-org/llama-3');
 });
 
 // ---------------------------------------------------------------- 别名表 / 快照 / 无前缀（v2.1）
@@ -54,6 +55,26 @@ test('PRICE_ALIASES：拼写变体显式指到规范名（点号 vs 短横线）
   // 别名也能被覆盖盖掉（Key 覆盖同样按别名命中的规范名/原名查）
   const key = { 'claude-opus-5.5': { in: 99, out: 99 } };
   assert.deepEqual(resolvePrice('claude-opus-5.5', undefined, undefined, key).spec, { in: 99, out: 99 });
+});
+
+test('OpenRouter 完整厂商 slug 前缀也能剥（线上渠道实际用的写法）', () => {
+  // NVIDIA NIM / OpenRouter 渠道声明的名字：deepseek-ai/deepseek-v4.1-flash 等
+  assert.deepEqual(resolvePrice('deepseek-ai/deepseek-v4.1-flash').spec, { in: 0.3, out: 1.2, cached_in: 0.006 });
+  assert.deepEqual(resolvePrice('z-ai/glm-5.3-flash').spec, { in: 0.15, out: 0.5, cached_in: 0.03 });
+  // 未登记的厂商前缀不剥：meta/xxx 剥完仍是 meta/xxx，查不到就是查不到
+  assert.equal(resolvePrice('unknown-vendor/some-model').source, 'default');
+});
+
+test('线上踩过的缺行已补：haiku-5-5 / fable-5-1 / glm-5.3-flash(x) / gemini-3.8-flash', () => {
+  // Haiku 5.5：官方 From $0.10/$0.50，缓存读 $0.01（platform.claude.com）
+  assert.deepEqual(resolvePrice('claude-haiku-5-5').spec, { in: 0.1, out: 0.5, cached_in: 0.01, cache_write_5m: 0.125, cache_write_1h: 0.2 });
+  // Fable 5.1：$10/$50、缓存读 $0.25
+  assert.deepEqual(resolvePrice('claude-fable-5-1').spec, { in: 10, out: 50, cached_in: 0.25, cache_write_5m: 12.5, cache_write_1h: 20 });
+  // glm-5.3-flash / flashx：z.ai 官方美元价
+  assert.deepEqual(resolvePrice('glm-5.3-flash').spec, { in: 0.15, out: 0.5, cached_in: 0.03 });
+  assert.deepEqual(resolvePrice('glm-5.3-flashx').spec, { in: 0.37, out: 1.25, cached_in: 0.075 });
+  // gemini-3.8-flash：与 3.6/3.7 同一促销口径
+  assert.deepEqual(resolvePrice('gemini-3.8-flash').spec, { in: 0.75, out: 3.75 });
 });
 
 test('快照后缀：只剥结尾日期，版本号永不剥', () => {

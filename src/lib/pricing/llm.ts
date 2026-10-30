@@ -43,7 +43,7 @@ export const DEFAULT_PRICE: Price = { in: 1, out: 3 };
  * 价格体系版本号：价格表/字段语义发生**影响计费结果**的变更时递增。
  * 它进消费日志的 billing_meta，审计时用它对齐「这笔账是按哪版价格记的」。
  */
-export const LLM_PRICING_VERSION = 'v2.1-alias-2026-10-31';
+export const LLM_PRICING_VERSION = 'v2.2-aliases-2026-10-31';
 
 /** Longest-prefix match, so dated snapshots (gpt-4o-2024-11-20) inherit the base price. */
 export const PRICE_TABLE: Record<string, Price> = {
@@ -90,6 +90,13 @@ export const PRICE_TABLE: Record<string, Price> = {
   // （https://platform.claude.com/docs/en/about-claude/pricing）。
   'claude-opus-5-5': { in: 4, out: 20, cached_in: 0.2, cache_write_5m: 5, cache_write_1h: 8 },
   'claude-sonnet-5-5': { in: 2, out: 10, cached_in: 0.1, cache_write_5m: 2.5, cache_write_1h: 4 },
+  // Haiku 5.5（2026-10-07 发布）：官方 From $0.10/$0.50，缓存读 $0.01；写价按官方
+  // 1.25x/2x 口径 = $0.125/$0.20（platform.claude.com/docs/en/models/haiku-5-5/overview）。
+  // 注意 ≥100K tokens 档为 $0.50/$2.50——要用高档就写字段表达式：
+  //   {"in": "context >= 100k ? 0.5 : 0.1", "out": "context >= 100k ? 2.5 : 0.5", ...}
+  'claude-haiku-5-5': { in: 0.1, out: 0.5, cached_in: 0.01, cache_write_5m: 0.125, cache_write_1h: 0.2 },
+  // Fable 5.1：官方定价页 2026-10 核对，$10/$50、缓存读 $0.25、写 5m $12.5 / 1h $20。
+  'claude-fable-5-1': { in: 10, out: 50, cached_in: 0.25, cache_write_5m: 12.5, cache_write_1h: 20 },
   'claude-3-haiku': { in: 0.25, out: 1.25, cache_write_5m: 0.3125, cache_write_1h: 0.5 },
   'claude-3-5-haiku': { in: 0.8, out: 4, cache_write_5m: 1, cache_write_1h: 1.6 },
   'claude-3-5-sonnet': { in: 3, out: 15, cache_write_5m: 3.75, cache_write_1h: 6 },
@@ -122,6 +129,9 @@ export const PRICE_TABLE: Record<string, Price> = {
   'gemini-3.5-flash': { in: 1.5, out: 9 },
   'gemini-3.6-flash': { in: 0.75, out: 3.75 },
   'gemini-3.7-flash': { in: 0.75, out: 3.75 },
+  // 3.8 与 3.6/3.7 同一促销口径（$0.75/$3.75 至 2026-12-31，之后翻倍——Google
+  // Agent Platform 页对这三个型号写的是同一句话），到期一起改。
+  'gemini-3.8-flash': { in: 0.75, out: 3.75 },
 
   // DeepSeek — 官方公示价（$ / 1M tokens）。峰谷时段差异如需体现，用字段费率表达式：
   //   {"in": "0.3 * (hour('Asia/Shanghai') >= 1 && hour('Asia/Shanghai') < 5 ? 1 : 0.5)", ...}
@@ -156,6 +166,10 @@ export const PRICE_TABLE: Record<string, Price> = {
   'glm-4.5-x': { in: 2.2, out: 8.9 },
   'glm-4.5': { in: 0.6, out: 2.2 },
   'glm-5.3': { in: 1.4, out: 4.4 },
+  // 5.3-Flash / FlashX：z.ai 官方美元价目表（docs.z.ai/guides/overview/pricing，
+  // 2026-10-31 核对）——Flash $0.15/$0.50（缓存 $0.03），FlashX $0.37/$1.25（缓存 $0.075）。
+  'glm-5.3-flashx': { in: 0.37, out: 1.25, cached_in: 0.075 },
+  'glm-5.3-flash': { in: 0.15, out: 0.5, cached_in: 0.03 },
   'glm-5.2': { in: 1.4, out: 4.4 },
   'glm-5.1': { in: 1.4, out: 4.4 },
   'glm-5-turbo': { in: 1.2, out: 4 },
@@ -196,6 +210,17 @@ export const ALIAS_PREFIXES = [
   'openai/',
   'google/',
   'deepseek/',
+  // OpenRouter 的完整厂商 slug（与上面的短形并存：deepseek/ 与 deepseek-ai/ 都有人写）。
+  // 剥前缀是安全的：剥完仍要**精确**命中价格表/覆盖，不存在"剥了就乱配价"。
+  'deepseek-ai/',
+  'z-ai/',
+  'minimaxai/',
+  'stepfun-ai/',
+  'meta/',
+  'moonshotai/',
+  'nvidia/',
+  'qwen/',
+  'x-ai/',
   // Typesafe / Jev。`~` 是 OpenRouter 的浮动版本别名前缀（~typesafe/jev-latest）。
   '~typesafe/',
   'typesafe/',

@@ -11,7 +11,7 @@ import { listUpstreamModels } from './upstream-models';
 import { loadModelBilling, findUnpricedChannelModels, fallbackActive } from './model-billing';
 import {
   PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, PRICE_ALIASES, QUOTA_PER_USD, quotaToUSD,
-  validatePriceSpec, resolvePrice, type PriceSpec,
+  validatePriceSpec, resolvePrice, stripAliasPrefix, type PriceSpec,
 } from './pricing/llm';
 import { TokenStatusEnabled, TokenStatusDisabled, ChannelStatusEnabled, ChannelStatusManuallyDisabled, LogTypeManage } from '../types';
 
@@ -583,7 +583,12 @@ async function billingCmd(env: Env, args: string[]): Promise<CliResult> {
       `未定价 (渠道, 模型) 组合：${unpriced.length}`,
     ];
     for (const r of unpriced) {
-      lines.push(`  - 渠道 #${r.channelId}「${r.channelName}」(${r.channelType})：${r.requested}${r.upstream !== r.requested ? `（上游 ${r.upstream}）` : ''}`);
+      // 名字带斜杠却没被任何已登记前缀剥掉 → 大概率是厂商 slug 没登记（ALIAS_PREFIXES），
+      // 直接点名，省得对着「未定价」三个字猜。
+      const prefixHint = r.requested.includes('/') && stripAliasPrefix(r.requested) === r.requested
+        ? ' ⚠ 前缀未登记（ALIAS_PREFIXES，price aliases 可查）'
+        : '';
+      lines.push(`  - 渠道 #${r.channelId}「${r.channelName}」(${r.channelType})：${r.requested}${r.upstream !== r.requested ? `（上游 ${r.upstream}）` : ''}${prefixHint}`);
     }
     return { ok: unpriced.length === 0 || !strict, output: lines.join('\n') };
   }

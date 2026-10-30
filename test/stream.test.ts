@@ -259,8 +259,11 @@ test('glm: legacy vendor prefixes price the same as the bare model', () => {
   assert.deepEqual(resolvePrice('zai/glm-5').spec, resolvePrice('glm-5').spec);
   assert.equal(stripAliasPrefix('zai-coding-plan/glm-4.7'), 'glm-4.7');
   assert.equal(stripAliasPrefix('glm-4.7'), 'glm-4.7');
-  // A slash in an unrelated model name must not be mangled.
-  assert.equal(stripAliasPrefix('meta/llama-3'), 'meta/llama-3');
+  // OpenRouter 完整厂商 slug 也剥（线上 NVIDIA 渠道就这么写）。
+  assert.equal(stripAliasPrefix('deepseek-ai/deepseek-v4.1-flash'), 'deepseek-v4.1-flash');
+  assert.equal(stripAliasPrefix('z-ai/glm-5.3-flash'), 'glm-5.3-flash');
+  // 未登记的厂商前缀不剥——登记表之外的斜杠是模型名的一部分。
+  assert.equal(stripAliasPrefix('unknown-org/llama-3'), 'unknown-org/llama-3');
 });
 
 test('glm: longest-prefix match separates the flash variants', () => {

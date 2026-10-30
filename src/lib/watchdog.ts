@@ -1,8 +1,10 @@
 import type { Env } from '../types';
 import { applyCredit, reconcile } from './ledger';
 import { pruneRelayEvents } from './health';
-import { findPrice } from './pricing/llm';
+import { findPrice, strictBillingEnabled } from './pricing/llm';
+import { listModels } from './channel';
 import { getOptions } from './options';
+import type { Options } from './options';
 import { checkRouteGapRecovery } from './route-alert';
 
 /**
@@ -64,7 +66,8 @@ export async function runWatchdog(env: Env): Promise<WatchdogResult> {
    * 同样搭这趟车：查不到价的模型。它和账本偏差是两种毛病，但共享同一条规矩——
    * 平时不说话，一开口就是「有个东西错了，而且它自己不会喊」。
    */
-  const unpriced = await detectUnpricedModels(env);
+  const options = await getOptions(env);
+  const unpriced = await detectUnpricedModels(env, options);
 
   const result: WatchdogResult = {
     at,
@@ -79,13 +82,19 @@ export async function runWatchdog(env: Env): Promise<WatchdogResult> {
     .catch((error) => console.error('[watchdog] 心跳写入失败：', error));
 
   if (unpriced.length) {
+    const strict = strictBillingEnabled(options);
     const detail = unpriced
-      .map((m) => `${m.model}（${m.n} 次，按默认价记了 ${m.quota} quota）`)
+      .map((m) =>
+        m.n > 0
+          ? `${m.model}（近 24h ${m.n} 次${strict ? '' : `，按默认价记了 ${m.quota} quota`}）`
+          : m.model,
+      )
       .join('；');
-    const text =
-      `以下模型不在价格表里，正按 DEFAULT_PRICE $1/$3 记账：${detail}。` +
-      '处理：在后台「价格」页配全局覆盖（固定价或表达式），或在 lib/pricing/llm.ts 的 PRICE_TABLE 补价格行；' +
-      '如果它只是别名，确认渠道的 model_mapping 指向的上游模型有价即可（resolvePrice 会自动兜底）。';
+    const text = strict
+      ? `以下模型挂在启用渠道上但查不到价，请求会以 model_price_not_configured 拒绝：${detail}。` +
+        '处理：在后台「价格」页配全局覆盖（常量或按字段费率表达式），或清空兜底价开关换宽松模式。'
+      : `以下模型不在价格表里，正按默认价 $${options.DefaultPrice?.in ?? 1}/$${options.DefaultPrice?.out ?? 3} 记账：${detail}。` +
+        '处理：在后台「价格」页配全局覆盖（常量或按字段费率表达式），或清空兜底价启用严格计费（未定价直接拒绝）。';
     console.error('[watchdog]', text);
     await env.DB.prepare('INSERT INTO logs (user_id, created_at, type, content) VALUES (0, ?, 4, ?)')
       .bind(at, text)
@@ -229,27 +238,33 @@ export async function reclaimAbandonedReservations(env: Env, limit = 100): Promi
 }
 
 /**
- * 找出最近有人用、但价格表里查不到的模型。
+ * 找出**挂在启用渠道上、但价格表里查不到**的模型。
  *
- * 查不到价不会让任何请求失败，只会**按 DEFAULT_PRICE（$1/$3）悄悄记账**——线上因此
- * 把 gemini-flash-lite-latest 按默认价记了 49 次，没有任何东西报过警。这一步就是让
- * 它开口说话。
+ * 口径是「声明了就算」而不是「有人用过才算」：等第一笔请求踩进去才发现没定价，
+ * 严格计费下用户已经吃了一次 503，宽松计费下已经按默认价记了一笔糊涂账——
+ * 警报必须在第一次请求之前就响。
  *
- * 名字里带 `:` 的是语音（`asr:azure:speech-to-text` 这种），它们走 pricing/speech.ts
- * 和授权窗口结算，跟 LLM 价格表无关，必须排除，否则每天都会报一堆假警。
+ * 名字里带 `:` 的是语音（`asr:azure:speech-to-text` 这种），它们走独立的授权窗口
+ * 结算，跟 LLM 价格表无关，必须排除，否则每天都会报一堆假警。
  */
-export async function detectUnpricedModels(env: Env): Promise<{ model: string; n: number; quota: number }[]> {
+export async function detectUnpricedModels(env: Env, options?: Options): Promise<{ model: string; n: number; quota: number }[]> {
   const since = Math.floor(Date.now() / 1000) - 86400;
-  const options = await getOptions(env);
+  const opts = options ?? (await getOptions(env));
   try {
+    const declared = (await listModels(env)).filter((m) => m && !m.includes(':'));
+    const unpriced = declared.filter((model) => !findPrice(model, opts));
+    if (!unpriced.length) return [];
+    // 近 24h 的用量做补充信息（没被用过的未定价模型 n=0——它还没造成损失，但马上会）。
+    const placeholders = unpriced.map(() => '?').join(',');
     const result = await env.DB.prepare(
-      `SELECT model_name AS model, COUNT(*) AS n, SUM(quota) AS quota FROM logs
-        WHERE type = 2 AND created_at > ? AND model_name != '' AND model_name NOT LIKE '%:%'
+      `SELECT model_name AS model, COUNT(*) AS n, COALESCE(SUM(quota),0) AS quota FROM logs
+        WHERE type = 2 AND created_at > ? AND model_name IN (${placeholders})
         GROUP BY model_name`,
     )
-      .bind(since)
+      .bind(since, ...unpriced)
       .all<{ model: string; n: number; quota: number }>();
-    return (result.results ?? []).filter((row) => !findPrice(row.model, options));
+    const usage = new Map((result.results ?? []).map((r) => [r.model, r]));
+    return unpriced.map((model) => ({ model, n: usage.get(model)?.n ?? 0, quota: usage.get(model)?.quota ?? 0 }));
   } catch (error) {
     console.error('[watchdog] 未定价模型扫描失败：', error);
     return [];

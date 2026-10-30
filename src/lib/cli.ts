@@ -7,7 +7,7 @@ import { getHeartbeat, runWatchdog } from './watchdog';
 import { randomKey } from './crypto';
 import {
   PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, QUOTA_PER_USD, quotaToUSD,
-  validatePriceSpec, resolvePrice, isExprSpec, type PriceSpec,
+  validatePriceSpec, resolvePrice, type PriceSpec,
 } from './pricing/llm';
 import { TokenStatusEnabled, TokenStatusDisabled, ChannelStatusEnabled, ChannelStatusManuallyDisabled, LogTypeManage } from '../types';
 
@@ -400,6 +400,12 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
 
 // ---------------------------------------------------------------- price
 
+/** 单个费率字段的展示：数字直接显示，表达式截断显示。 */
+function fmtRate(v: number | string | undefined): string {
+  if (v === undefined) return '—';
+  return typeof v === 'number' ? `$${v}` : `「${v.length > 24 ? v.slice(0, 24) + '…' : v}」`;
+}
+
 async function priceCmd(env: Env, args: string[]): Promise<CliResult> {
   const [sub, ...rest] = args;
   const options = await getOptions(env);
@@ -414,35 +420,55 @@ async function priceCmd(env: Env, args: string[]): Promise<CliResult> {
         const { spec, source } = resolvePrice(name, options);
         rows.push([
           name,
-          isExprSpec(spec) ? '表达式' : `$${spec.in}`,
-          isExprSpec(spec) ? '—' : `$${spec.out}`,
-          isExprSpec(spec) ? '—' : spec.cached_in !== undefined ? `$${spec.cached_in}` : '—',
+          fmtRate(spec.in),
+          fmtRate(spec.out),
+          fmtRate(spec.cached_in),
+          spec.cache_write_5m !== undefined || spec.cache_write_1h !== undefined
+            ? `${fmtRate(spec.cache_write_5m)}/${fmtRate(spec.cache_write_1h)}`
+            : '—',
           source === 'key' ? 'key' : source === 'global' ? '覆盖' : source === 'builtin' ? '内置' : '默认',
         ]);
       }
-      return { ok: true, output: `${rows.length} 个模型（美元 / 1M tokens）：\n` + table(['模型', '输入', '输出', '缓存命中', '来源'], rows) };
+      return {
+        ok: true,
+        output: `${rows.length} 个模型（美元 / 1M tokens；缓存写入=5m/1h）：\n` +
+          table(['模型', '输入', '输出', '缓存命中', '缓存写入', '来源'], rows),
+      };
     }
     case 'get': {
       const model = rest[0];
       if (!model) return { ok: false, output: '用法：price get <模型名>' };
       const { spec, source } = resolvePrice(model, options);
       const sourceLabel = source === 'key' ? 'key' : source === 'global' ? '覆盖' : source === 'builtin' ? '内置' : '默认';
-      return { ok: true, output: `${model}（${sourceLabel}）：${isExprSpec(spec) ? `表达式 ${spec.expr}` : `输入 $${spec.in} / 输出 $${spec.out}${spec.cached_in !== undefined ? ` / 缓存 $${spec.cached_in}` : ''}`}` };
+      const parts = [
+        `输入 ${fmtRate(spec.in)}`,
+        `输出 ${fmtRate(spec.out)}`,
+        `缓存命中 ${fmtRate(spec.cached_in)}`,
+        `缓存写入5m ${fmtRate(spec.cache_write_5m)}`,
+        `缓存写入1h ${fmtRate(spec.cache_write_1h)}`,
+      ];
+      return { ok: true, output: `${model}（${sourceLabel}）：${parts.join(' / ')}` };
     }
     case 'set': {
       const model = rest[0];
       const kv = kvOf(rest.slice(1));
-      if (!model || !kv.size) return { ok: false, output: '用法：price set <模型> in=1.32 out=3.96 [cached=0.044] 或 price set <模型> expr="p * 3 + c * 15"' };
-      const overrides = { ...(options.ModelPriceOverride ?? {}) };
-      if (kv.has('expr')) {
-        overrides[model] = { expr: kv.get('expr')! };
-      } else {
-        const spec: PriceSpec = { in: Number(kv.get('in')), out: Number(kv.get('out')) };
-        if (kv.has('cached')) spec.cached_in = Number(kv.get('cached'));
-        overrides[model] = spec;
+      if (!model || !kv.size) {
+        return { ok: false, output: '用法：price set <模型> in=1.32 out=3.96 [cached=0.044] [cw5=1.65] [cw1=2.64]，字段也可以写费率表达式，如 in="4 * (context > 272k ? 2 : 1)"' };
       }
-      const v = validatePriceSpec(overrides[model]);
+      const overrides = { ...(options.ModelPriceOverride ?? {}) };
+      // 旧版整笔表达式语法（expr="..."）已在 v2 移除：明确指路，不要让用户对着
+      // 「缺少字段 in」猜原因。
+      if (kv.has('expr')) {
+        return { ok: false, output: '旧版整笔 {expr} 已移除：v2 按字段写费率表达式，如 price set m in="4 * (context > 272k ? 0.5 : 1)" out=20' };
+      }
+      const spec: PriceSpec = { in: kv.get('in')!, out: kv.get('out')! };
+      if (kv.has('cached')) spec.cached_in = kv.get('cached')!;
+      if (kv.has('cw5')) spec.cache_write_5m = kv.get('cw5')!;
+      if (kv.has('cw1')) spec.cache_write_1h = kv.get('cw1')!;
+      const v = validatePriceSpec(spec);
       if (!v.ok) return { ok: false, output: `价格配置有误：${v.error}` };
+      // 存**归一化后**的 spec：CLI 提交的都是文本，纯数字要落成数字而不是表达式
+      overrides[model] = v.spec;
       await setOptions(env, { ModelPriceOverride: overrides });
       return { ok: true, output: `模型 ${model} 的价格已覆盖（对全部 Key 生效；单个 Key 可用 token price 再覆盖）` };
     }
@@ -457,10 +483,9 @@ async function priceCmd(env: Env, args: string[]): Promise<CliResult> {
     }
     case 'default': {
       const kv = kvOf(rest);
-      if (!kv.has('in') || !kv.has('out')) return { ok: false, output: '用法：price default in=1 out=3（未知模型的兜底价）' };
+      if (!kv.has('in') || !kv.has('out')) return { ok: false, output: '用法：price default in=1 out=3（未知模型的兜底价，只支持常量）' };
       const v = validatePriceSpec({ in: Number(kv.get('in')), out: Number(kv.get('out')) });
       if (!v.ok) return { ok: false, output: `兜底价有误：${v.error}` };
-      if (isExprSpec(v.spec)) return { ok: false, output: '兜底价只支持固定价' };
       await setOptions(env, { DefaultPrice: v.spec });
       return { ok: true, output: `兜底价已设为 $${v.spec.in} / $${v.spec.out}` };
     }
@@ -468,7 +493,7 @@ async function priceCmd(env: Env, args: string[]): Promise<CliResult> {
       return { ok: true, output: `别名前缀（查价前剥掉）：${ALIAS_PREFIXES.join('  ')}` };
     }
     default:
-      return { ok: false, output: '用法：price list [过滤] | get <模型> | set <模型> in=X out=Y [cached=Z] | set <模型> expr="..." | rm <模型> | default in=X out=Y | aliases' };
+      return { ok: false, output: '用法：price list [过滤] | get <模型> | set <模型> in=X out=Y [cached=Z] [cw5=A] [cw1=B] | rm <模型> | default in=X out=Y | aliases' };
   }
 }
 

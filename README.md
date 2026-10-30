@@ -163,18 +163,24 @@ token price 2 {"gpt-4o":{"in":1,"out":2}}
 ## 计费：价格表 × 用量，没有倍率
 
 ```
-quota = ceil( (未命中缓存的 prompt × 输入价 + 命中缓存的 prompt × 缓存价 + completion × 输出价)
+quota = ceil( (fresh × 输入价 + 命中缓存 × 缓存价 + 写缓存5m × 写5m价 + 写缓存1h × 写1h价 + completion × 输出价)
               / 1e6 × 500000 )
+fresh = prompt − 缓存命中 − 写缓存5m − 写缓存1h
 ```
 
 - `500000 quota == $1`。价格单位一律是**美元 / 百万 tokens**。
 - **没有任何倍率**：没有分组倍率、没有时段折扣、没有补全倍率。同一个模型对任何人、
-  任何时候都只有一个价（除非你给它配了表达式，那也是表达式说了算）。
-- 未知模型回退默认价（$1 / $3），不会被当成免费；watchdog 会把「近 24h 用过但没定价」
-  的模型写进系统日志提醒你补价。
-- **缓存命中计价**：DeepSeek 的 `prompt_cache_hit_tokens` 与 OpenAI 的
-  `prompt_tokens_details.cached_tokens` 都会被识别，按 `cached_in` 计价；
-  未配 `cached_in` 的模型按原价计，宁可高估不会低估。
+  任何时候都只有一个价（除非你给它配了字段费率表达式，那也是表达式说了算）。
+- **缓存命中计价**：DeepSeek 的 `prompt_cache_hit_tokens`、OpenAI 的
+  `prompt_tokens_details.cached_tokens`、Anthropic 的 `cache_read_input_tokens` 都按
+  `cached_in` 计价；未配 `cached_in` 的模型按输入价计，宁可高估不会低估。
+- **缓存写入计价**（Anthropic 官方口径：5m TTL = 1.25× 输入价、1h TTL = 2×）：
+  `cache_creation.ephemeral_5m/1h_input_tokens` 分桶按 `cache_write_5m` / `cache_write_1h`
+  计价；只报总数时归入 5m 桶；未配置的模型按输入价计。OpenAI/Gemini 无写缓存概念。
+- **严格计费开关 = 兜底价**：价格页清空默认价（存 `null`）即启用——查不到价的请求
+  直接 503 `model_price_not_configured`（不调上游、不预扣）；设置兜底价则按它记账
+  （默认 $1/$3）。后台新增「模型计费」页：每个模型按哪个价计、近 7 天用量、
+  缓存命中率、有没有漏配价，一眼看完；总览与健康页有未定价警告横幅。
 
 ### 价格的四级优先
 
@@ -186,60 +192,72 @@ quota = ceil( (未命中缓存的 prompt × 输入价 + 命中缓存的 prompt �
    （`PUT /api/pricing/overrides`，整包替换，逐条校验）
 3. **内置价格表** —— `src/lib/pricing/llm.ts` 的 `PRICE_TABLE`，最长前缀匹配
    （`gpt-4o-mini-2024-07-18` 命中 `gpt-4o-mini`；`zai-coding-plan/glm-4.7` 剥前缀命中 `glm-4.7`）
-4. **默认价** —— $1 / $3，价格页（或 `price default in=X out=Y`）可改
+4. **默认价** —— $1 / $3（严格计费下不生效；价格页可改/可清除）
 
-`PriceSpec` 两种形态：
+`PriceSpec` 的**每个字段**（`in` / `out` / `cached_in` / `cache_write_5m` / `cache_write_1h`）
+独立地是数字常量或费率表达式：
 
 ```jsonc
-{ "in": 1.32, "out": 3.96, "cached_in": 0.044 }   // 固定价，美元/1M tokens
-{ "expr": "p * 1.32 + c * 3.96 + cr * 0.044" }    // 表达式，见下
+{ "in": 1.32, "out": 3.96, "cached_in": 0.044 }                      // 常量，美元/1M tokens
+{ "in": "4 * (context > 272k ? 2 : 1)", "out": 20 }                  // 字段费率表达式，见下
 ```
 
-### 表达式计费语言
+### 表达式计费语言（v2：按字段的绝对费率）
 
-参考 [new-api 的 billingexpr](https://github.com/QuantumNous/new-api)（`pkg/billingexpr/`）实现的
-AST 解释器（Cloudflare Workers 禁 eval/new Function，所以是手写 parser + 解释执行，
-`src/lib/pricing/expr.ts`）。**一条表达式就是这个模型在这把 Key 上的全部计费逻辑。**
+字段表达式的求值结果 = **该字段本次请求的 USD / 1M tokens 费率**；token 数由计费引擎
+按字段套用，表达式永远不碰 token 数。手写 lexer + parser + AST 解释器
+（Cloudflare Workers 禁 eval/new Function），设计参考
+[new-api 的 billingexpr](https://github.com/QuantumNous/new-api)
+（`pkg/billingexpr/`）的函数面，语义按字段费率重新设计（v1 的整笔 `{expr}` 总价写法已移除）。
 
-- 求值结果的单位是**微美元**（美元 × 1e6）；系数直接写供应商公示的 $/1M tokens：
-  `p * 2.5` = 每百万输入 token 收 $2.50。网关按
-  `quota = ceil(结果 / 1e6 × 500000)` 换算。
-- **变量**：`p`（输入 token，引用了 `cr` 时自动扣掉缓存部分）、`c`（输出 token）、
-  `cr`（缓存命中 token，不引用则为 0）、`len`（完整输入长度，**永不被扣除**，
-  阶梯条件请用它）。
-- **函数**：`min(a,b)` `max(a,b)` `abs(x)` `ceil(x)` `floor(x)`、
-  `fixed(amount)`（每次成功请求收 $amount，内部 ×1e6 参与同一换算）、
-  `tier("档名", 值)`（原样返回值并把命中的档名记进消费日志）、
-  `hour/minute/weekday/day/month("时区")`（IANA 时区，可省略默认 UTC，非法回退 UTC；
-  `weekday` 0=周日）。
-- **运算符**：`+ - * / %`（`%` 只许整数、`/` 永远浮点）、比较 `> >= < <= == !=`、
-  `&& || !`（操作数必须是布尔，没有 JS 的真值短路）、三目 `?:`（唯一的短路点，
-  走不到的分支不产生 tier/fixed 副作用）、括号、数字/字符串字面量。
-- **保存时校验**：编译 + 冒烟（多组用量 × 多个时刻实跑，结果必须是有限非负数字），
-  坏配置在保存那一刻就被拦下；万一库里存了坏表达式，计费时回退默认价并打错误日志，
-  **绝不按 0 记账**。
+- **变量**：`context`（别名 `len`，完整输入 token 数，阶梯条件用它）、`n`（请求级数量，默认 1）。
+- **请求探针**：`param("路径")`（点路径读请求体）、`header("名")`（读请求头）——
+  缺失为 `null`：`==` 比较为 false、`has(null, ·)` 为 false，算术作用于 null 才报错；
+  `has(s, 子串)` 判子串。
+- **函数**：`min` `max` `abs` `ceil` `floor`、`tier("档名", 值)`（原样返回值并把档名
+  记进消费日志）、`hour/minute/weekday/day/month("时区")`（IANA 时区，可省略默认 UTC，
+  非法回退 UTC；`weekday` 0=周日）。
+- **运算符**：`+ - * / %`（`/` 永远浮点）、比较 `> >= < <= == !=`、`&& || !`（严格布尔）、
+  三目 `?:`（短路，走不到的分支不产生 tier 副作用）、括号、数字字面量支持 **k/m 后缀**
+  （`272k` = 272000，`1.5m` = 1_500_000）。
+- **求值时机**：每个请求在「选中渠道后、发上游前」求值一次并连同计费身份钉在预扣上，
+  结算复用同一份；求值失败该渠道跳过（relay_events 可见），全部渠道跳过且无兜底价
+  → 503 `model_price_not_configured`。
+- **保存时校验**：逐字段编译 + 冒烟（context ∈ {0, 1k, 100k, 272k, 300k, 5m} × 探针缺失 ×
+  三个时刻，费率必须有限非负），坏配置在保存那一刻就被拦下。
 
 例子：
 
 ```jsonc
-// 基础（等价于固定价表）
-{ "expr": "p * 3 + c * 15 + cr * 0.3" }
+// GPT-6 长上下文档位（>272K 输入整笔翻倍）
+{ "in": "4 * (context > 272k ? 2 : 1)", "out": "20 * (context > 272k ? 1.5 : 1)" }
 
-// 阶梯：上下文 ≤128K 一档，否则另一档（用 len 别用 p）
-{ "expr": "len <= 128000 ? fixed(0.002) : fixed(0.004)" }
+// DeepSeek 谷时半价（北京时间 1-5 点）
+{ "in": "0.3 * (hour('Asia/Shanghai') >= 1 && hour('Asia/Shanghai') < 5 ? 0.5 : 1)" }
 
-// 分时：北京时间 22 点后到 6 点半价（替代被删掉的 DeepSeek 时段折扣）
-{ "expr": "hour('Asia/Shanghai') >= 22 || hour('Asia/Shanghai') < 6 ? p * 0.22 + c * 0.66 : p * 0.44 + c * 1.32" }
-
-// 按次收费
-{ "expr": "tier('request', fixed(0.01))" }
+// 请求头开关的倍率（fast-mode 档）
+{ "out": "has(header('anthropic-beta'), 'fast-mode') ? 30 : 20" }
 ```
+
+### 渠道运维三件套
+
+- **测试选模型**：渠道页点「测试」弹窗选择该渠道 models 里的一个模型再测
+  （显式传的 model 必须 ∈ 渠道 models——测试带渠道 key 直连上游，不能变成
+  「拿这把 key 调任意模型」的后门）。
+- **从上游拉取模型**：新增/编辑渠道时用 key 请求上游 `/models`（5 种渠道类型各自的
+  端点与鉴权头，Gemini 分页取全并剥 `models/` 前缀，Azure 取 deployment 名），
+  复选后追加合并进模型列表；编辑已有渠道可走库存 key，key 不回传前端。
+- **模型计费页**：`GET /api/model-billing`，见上。
 
 ### 价格外显
 
 - `GET /api/pricing`（管理员）：内置表全文、默认价、全局覆盖现状、别名前缀表。
 - `GET /v1/pricing`（任意 sk- Key）：**这把 Key** 调用时的生效价格，每条带 `source`
   （`key` / `global` / `builtin` / `default`）。客户端可以在调用前算出成本。
+- `GET /api/model-billing`（管理员）：模型计费页数据（声明模型全集 × 价格解析 × 近 7 天用量）。
+- `npm run audit:llm-billing`：部署前的只读审计——列出启用渠道上未定价的 (渠道, 模型)
+  组合；严格计费下不为空则以非零退出。`python scripts/d1_guard.py check`：部署前核对
+  本地迁移文件与远端 `d1_migrations` 历史一致（fail-closed）。
 
 ### 403 的处理：模型/区域级软熔断 + 换渠道，不是渠道故障
 

@@ -1,51 +1,56 @@
 /**
- * 计费表达式引擎 —— 手写 lexer + 优先级爬升解析器 + AST 解释执行。
+ * 计费表达式引擎 v2 —— 手写 lexer + 优先级爬升解析器 + AST 解释执行。
  *
  * **为什么不用 `new Function` / `eval`**：Cloudflare Workers 禁止动态代码求值，
  * 所以表达式被解析成 AST 后由解释器直接遍历求值。
  *
- * 设计参考 new-api（QuantumNous/new-api）的 `pkg/billingexpr/`：
+ * ## v2 语义：按字段的「绝对费率」表达式
  *
- * - 「一条表达式就是全部计费逻辑」：没有隐藏倍率，系数就是供应商公示的 $/1M tokens，
- *   `p * 2.5` 表示每百万输入 token 收 $2.50；
- * - 求值结果的单位是**微美元**（美元 × 1e6）：`p * 2.5` 在 p=1,000,000 时得到
- *   2,500,000 微美元 = $2.50，调用方按 `quota = ceil(microUSD / 1e6 × QUOTA_PER_USD)`
- *   换算（换算在 llm.ts，这里只管求值）；
- * - `fixed(amount)` 表示「每次成功请求 $amount」，内部同样放大 1e6 与 token 计费共用换算；
- * - `tier(name, value)` 原样返回 value，并把命中的档位记进 trace，供日志展示；
- * - 三目是唯一的短路点：走不到的分支不产生 tier/fixed 副作用；
- * - `%` 只允许整数操作数，`/` 永远是浮点除法。
+ * 价格对象的**每个字段**（in / cached_in / out / cache_write_5m / cache_write_1h）
+ * 都可以是数字常量或一个表达式；表达式的求值结果 = **该字段本次请求的费率
+ * （USD / 1M tokens）**。token 数由计费引擎按字段套用，表达式永远不碰 token 数：
  *
- * 与 new-api 的差异（刻意从简，个人网关够用）：
- * - 变量只有 `p` / `c` / `cr` / `len`（本网关的 usage 只有这四个维度）；
- * - 没有 `param()` / `header()` / `u()` 请求探针——结算管道里拿不到原始请求体；
- * - 没有 `image_count` 与请求规则插桩（`_trace`）；
- * - `fixed()` 不强制包在 `tier()` 里、也允许与 token 项相加——语义仍是明确定义的
- *   「token 费 + 每请求固定费」，校验只要求金额是**非负数字字面量**（防 `fixed(p)`）。
+ *   "in":  "4 * (context > 272k ? 0.5 : 1)"        // GPT-6 长上下文档位
+ *   "in":  "0.3 * (hour('Asia/Shanghai') >= 1 && hour('Asia/Shanghai') < 5 ? 0.5 : 1)"
+ *                                                  // DeepSeek 谷时
+ *   "out": "has(header('anthropic-beta'), 'fast-mode') ? 30 : 20"
+ *
+ * 变量只有 `context`（别名 `len`，完整输入 token 数）与 `n`（请求级数量，默认 1）；
+ * 请求探针 `param(path)` / `header(key)` 读取本次请求，缺失时为 null
+ * （`==` 比较为 false、`has(null, ·)` 为 false，算术作用于 null 才报错）。
+ *
+ * 设计参考 new-api（QuantumNous/new-api）`pkg/billingexpr/` 的函数面
+ * （param/header/has/hour/minute/weekday/day/month/tier/min/max/abs/ceil/floor），
+ * 但**语义不同**：new-api 是「一条表达式算总价」，v2 是「每字段一条费率表达式」——
+ * 所以没有 p/c/cr 这类 token 数变量，也没有 `fixed()` 按次计费
+ * （按次计费将来以独立字段形式支持，见图像轮设计）。
+ *
+ * 其余从 v1 沿用的性质：
+ * - 三目 / && / || 短路：走不到的分支不产生 tier 副作用；
+ * - `/` 永远是浮点除法；`%` 为实数取模（除数为 0 报错）；
+ * - 编译期拒绝未知变量/函数、参数个数/字面量类型错误；坏配置在保存时就会被拦下。
  */
 
-export interface ExprParams {
-  /** 计价用输入 token（表达式引用 `cr` 时已自动扣掉缓存部分，见 llm.ts）。 */
-  p: number;
-  /** 输出 token。 */
-  c: number;
-  /** 缓存命中 token；表达式没引用它时为 0（那部分留在 p 里）。 */
-  cr: number;
-  /** 输入上下文总长度，只用于阶梯条件，**永不被自动排除**。 */
-  len: number;
+export interface RateParams {
+  /** 本次请求的完整输入 token 数（含缓存命中部分）。阶梯条件用它。 */
+  context: number;
+  /** 请求级数量参数（图像张数等），默认 1。 */
+  n: number;
+}
+
+/** 请求探针：从本次 HTTP 请求里取值；取不到返回 null。 */
+export interface ProbeContext {
+  header: (key: string) => string | null;
+  param: (path: string) => unknown;
 }
 
 export interface ExprTrace {
   /** 最后一次 tier() 命中的档名。 */
   matchedTier?: string;
-  /** 'token'（默认）或 'request'（表达式调用了 fixed()）。 */
-  billingUnit: 'token' | 'request';
-  /** fixed() 的美元价（未乘任何系数）。 */
-  fixedPrice?: number;
 }
 
 export type CompileResult = { ok: true; program: Program } | { ok: false; error: string };
-export type EvalResult = { ok: true; microUSD: number; trace: ExprTrace } | { ok: false; error: string };
+export type EvalResult = { ok: true; rate: number; trace: ExprTrace } | { ok: false; error: string };
 
 // ---------------------------------------------------------------- AST
 
@@ -67,17 +72,16 @@ type BinOp = '+' | '-' | '*' | '/' | '%' | '==' | '!=' | '<' | '<=' | '>' | '>='
 export interface Program {
   src: string;
   ast: Node;
-  /** 表达式引用到的变量名（供 p/c 的自动排除判定）。 */
-  usedVars: Set<string>;
-  /** 是否调用了 fixed()（按次计费）。 */
-  hasFixed: boolean;
 }
 
-const VARIABLES = new Set(['p', 'c', 'cr', 'len']);
-const FUNCTIONS = new Set(['min', 'max', 'abs', 'ceil', 'floor', 'fixed', 'tier', 'hour', 'minute', 'weekday', 'day', 'month']);
+const VARIABLES = new Set(['context', 'len', 'n']);
+const FUNCTIONS = new Set([
+  'min', 'max', 'abs', 'ceil', 'floor', 'tier',
+  'param', 'header', 'has',
+  'hour', 'minute', 'weekday', 'day', 'month',
+]);
 
 const MAX_SRC_LEN = 4096;
-const MAX_DEPTH = 128;
 const CACHE_LIMIT = 256;
 
 // ---------------------------------------------------------------- 词法
@@ -99,8 +103,16 @@ function tokenize(src: string): Token[] {
     if (ch >= '0' && ch <= '9') {
       const m = /^\d+(\.\d+)?([eE][+-]?\d+)?/.exec(src.slice(i));
       if (!m) throw new ExprError(`非法数字（位置 ${i}）`);
-      tokens.push({ t: 'num', v: m[0] });
-      i += m[0].length;
+      let text = m[0];
+      i += text.length;
+      // k/m 后缀：272k = 272000，1.5m = 1_500_000。后缀后面不能再跟标识符字符，
+      // 否则 `272kilo` 会被静默切成 `272k` + `ilo`。
+      const suf = src[i];
+      if ((suf === 'k' || suf === 'K' || suf === 'm' || suf === 'M') && !/[A-Za-z0-9_]/.test(src[i + 1] ?? '')) {
+        text += suf;
+        i++;
+      }
+      tokens.push({ t: 'num', v: text });
       continue;
     }
     if (ch === '.' && src[i + 1] >= '0' && src[i + 1] <= '9') {
@@ -219,7 +231,12 @@ class Parser {
     if (!t) throw new ExprError('表达式意外结束');
     this.add();
     if (t.t === 'num') {
-      const value = Number(t.v);
+      // k/m 后缀在词法阶段已并入文本，这里统一求值（.5 这种前导点形式也合法）。
+      const m = /^((?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)([kKmM])?$/.exec(t.v);
+      if (!m) throw new ExprError(`非法数字：${t.v}`);
+      let value = Number(m[1]);
+      if (m[2] === 'k' || m[2] === 'K') value *= 1_000;
+      if (m[2] === 'm' || m[2] === 'M') value *= 1_000_000;
       if (!Number.isFinite(value)) throw new ExprError(`数字字面量溢出：${t.v}`);
       return { kind: 'num', value };
     }
@@ -263,21 +280,13 @@ class Parser {
 function checkCall(name: string, args: Node[]): void {
   const arityError = (want: string) => new ExprError(`${name}() 需要 ${want} 个参数`);
   switch (name) {
-    case 'min': case 'max':
+    case 'min': case 'max': case 'has':
       if (args.length !== 2) throw arityError('2');
       break;
-    case 'abs': case 'ceil': case 'floor':
+    case 'abs': case 'ceil': case 'floor': case 'param': case 'header':
       if (args.length !== 1) throw arityError('1');
       break;
-    case 'fixed': {
-      if (args.length !== 1) throw arityError('1');
-      const arg = args[0];
-      // 金额必须是**非负有限数字字面量**：fixed(p)、fixed(0.01+0.02) 这类会被拒绝，
-      // 否则「按次收费」就能被请求方用 token 数操纵。
-      if (arg.kind !== 'num') throw new ExprError('fixed() 的金额必须是非负数字字面量');
-      if (!(arg.value >= 0) || !Number.isFinite(arg.value)) throw new ExprError('fixed() 的金额必须是非负有限数字');
-      break;
-    }
+    case 'param': break; // arity 已查；键必须是字符串字面量，见下
     case 'tier': {
       if (args.length !== 2) throw arityError('2');
       if (args[0].kind !== 'str') throw new ExprError('tier() 的第一个参数必须是字符串字面量档名');
@@ -288,11 +297,16 @@ function checkCall(name: string, args: Node[]): void {
       if (args.length === 1 && args[0].kind !== 'str') throw new ExprError(`${name}() 的时区参数必须是字符串字面量`);
       break;
   }
+  // 探针的键在编译期定死为字符串字面量：便于校验阶段理解表达式读了什么，
+  // 也防止把动态字符串当路径用（路径应写死在配置里，而不是运行时拼出来）。
+  if ((name === 'param' || name === 'header') && args[0]?.kind !== 'str') {
+    throw new ExprError(`${name}() 的键必须是字符串字面量`);
+  }
 }
 
 // ---------------------------------------------------------------- 编译缓存
 
-const cache = new Map<string, CompileResult & { ok: true } | CompileResult & { ok: false }>();
+const cache = new Map<string, CompileResult>();
 
 /** 编译（带缓存）。语义错误的表达式永远编译不过，坏配置在保存时就会被拦下。 */
 export function compileBillingExpr(src: string): CompileResult {
@@ -303,29 +317,12 @@ export function compileBillingExpr(src: string): CompileResult {
   try {
     if (src.length > MAX_SRC_LEN) throw new ExprError(`表达式过长（>${MAX_SRC_LEN} 字符）`);
     const ast = new Parser(tokenize(src)).parse();
-    const usedVars = new Set<string>();
-    let hasFixed = false;
-    const walk = (n: Node): void => {
-      switch (n.kind) {
-        case 'var': usedVars.add(n.name); break;
-        case 'call':
-          if (n.name === 'fixed') hasFixed = true;
-          n.args.forEach(walk);
-          break;
-        case 'un': walk(n.arg); break;
-        case 'bin': walk(n.l); walk(n.r); break;
-        case 'and': case 'or': walk(n.l); walk(n.r); break;
-        case 'cond': walk(n.c); walk(n.t); walk(n.f); break;
-        default: break;
-      }
-    };
-    walk(ast);
-    result = { ok: true, program: { src, ast, usedVars, hasFixed } };
+    result = { ok: true, program: { src, ast } };
   } catch (e) {
     result = { ok: false, error: e instanceof ExprError ? e.message : `解析失败：${String(e)}` };
   }
   if (cache.size >= CACHE_LIMIT) cache.clear();
-  cache.set(key, result as never);
+  cache.set(key, result);
   return result;
 }
 
@@ -334,7 +331,8 @@ export function compileBillingExpr(src: string): CompileResult {
 type Value = number | string | boolean | null;
 
 interface Ctx {
-  params: ExprParams;
+  params: RateParams;
+  probes: ProbeContext;
   trace: ExprTrace;
   now: Date;
 }
@@ -345,7 +343,11 @@ function evalNode(node: Node, ctx: Ctx): Value {
     case 'str': return node.value;
     case 'bool': return node.value;
     case 'nil': return null;
-    case 'var': return ctx.params[node.name as keyof ExprParams];
+    case 'var': {
+      // `len` 是 `context` 的别名（v1 沿用下来的书写习惯）。
+      if (node.name === 'len') return ctx.params.context;
+      return ctx.params[node.name as keyof RateParams];
+    }
     case 'un': {
       const v = evalNode(node.arg, ctx);
       if (node.op === '!') {
@@ -374,7 +376,7 @@ function evalNode(node: Node, ctx: Ctx): Value {
     case 'cond': {
       const c = evalNode(node.c, ctx);
       if (typeof c !== 'boolean') throw new ExprError('三目条件必须是布尔值');
-      // 唯一的短路点：走不到的分支不产生 tier/fixed 副作用（与 new-api 一致）。
+      // 短路：走不到的分支不产生 tier 副作用。
       return evalNode(c ? node.t : node.f, ctx);
     }
     case 'bin': return evalBin(node.op, evalNode(node.l, ctx), evalNode(node.r, ctx));
@@ -385,6 +387,13 @@ function evalNode(node: Node, ctx: Ctx): Value {
 function num(v: Value, what: string): number {
   if (typeof v !== 'number') throw new ExprError(`${what} 需要数字操作数`);
   return v;
+}
+
+/** 探针返回值只允许标量；对象/数组没有定价语义，直接报错（fail-closed）。 */
+function scalar(v: unknown, what: string): Value {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') return v;
+  throw new ExprError(`${what} 返回了非标量值（对象/数组不能参与定价运算）`);
 }
 
 function evalBin(op: BinOp, lv: Value, rv: Value): Value {
@@ -398,12 +407,10 @@ function evalBin(op: BinOp, lv: Value, rv: Value): Value {
         case '*': return a * b;
         case '/':
           if (b === 0) throw new ExprError('除零');
-          return a / b; // 永远是浮点除法（Go 语义，没有整除）
-        case '%': {
-          if (!Number.isInteger(a) || !Number.isInteger(b)) throw new ExprError('% 只允许整数操作数');
+          return a / b; // 永远是浮点除法
+        case '%':
           if (b === 0) throw new ExprError('对 0 取模');
-          return a % b;
-        }
+          return a % b; // 实数取余（JS 语义），正负号跟随被除数
       }
       break;
     }
@@ -422,7 +429,12 @@ function evalBin(op: BinOp, lv: Value, rv: Value): Value {
         (typeof lv === 'string' && typeof rv === 'string') ||
         (typeof lv === 'boolean' && typeof rv === 'boolean') ||
         (lv === null && rv === null);
-      if (!sameType) throw new ExprError('"=="/"!=" 不能比较不同类型的值');
+      if (!sameType) {
+        // null 与非 null 的比较不报错、直接为「不等」：探针缺失时
+        // `header('x') == 'fast'` 应当是 false 而不是一条 5xx。
+        if (lv === null || rv === null) return op === '!=';
+        throw new ExprError('"=="/"!=" 不能比较不同类型的值');
+      }
       return op === '==' ? lv === rv : lv !== rv;
     }
   }
@@ -437,19 +449,29 @@ function evalCall(node: Extract<Node, { kind: 'call' }>, ctx: Ctx): Value {
     case 'abs': return Math.abs(num(evalNode(args[0], ctx), 'abs()'));
     case 'ceil': return Math.ceil(num(evalNode(args[0], ctx), 'ceil()'));
     case 'floor': return Math.floor(num(evalNode(args[0], ctx), 'floor()'));
-    case 'fixed': {
-      const amount = num(evalNode(args[0], ctx), 'fixed()');
-      ctx.trace.billingUnit = 'request';
-      ctx.trace.fixedPrice = amount;
-      // 与 new-api 相同：放大 1e6，和 token 计费共用「微美元 → quota」换算。
-      return amount * 1_000_000;
-    }
     case 'tier': {
       const name = evalNode(args[0], ctx);
       const value = num(evalNode(args[1], ctx), 'tier()');
       if (typeof name !== 'string') throw new ExprError('tier() 的档名必须是字符串');
       ctx.trace.matchedTier = name;
       return value;
+    }
+    case 'param': {
+      const path = evalNode(args[0], ctx) as string;
+      return scalar(ctx.probes.param(path), `param("${path}")`);
+    }
+    case 'header': {
+      const key = evalNode(args[0], ctx) as string;
+      return scalar(ctx.probes.header(key), `header("${key}")`);
+    }
+    case 'has': {
+      const src = evalNode(args[0], ctx);
+      const sub = evalNode(args[1], ctx);
+      // 缺失探针上的 has 恒为 false：`has(header('x'), 'y')` 在没有 x 头时安全。
+      if (src === null) return false;
+      if (typeof src !== 'string') throw new ExprError('has() 的第一个参数必须是字符串');
+      if (typeof sub !== 'string') throw new ExprError('has() 的第二个参数必须是字符串');
+      return src.includes(sub);
     }
     case 'hour': case 'minute': case 'weekday': case 'day': case 'month': {
       let tz: string | undefined;
@@ -513,14 +535,34 @@ function timeParts(tz: string | undefined, now: Date): { hour: number; minute: n
 
 // ---------------------------------------------------------------- 入口
 
-/** 求值。结果单位是微美元（美元 × 1e6）；`hasFixed` 时 trace.billingUnit === 'request'。 */
-export function evaluateProgram(program: Program, params: ExprParams, now: Date = new Date()): EvalResult {
-  const trace: ExprTrace = { billingUnit: 'token' };
+/** 没有真实请求时的探针桩：所有探针返回 null（保存时的冒烟校验用它）。 */
+export const ABSENT_PROBES: ProbeContext = {
+  header: () => null,
+  param: () => null,
+};
+
+export interface RateEnv {
+  params: RateParams;
+  probes?: ProbeContext;
+  now?: Date;
+}
+
+/**
+ * 求值一个费率表达式。结果是**该字段的 USD / 1M tokens 费率**（不是总价——
+ * token 数由计费引擎按字段套用，见 llm.ts 的 quotaFromRates）。
+ */
+export function evaluateRate(program: Program, env: RateEnv): EvalResult {
+  const trace: ExprTrace = {};
   try {
-    const out = evalNode(program.ast, { params, trace, now });
-    if (typeof out !== 'number') throw new ExprError('表达式结果必须是数字');
+    const out = evalNode(program.ast, {
+      params: env.params,
+      probes: env.probes ?? ABSENT_PROBES,
+      trace,
+      now: env.now ?? new Date(),
+    });
+    if (typeof out !== 'number') throw new ExprError('表达式结果必须是数字（费率）');
     if (!Number.isFinite(out)) throw new ExprError('表达式结果不是有限数字');
-    return { ok: true, microUSD: out, trace };
+    return { ok: true, rate: out, trace };
   } catch (e) {
     return { ok: false, error: e instanceof ExprError ? e.message : `求值失败：${String(e)}` };
   }

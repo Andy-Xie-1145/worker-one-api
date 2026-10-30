@@ -1,6 +1,8 @@
 import { type Env, type TokenRow, type UserRow, LogTypeConsume, TokenStatusExhausted } from '../types';
 import { invalidateTokenCache, parseTokenPriceConfig } from './auth';
-import { calcQuotaDetailed, quotaToUSD } from './pricing';
+import { calcQuotaDetailed, quotaFromRates, quotaToUSD } from './pricing';
+import type { RateSet, PriceSource } from './pricing/llm';
+import type { ExprTrace } from './pricing/expr';
 import { applyCreditGated, applyCredit } from './ledger';
 import type { Options } from './options';
 import type { PriceSpec } from './pricing/llm';
@@ -11,6 +13,10 @@ export interface Usage {
   total_tokens?: number;
   /** Subset of prompt_tokens served from the vendor's prompt cache, when reported. */
   cached_tokens?: number;
+  /** 5 分钟 TTL 缓存写入 token（Anthropic cache_creation.ephemeral_5m_input_tokens）。 */
+  cache_write_5m_tokens?: number;
+  /** 1 小时 TTL 缓存写入 token（Anthropic cache_creation.ephemeral_1h_input_tokens）。 */
+  cache_write_1h_tokens?: number;
 }
 
 /**
@@ -115,23 +121,30 @@ export async function postConsume(
      * 扣掉——这正是回收器敢在 15 分钟后无条件退款的前提。
      */
     settleRef?: string;
+    /**
+     * 预扣时钉住的计费身份产物（费率 + 来源 + trace）。传入就**直接用它结算**，
+     * 不再重新查价——两次解析之间配置/时间函数可能变化，前后不一致会让找平出错。
+     * 缺省时回退到重新解析（老调用方/测试的兼容路径）。
+     */
+    billing?: { rates: RateSet; source: PriceSource; via?: 'requested' | 'upstream'; trace?: ExprTrace };
   },
 ): Promise<number> {
   const { token, user, channelId, modelName, usage, preConsumed, options, elapsedMs } = args;
-  const detail = calcQuotaDetailed(modelName, usage, options, args.upstreamModel, args.keyOverrides);
+  const detail = args.billing
+    ? { quota: quotaFromRates(args.billing.rates, usage), source: args.billing.source, trace: args.billing.trace }
+    : calcQuotaDetailed(modelName, usage, options, args.upstreamModel, args.keyOverrides);
   const quota = detail.quota;
   const delta = quota - preConsumed;
   const now = Math.floor(Date.now() / 1000);
 
-  const pricePart =
-    detail.trace?.billingUnit === 'request' && detail.trace.fixedPrice !== undefined
-      ? `，按次计费 $${detail.trace.fixedPrice}`
-      : detail.trace?.matchedTier
-        ? `，计费档「${detail.trace.matchedTier}」`
-        : '';
+  const pricePart = detail.trace?.matchedTier ? `，计费档「${detail.trace.matchedTier}」` : '';
+  const cachePart =
+    usage.cache_write_5m_tokens || usage.cache_write_1h_tokens
+      ? `，缓存写入 ${usage.cache_write_5m_tokens ?? 0}/${usage.cache_write_1h_tokens ?? 0}`
+      : '';
   const content =
     args.content ??
-    `输入 ${usage.prompt_tokens} tokens${usage.cached_tokens ? `（缓存命中 ${usage.cached_tokens}）` : ''}，` +
+    `输入 ${usage.prompt_tokens} tokens${usage.cached_tokens ? `（缓存命中 ${usage.cached_tokens}）` : ''}${cachePart}，` +
       `输出 ${usage.completion_tokens} tokens${pricePart}，消耗 $${quotaToUSD(quota).toFixed(6)}`;
 
   const also: D1PreparedStatement[] = [

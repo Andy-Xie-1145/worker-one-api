@@ -72,6 +72,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .term-in .ps{color:#3fb950;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;white-space:nowrap}
 .term-in input{flex:1;background:#161b22;border:1px solid #2a313a;color:#e6edf3;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;padding:5px 8px}
 .term-in input:focus{outline:none;border-color:var(--accent)}
+.spin{width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;display:inline-block;vertical-align:-2px}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -128,6 +130,11 @@ async function boot() {
   if (!state.status) { app.innerHTML = '<div class="center"><p>无法连接到服务</p></div>'; return; }
   if (!localStorage.getItem(KEY_STORAGE)) return showUnlock();
   try { state.owner = await api('/owner'); } catch (err) { toast(err.message, 'err'); return; }
+  const h = parseHash();
+  if (h) {
+    if (h.page === 'pricing' && h.q) pendingPricingQuery = h.q;
+    state.page = h.page;
+  }
   render();
 }
 
@@ -164,6 +171,7 @@ const PAGES = {
   tokens: ['令牌', pageTokens],
   channels: ['渠道', pageChannels],
   pricing: ['价格', pagePricing],
+  billing: ['模型计费', pageModelBilling],
   health: ['健康', pageHealth],
   logs: ['日志', pageLogs],
   terminal: ['终端', pageTerminal],
@@ -198,14 +206,31 @@ function render() {
   fn(document.getElementById('view')).catch((e) => toast(e.message, 'err'));
 }
 
+// 极简 hash 路由：#页签 直接跳页；#pricing?q=模型名 会在价格页自动填过滤框。
+let pendingPricingQuery = '';
+function parseHash() {
+  const h = location.hash.replace(/^#/, '');
+  if (!h) return null;
+  const [page, query] = h.split('?');
+  if (!PAGES[page]) return null;
+  return { page, q: new URLSearchParams(query || '').get('q') || '' };
+}
+window.addEventListener('hashchange', () => {
+  const h = parseHash();
+  if (!h || !state.owner) return; // 未解锁时忽略，交由解锁流程接管
+  if (h.page === 'pricing' && h.q) pendingPricingQuery = h.q;
+  state.page = h.page;
+  render();
+});
+
 function table(cols, rows, renderRow) {
   return `<div class="scroll"><table><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>
     <tbody>${rows.length ? rows.map(renderRow).join('') : `<tr><td colspan="${cols.length}" class="muted">暂无数据</td></tr>`}</tbody></table></div>`;
 }
 
-function dialog(title, innerHTML, onSave) {
+function dialog(title, innerHTML, onSave, okLabel = '保存') {
   const dlg = $(`<dialog><div class="dlg-body"><h2 style="margin-top:0">${esc(title)}</h2>${innerHTML}</div>
-    <div class="dlg-foot"><button data-x>取消</button><button class="primary" data-ok>保存</button></div></dialog>`);
+    <div class="dlg-foot"><button data-x>取消</button><button class="primary" data-ok>${esc(okLabel)}</button></div></dialog>`);
   document.body.append(dlg);
   dlg.showModal();
   const close = () => { dlg.close(); dlg.remove(); };
@@ -252,7 +277,9 @@ async function pageDashboard(view) {
 }
 
 async function loadDashboard(view) {
-  const d = await api('/dashboard');
+  // 计费横幅：拉取失败静默，不打扰总览。
+  const [d, billing] = await Promise.all([api('/dashboard'), api('/model-billing').catch(() => null)]);
+  const bun = billing?.totals?.unconfigured || 0;
   const byModel = {};
   for (const r of d.daily) {
     byModel[r.model_name] = byModel[r.model_name] || { count: 0, quota: 0, pt: 0, ct: 0 };
@@ -265,6 +292,9 @@ async function loadDashboard(view) {
   const max = Math.max(1, ...models.map(([, m]) => m.quota));
 
   view.replaceChildren($(`<div>
+    ${bun > 0 ? `<div class="card" style="border-color:var(--err);margin-bottom:12px;padding:10px 16px">
+      <span style="color:var(--err)">有 ${bun} 个模型没有配置价格${billing.strict_billing ? '，将拒绝请求' : ''}</span>
+      · <a href="#billing">去模型计费页</a></div>` : ''}
     <div class="stats" style="margin-bottom:12px">
       <div class="stat"><div class="k">余额</div><div class="v">${usd(d.self.quota)}</div></div>
       <div class="stat"><div class="k">累计消耗</div><div class="v">${usd(d.self.used_quota)}</div></div>
@@ -328,7 +358,7 @@ async function pageTokens(view) {
     <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
     <label>可用模型（逗号分隔，留空表示全部）</label><input id="models" value="${esc(t.models || '')}">
     <label>价格配置（可选 JSON）</label>
-    <textarea id="price_config" placeholder='{"my-model":{"in":1.32,"out":3.96,"cached_in":0.044},"fast-model":{"expr":"p * 2 + c * 8"}}'>${t.price_config ? esc(JSON.stringify(t.price_config, null, 2)) : ''}</textarea>
+    <textarea id="price_config" placeholder='{"my-model":{"in":1.32,"out":3.96,"cached_in":0.044},"long-ctx":{"in":"4*(context>272k?2:1)"}}'>${t.price_config ? esc(JSON.stringify(t.price_config, null, 2)) : ''}</textarea>
     <p class="muted" style="margin:4px 0 0">同一模型在此 Key 上的价格覆盖全局价格覆盖与内置价格表。留空 = 不修改（新建时留空 = 不配置）；提交 <code>{}</code> 表示清空。</p>
     ${t.id ? `<label>状态</label><select id="status"><option value="1"${t.status === 1 ? ' selected' : ''}>启用</option><option value="2"${t.status === 2 ? ' selected' : ''}>禁用</option></select>` : ''}`;
 
@@ -400,7 +430,8 @@ async function pageChannels(view) {
     <div class="row"><input id="base_url" value="${esc(ch.base_url || '')}" style="flex:1">
       <select id="preset" style="width:150px"><option value="">预设…</option>${Object.entries(meta.presets).map(([k, v]) => `<option value="${esc(v)}">${esc(k)}</option>`).join('')}</select></div>
     <label>模型列表（逗号分隔）</label><textarea id="models">${esc(ch.models || '')}</textarea>
-    <div class="row"><button type="button" id="fill" style="margin-top:6px">填入内置价格表中的常见模型</button></div>
+    <div class="row"><button type="button" id="fill" style="margin-top:6px">填入内置价格表中的常见模型</button>
+      <button type="button" id="fetchModels" style="margin-top:6px">从上游拉取</button></div>
     <div class="grid">
       <div><label>优先级（大者优先）</label><input id="priority" type="number" value="${ch.priority ?? 0}"></div>
       <div><label>权重（同优先级内随机）</label><input id="weight" type="number" min="1" value="${ch.weight ?? 1}"></div>
@@ -410,9 +441,65 @@ async function pageChannels(view) {
     <label>渠道额外配置 JSON（可选，如 {"api_version":"2024-10-21"}）</label><textarea id="config">${esc(ch.config || '')}</textarea>
     <label>系统提示词（可选，注入到每个请求）</label><textarea id="system_prompt">${esc(ch.system_prompt || '')}</textarea>`;
 
-  const wire = (dlg) => {
+  // 从上游拉取模型列表：POST /api/channels/fetch-models。新建渠道用表单现输入的
+  // {type, base_url, key, config?}；编辑已有渠道且 key 留空时改用 {channel_id}（后端取已存 Key）。
+  const fetchUpstreamModels = (formDlg, ch) => {
+    const keyVal = val(formDlg, 'key').trim();
+    const cfg = val(formDlg, 'config').trim();
+    const body = keyVal
+      ? { type: val(formDlg, 'type'), base_url: val(formDlg, 'base_url').trim(), key: keyVal, ...(cfg ? { config: cfg } : {}) }
+      : (ch.id ? { channel_id: ch.id } : { type: val(formDlg, 'type'), base_url: val(formDlg, 'base_url').trim(), key: '' });
+    const dlg = dialog('从上游拉取模型',
+      '<div id="fmArea" class="row"><span class="spin"></span><span class="muted">正在请求上游 /v1/models …</span></div>',
+      async (d) => {
+        const picked = [...d.querySelectorAll('input[data-m]:checked')].map((c) => c.dataset.m);
+        if (!picked.length) throw new Error('请勾选至少一个模型');
+        const ta = formDlg.querySelector('#models');
+        const have = new Set(ta.value.split(/[,\n]/).map((s) => s.trim()).filter(Boolean));
+        ta.value = [...have, ...picked.filter((m) => !have.has(m))].join(', ');
+        toast(`已合并 ${picked.length} 个模型`, 'ok');
+      }, '合并选中项');
+    dlg.querySelector('[data-ok]').disabled = true;
+    (async () => {
+      let list;
+      try {
+        const r = await api('/channels/fetch-models', { method: 'POST', body });
+        list = Array.isArray(r?.models) ? r.models : [];
+      } catch (e) {
+        dlg.close(); dlg.remove();
+        toast(e.message, 'err');
+        return;
+      }
+      if (!list.length) { dlg.close(); dlg.remove(); toast('上游未返回任何模型'); return; }
+      const area = dlg.querySelector('#fmArea');
+      area.className = '';
+      area.innerHTML = `
+        <div class="row" style="margin-bottom:8px">
+          <input id="fmQ" placeholder="按模型名过滤…" style="flex:1">
+          <button type="button" id="fmAll">全选</button>
+          <button type="button" id="fmNone">清空</button>
+        </div>
+        <div style="max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:6px 10px">
+          ${list.map((m) => `<label style="margin:2px 0;display:flex;align-items:center;gap:6px"><input type="checkbox" data-m="${esc(m)}" style="width:auto" checked><span class="mono">${esc(m)}</span></label>`).join('')}
+        </div>
+        <p class="muted" style="margin:8px 0 0">共 ${list.length} 个模型；确认后勾选项会<b>追加合并</b>进「模型列表」（自动去重，保留手工已输入项）。</p>`;
+      const q = dlg.querySelector('#fmQ');
+      const visBoxes = () => [...area.querySelectorAll('label')]
+        .filter((l) => !l.hidden).map((l) => l.querySelector('input[data-m]'));
+      q.oninput = () => {
+        const s = q.value.trim().toLowerCase();
+        [...area.querySelectorAll('label')].forEach((l) => { l.hidden = !!s && !l.textContent.toLowerCase().includes(s); });
+      };
+      dlg.querySelector('#fmAll').onclick = () => visBoxes().forEach((c) => { c.checked = true; });
+      dlg.querySelector('#fmNone').onclick = () => [...area.querySelectorAll('input[data-m]')].forEach((c) => { c.checked = false; });
+      dlg.querySelector('[data-ok]').disabled = false;
+    })();
+  };
+
+  const wire = (dlg, ch = {}) => {
     dlg.querySelector('#preset').onchange = (e) => { if (e.target.value) dlg.querySelector('#base_url').value = e.target.value; };
     dlg.querySelector('#fill').onclick = () => { dlg.querySelector('#models').value = meta.known_models.join(','); };
+    dlg.querySelector('#fetchModels').onclick = () => fetchUpstreamModels(dlg, ch);
   };
 
   const collect = (dlg) => {
@@ -444,16 +531,42 @@ async function pageChannels(view) {
       await api('/channels/' + ch.id, { method: 'PUT', body: collect(d) });
       toast('已保存', 'ok'); pageChannels(view);
     });
-    wire(dlg);
+    wire(dlg, ch);
   }));
 
-  view.querySelectorAll('[data-test]').forEach((b) => (b.onclick = async () => {
-    b.disabled = true; b.textContent = '测试中…';
-    try {
-      await api('/channels/' + b.dataset.test + '/test', { method: 'POST' });
-      toast('测试通过', 'ok');
-    } catch (e) { toast(e.message, 'err'); }
-    pageChannels(view);
+  // 行内「测试」→ 弹窗选模型；双击选项 = 直接确认。
+  view.querySelectorAll('[data-test]').forEach((b) => (b.onclick = () => {
+    const ch = rows.find((r) => r.id === Number(b.dataset.test));
+    if (!ch) return;
+    const models = [...new Set((ch.models || '').split(/[,\n]/).map((s) => s.trim()).filter(Boolean))];
+    if (!models.length) return toast('渠道未配置模型', 'err');
+    dialog(`测试渠道 #${ch.id} ${ch.name}`, `
+      <label style="margin-top:0">模型（共 ${models.length} 个）</label>
+      ${models.length > 8 ? '<input id="testFilter" placeholder="按模型名过滤…" style="margin-bottom:8px">' : ''}
+      <select id="testModel" size="${Math.min(10, Math.max(2, models.length))}" style="width:100%">
+        ${models.map((m, idx) => `<option value="${esc(m)}"${idx === 0 ? ' selected' : ''}>${esc(m)}</option>`).join('')}
+      </select>`,
+      async (dlg) => {
+        const model = dlg.querySelector('#testModel').value;
+        if (!model) throw new Error('请先选择一个模型');
+        b.disabled = true; b.textContent = '测试中…';
+        try {
+          await api('/channels/' + ch.id + '/test', { method: 'POST', body: { model } });
+          toast(`测试通过（${model}）`, 'ok');
+        } finally {
+          b.disabled = false; b.textContent = '测试';
+        }
+        pageChannels(view);
+      }, '测试');
+    const sel = document.getElementById('testModel');
+    const flt = document.getElementById('testFilter');
+    if (flt) flt.oninput = () => {
+      const s = flt.value.trim().toLowerCase();
+      [...sel.options].forEach((o) => { o.hidden = !!s && !o.value.toLowerCase().includes(s); });
+    };
+    sel.ondblclick = (e) => {
+      if (e.target.tagName === 'OPTION') sel.closest('dialog').querySelector('[data-ok]').click();
+    };
   }));
 
   view.querySelectorAll('[data-del]').forEach((b) => (b.onclick = async () => {
@@ -476,12 +589,20 @@ async function loadPricing(view) {
   const dp = p.default_price || {};
   const aliases = p.alias_prefixes || [];
 
+  // v2：价格对象的每个字段都可以是数字常量或费率表达式字符串，空 = 不设置该字段。
+  const FIELDS = [
+    ['in', '输入', '输入 $/1M'],
+    ['out', '输出', '输出 $/1M'],
+    ['cached_in', '缓存读', '缓存命中（读）$/1M'],
+    ['cache_write_5m', '缓存写5m', '缓存写入 5m $/1M'],
+    ['cache_write_1h', '缓存写1h', '缓存写入 1h $/1M'],
+  ];
+
   function mkRow(name, spec, isNew) {
     const s = spec || {};
-    if (Object.prototype.hasOwnProperty.call(s, 'expr')) {
-      return { name, isNew, mode: 'expr', expr: String(s.expr ?? '').trim(), in: '', out: '', cached_in: '', err: '' };
-    }
-    return { name, isNew, mode: 'fixed', expr: '', in: s.in ?? '', out: s.out ?? '', cached_in: s.cached_in ?? '', err: '' };
+    const r = { name, isNew, err: '' };
+    for (const [f] of FIELDS) r[f] = s[f] ?? '';
+    return r;
   }
 
   // 本地可编辑状态：合并 built_in ∪ global_overrides；所有编辑先落在 rows，点「保存全部」才提交。
@@ -490,20 +611,26 @@ async function loadPricing(view) {
     .map((name) => mkRow(name, loadedOverrides[name] ?? builtIn[name], false));
   const filter = { q: '', coveredOnly: false };
 
+  // 纯数字串转数字，其余按费率表达式原样保留；空 = 不设置。
+  function fieldValue(v) {
+    const t = String(v ?? '').trim();
+    if (t === '') return undefined;
+    return /^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t) ? Number(t) : t;
+  }
+
   // 行当前表示的 PriceSpec。
   function specOf(r) {
-    if (r.mode === 'expr') return { expr: (r.expr || '').trim() };
-    const spec = { in: r.in === '' ? null : Number(r.in), out: r.out === '' ? null : Number(r.out) };
-    if (r.cached_in !== '') spec.cached_in = Number(r.cached_in);
+    const spec = {};
+    for (const [f] of FIELDS) {
+      const v = fieldValue(r[f]);
+      if (v !== undefined) spec[f] = v;
+    }
     return spec;
   }
 
   function sameSpec(a, b) {
     if (!a || !b) return false;
-    const ea = typeof a.expr === 'string', eb = typeof b.expr === 'string';
-    if (ea || eb) return ea && eb && a.expr.trim() === b.expr.trim();
-    const n = (x) => (x === undefined || x === null || x === '' ? null : Number(x));
-    return n(a.in) === n(b.in) && n(a.out) === n(b.out) && n(a.cached_in) === n(b.cached_in);
+    return FIELDS.every(([f]) => fieldValue(a[f]) === fieldValue(b[f]));
   }
 
   // 会作为覆盖提交的行：不在内置表，或当前值 ≠ 内置值（「恢复默认」即清除覆盖）。
@@ -528,28 +655,38 @@ async function loadPricing(view) {
       <div class="row">
         <div><label style="margin:0 0 4px">输入 $/1M</label><input id="dpIn" type="number" step="any" min="0" value="${esc(dp.in ?? '')}" style="width:140px"></div>
         <div><label style="margin:0 0 4px">输出 $/1M</label><input id="dpOut" type="number" step="any" min="0" value="${esc(dp.out ?? '')}" style="width:140px"></div>
+        <div style="align-self:flex-end"><button type="button" id="dpClear">清除兜底价（启用严格计费）</button></div>
       </div>
-      <p class="muted" style="margin:8px 0 0">请求的模型在内置表和覆盖里都找不到时按此价计费（仅支持固定价），随「保存全部」一起提交。</p>
+      <p class="muted" style="margin:8px 0 0">未知模型的兜底价（只支持常量）。<b>留空/清除 = 严格计费</b>：查不到价的模型直接拒绝（503 model_price_not_configured）；设置了 = 按此价记账。</p>
     </div>
 
-    <div class="card"><h2>表达式计费</h2>
-      <p class="muted">价格可写成表达式代替固定单价。表达式的<b>结果单位是微美元</b>，系数即美元/百万 tokens：<code>p * 2.5</code> 表示每百万输入 tokens 收 $2.50。</p>
+    <div class="card"><h2>费率表达式（v2）</h2>
+      <p class="muted">价格对象的每个字段（in / out / cached_in / cache_write_5m / cache_write_1h）都可以是<b>数字常量</b>或<b>费率表达式</b>字符串；单位都是美元/百万 tokens，每次请求逐字段求值。</p>
       <h2 style="margin-top:14px;font-size:13px">变量</h2>
-      ${table(['变量', '含义'], [['p', '输入 tokens'], ['c', '输出 tokens'], ['cr', '缓存命中 tokens'], ['len', '输入总长']],
-        ([k, v]) => `<tr><td class="mono">${k}</td><td>${v}</td></tr>`)}
-      <h2 style="margin-top:14px;font-size:13px">函数</h2>
+      ${table(['变量', '含义'], [
+        ['context', '本次请求的上下文长度（tokens）'],
+        ['len', '输入长度'],
+        ['n', '请求的 n 参数（候选数）'],
+      ], ([k, v]) => `<tr><td class="mono">${k}</td><td>${v}</td></tr>`)}
+      <h2 style="margin-top:14px;font-size:13px">探针函数</h2>
       ${table(['函数', '说明'], [
-        ['min max abs ceil floor', '常规数学函数'],
-        ['fixed(美元)', '按次收费，如 fixed(0.01) 表示每次请求固定收 $0.01'],
-        ['tier("档名", 值)', '把命中的档位记进日志，便于审计，不影响金额'],
-        ['hour("Asia/Shanghai") / weekday / day / month', '当前时间的时 / 星期 / 日 / 月；时区参数可省，默认 UTC'],
+        ['param("名")', '读请求 body 里的参数值'],
+        ['header("名")', '读请求头的值'],
+        ['has("名")', '判断某个参数是否存在'],
       ], ([k, v]) => `<tr><td class="mono">${esc(k)}</td><td>${esc(v)}</td></tr>`)}
-      <h2 style="margin-top:14px;font-size:13px">运算符</h2>
-      <p class="mono" style="margin:4px 0 0">+ - * / %&nbsp;&nbsp;·&nbsp;&nbsp;比较 &gt; &gt;= &lt; &lt;= == !=&nbsp;&nbsp;·&nbsp;&nbsp;逻辑 &amp;&amp; || !&nbsp;&nbsp;·&nbsp;&nbsp;三目 ? :&nbsp;&nbsp;·&nbsp;&nbsp;括号</p>
+      <h2 style="margin-top:14px;font-size:13px">时间与数值函数</h2>
+      ${table(['函数', '说明'], [
+        ['hour("Asia/Shanghai") / minute / weekday / day / month', '当前时间的时 / 分 / 星期 / 日 / 月；时区参数可省，默认 UTC'],
+        ['min max abs ceil floor', '常规数学函数'],
+        ['tier("档名", 值)', '记录命中的档位，便于审计，不影响金额'],
+      ], ([k, v]) => `<tr><td class="mono">${esc(k)}</td><td>${esc(v)}</td></tr>`)}
+      <h2 style="margin-top:14px;font-size:13px">数值与运算符</h2>
+      <p class="mono" style="margin:4px 0 0">k / m 后缀（如 272k、1m）&nbsp;&nbsp;·&nbsp;&nbsp;+ - * / %&nbsp;&nbsp;·&nbsp;&nbsp;比较 &gt; &gt;= &lt; &lt;= == !=&nbsp;&nbsp;·&nbsp;&nbsp;三目 ? :&nbsp;&nbsp;·&nbsp;&nbsp;&amp;&amp; || 短路</p>
       <h2 style="margin-top:14px;font-size:13px">示例</h2>
-      <p class="mono" style="margin:4px 0">基础按量：${esc('p * 3 + c * 15 + cr * 0.3')}</p>
-      <p class="mono" style="margin:4px 0">按次收费：${esc('tier("request", fixed(0.01))')}</p>
-      <p class="mono" style="margin:4px 0">分时定价：${esc('hour("Asia/Shanghai") >= 22 || hour("Asia/Shanghai") < 6 ? p * 1 : p * 2')}</p>
+      <p class="muted" style="margin:6px 0 2px">GPT-6 长上下文：上下文超 272k 时输入单价翻倍</p>
+      <p class="mono" style="margin:0 0 8px">"in": ${esc('"4*(context>272k?2:1)"')}</p>
+      <p class="muted" style="margin:0 0 2px">DeepSeek 谷时：北京时间 1-5 点输入单价打五折</p>
+      <p class="mono" style="margin:0">"in": ${esc('"0.3*(hour(\'Asia/Shanghai\')>=1&&hour(\'Asia/Shanghai\')<5?0.5:1)"')}</p>
     </div>
 
     <div class="row" style="position:sticky;bottom:0;background:var(--bg);padding:10px 0;z-index:5">
@@ -569,21 +706,14 @@ async function loadPricing(view) {
     const nameCell = r.isNew
       ? `<input data-field="name" class="mono" value="${esc(r.name)}" placeholder="新模型名">`
       : `<span class="mono">${esc(r.name)}</span>`;
-    const priceCell = r.mode === 'expr'
-      ? `<input data-field="expr" class="mono" style="width:100%" value="${esc(r.expr)}" placeholder="p * 3 + c * 15 + cr * 0.3">${r.err ? `<div style="color:var(--err);font-size:12px;margin-top:4px">${esc(r.err)}</div>` : ''}`
-      : `<div class="row" style="flex-wrap:nowrap;gap:6px">
-          <input type="number" step="any" min="0" data-field="in" value="${esc(r.in)}" placeholder="输入" title="输入 $/1M" style="width:100px">
-          <input type="number" step="any" min="0" data-field="out" value="${esc(r.out)}" placeholder="输出" title="输出 $/1M" style="width:100px">
-          <input type="number" step="any" min="0" data-field="cached_in" value="${esc(r.cached_in)}" placeholder="缓存·可空" title="缓存命中 $/1M，留空 = 无" style="width:110px">
-        </div>${r.err ? `<div style="color:var(--err);font-size:12px;margin-top:4px">${esc(r.err)}</div>` : ''}`;
+    const priceCell = `<div class="row" style="flex-wrap:nowrap;gap:6px">
+        ${FIELDS.map(([f, ph, tip]) => `<input type="text" class="mono" data-field="${f}" value="${esc(r[f])}" placeholder="${ph}" title="${tip}；数字或费率表达式，留空 = 不设置" style="width:112px">`).join('')}
+      </div>${r.err ? `<div style="color:var(--err);font-size:12px;margin-top:4px">${esc(r.err)}</div>` : ''}`;
     const act = builtIn[r.name]
       ? (overriding ? `<button data-act="restore" data-idx="${i}">恢复默认</button>` : '<span class="muted">—</span>')
       : `<button class="danger" data-act="delrow" data-idx="${i}">删除行</button>`;
     return `<tr data-idx="${i}">
       <td>${dot}${nameCell}</td>
-      <td><select data-field="mode" style="width:auto">
-        <option value="fixed"${r.mode === 'fixed' ? ' selected' : ''}>固定</option>
-        <option value="expr"${r.mode === 'expr' ? ' selected' : ''}>表达式</option></select></td>
       <td>${priceCell}</td>
       <td>${tag}</td>
       <td style="white-space:nowrap">${act}</td></tr>`;
@@ -594,8 +724,8 @@ async function loadPricing(view) {
     const shown = rows.map((r, i) => ({ r, i }))
       .filter(({ r }) => (!filter.coveredOnly || r.isNew || isOverriding(r)) && (!q || r.name.toLowerCase().includes(q)));
     tbl.innerHTML = `<div class="scroll"><table><thead><tr>
-        <th>模型</th><th style="width:96px">类型</th><th style="min-width:360px">价格</th><th style="width:86px">状态</th><th style="width:110px">操作</th></tr></thead>
-      <tbody>${shown.length ? shown.map(({ r, i }) => rowHtml(r, i)).join('') : '<tr><td colspan="5" class="muted">无匹配行</td></tr>'}</tbody></table></div>`;
+        <th>模型</th><th style="min-width:620px">价格（数字或费率表达式，留空 = 不设置）</th><th style="width:86px">状态</th><th style="width:110px">操作</th></tr></thead>
+      <tbody>${shown.length ? shown.map(({ r, i }) => rowHtml(r, i)).join('') : '<tr><td colspan="4" class="muted">无匹配行</td></tr>'}</tbody></table></div>`;
     saveHint.textContent = `共 ${rows.length} 个模型，${rows.filter(rowDirty).length} 行未保存`;
   };
 
@@ -612,7 +742,7 @@ async function loadPricing(view) {
 
   tbl.addEventListener('input', (e) => {
     const field = e.target.dataset.field;
-    if (!field || field === 'mode') return;
+    if (!field) return;
     const tr = e.target.closest('tr');
     const r = rows[Number(tr?.dataset.idx)];
     if (!r) return;
@@ -620,15 +750,6 @@ async function loadPricing(view) {
     r.err = '';
     refreshDot(tr, r);
     saveHint.textContent = `共 ${rows.length} 个模型，${rows.filter(rowDirty).length} 行未保存`;
-  });
-
-  tbl.addEventListener('change', (e) => {
-    if (e.target.dataset.field !== 'mode') return;
-    const r = rows[Number(e.target.closest('tr').dataset.idx)];
-    if (!r) return;
-    r.mode = e.target.value;
-    r.err = '';
-    renderRows();
   });
 
   tbl.addEventListener('click', (e) => {
@@ -648,6 +769,12 @@ async function loadPricing(view) {
   document.getElementById('q').oninput = (e) => { filter.q = e.target.value; renderRows(); };
   document.getElementById('coveredOnly').onchange = (e) => { filter.coveredOnly = e.target.checked; renderRows(); };
 
+  document.getElementById('dpClear').onclick = () => {
+    document.getElementById('dpIn').value = '';
+    document.getElementById('dpOut').value = '';
+    toast('已清除兜底价，点「保存全部」后生效（严格计费）', 'ok');
+  };
+
   document.getElementById('saveAll').onclick = async () => {
     const overrides = {};
     const errs = [];
@@ -658,37 +785,157 @@ async function loadPricing(view) {
       if (seen.has(name)) { r.err = '模型名重复'; errs.push(r); continue; }
       seen.add(name);
       const spec = specOf(r);
-      if (r.mode === 'expr') {
-        if (!spec.expr) { r.err = '表达式不能为空'; errs.push(r); continue; }
-      } else {
-        const bad = spec.in === null || spec.out === null || !Number.isFinite(spec.in) || !Number.isFinite(spec.out)
-          || spec.in < 0 || spec.out < 0
-          || (spec.cached_in !== undefined && (!Number.isFinite(spec.cached_in) || spec.cached_in < 0));
-        if (bad) { r.err = '输入/输出价必填且 ≥ 0'; errs.push(r); continue; }
-      }
       r.err = '';
       // 整包替换语义：与内置值相同的行不进 overrides（含「恢复默认」=清除覆盖）。
+      // 字段级校验交给后端：纯数字串自动转数字，表达式会编译+冒烟，400 message 原样 toast。
       if (!builtIn[name] || !sameSpec(spec, builtIn[name])) overrides[name] = spec;
     }
     const dpIn = document.getElementById('dpIn').value.trim();
     const dpOut = document.getElementById('dpOut').value.trim();
-    if (errs.length || dpIn === '' || dpOut === '' || !Number.isFinite(Number(dpIn)) || !Number.isFinite(Number(dpOut))) {
+    let default_price = null; // 都留空 = 严格计费
+    if (dpIn !== '' || dpOut !== '') {
+      const a = Number(dpIn), b = Number(dpOut);
+      if (dpIn === '' || dpOut === '' || !Number.isFinite(a) || !Number.isFinite(b) || a < 0 || b < 0) {
+        renderRows();
+        toast('兜底价需同时填输入/输出两个非负数字，或都留空（严格计费）', 'err');
+        return;
+      }
+      default_price = { in: a, out: b };
+    }
+    if (errs.length) {
       renderRows();
-      toast(errs.length ? '有未填完整的行，见表格内红色提示' : '默认兜底价的输入/输出为必填数字', 'err');
+      toast('有未填完整的行，见表格内红色提示', 'err');
       return;
     }
     try {
-      // 400 时后端 message 会原样出现在 toast 里（含模型名与原因）。
-      await api('/pricing/overrides', {
-        method: 'PUT',
-        body: { overrides, default_price: { in: Number(dpIn), out: Number(dpOut) } },
-      });
+      // 400 时后端 message 会原样出现在 toast 里（含字段名与原因）。
+      await api('/pricing/overrides', { method: 'PUT', body: { overrides, default_price } });
       toast('价格已保存', 'ok');
       loadPricing(view); // 保存成功后重新拉取，刷新表格与状态 tag
     } catch (e) { toast(e.message, 'err'); }
   };
 
+  if (pendingPricingQuery) {
+    filter.q = pendingPricingQuery;
+    pendingPricingQuery = '';
+  }
+  document.getElementById('q').value = filter.q;
   renderRows();
+}
+
+// ---------------------------------------------------------------- 模型计费
+
+const BILLING_SRC = { table: '内置', alias: '别名', mapping: '映射', override: '全局', key: 'Key', default: '兜底' };
+let billingFilter = { q: '', unconfOnly: false };
+
+async function pageModelBilling(view) {
+  await loadModelBilling(view);
+}
+
+async function loadModelBilling(view) {
+  const d = await api('/model-billing');
+  const totals = d.totals || {};
+  const unconf = totals.unconfigured || 0;
+  const models = d.models || [];
+  const fb = d.fallback_price;
+  const fmtCost = (n) => '$' + Number(n || 0).toFixed(4);
+  const fmtNum = (n) => (n === null || n === undefined ? '—' : Number(n).toLocaleString('en-US'));
+  // 字段值：数字直接显示；费率表达式字符串用 mono 截断显示（title 全文）。
+  const pcell = (spec, f) => {
+    const v = spec?.[f];
+    if (v === undefined || v === null) return '—';
+    if (typeof v === 'number') return '$' + v;
+    return `<code class="mono" title="${esc(String(v))}" style="display:inline-block;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom">${esc(String(v))}</code>`;
+  };
+  const statusTag = (m) => !m.configured ? '<span class="tag err">未配置</span>'
+    : m.partially_configured ? '<span class="tag warn">部分配置</span>' : '<span class="tag ok">已配置</span>';
+  const hasUnconf = models.some((m) => m.configured === false);
+
+  const showDetail = (m) => {
+    if (!m) return;
+    const dlg = dialog(`模型计费详情：${m.model}`, `
+      ${m.price_varies ? '<p style="color:var(--warn);margin:0 0 8px">⚠ 各渠道价格不一致</p>' : ''}
+      ${table(['渠道', '类型', '启用', '声明', '上游模型', '有价', '来源', '计费名', '7天用量'], m.channels || [], (c) => `<tr>
+        <td>${esc(c.name)}</td><td class="mono">${esc(c.type)}</td>
+        <td>${c.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag err">禁用</span>'}</td>
+        <td>${c.declared ? '是' : '—'}</td>
+        <td class="mono" style="max-width:160px;overflow:hidden;text-overflow:ellipsis">${esc(c.upstream_model || '—')}</td>
+        <td>${c.configured ? '是' : '否'}</td>
+        <td>${BILLING_SRC[c.source] || esc(c.source || '—')}</td>
+        <td>${c.via === 'upstream' ? '上游名' : '请求名'}${c.billing_model ? ` <span class="mono">${esc(c.billing_model)}</span>` : ''}</td>
+        <td>${fmtNum(c.usage?.requests)} 次 · ${fmtCost(c.usage?.cost_usd)}</td></tr>`)}
+      <h2 style="margin:12px 0 6px;font-size:13px">近 7 天用量</h2>
+      <div class="stats">
+        <div class="stat"><div class="k">请求</div><div class="v">${fmtNum(m.usage?.requests)}</div></div>
+        <div class="stat"><div class="k">输入 tokens</div><div class="v">${fmtNum(m.usage?.prompt_tokens)}</div></div>
+        <div class="stat"><div class="k">输出 tokens</div><div class="v">${fmtNum(m.usage?.completion_tokens)}</div></div>
+        <div class="stat"><div class="k">缓存命中率</div><div class="v">${m.usage?.cache_hit_rate == null ? '未知' : pct(m.usage.cache_hit_rate)}</div></div>
+        <div class="stat"><div class="k">缓存命中 tokens</div><div class="v">${m.usage?.cached_tokens == null ? '未知' : fmtNum(m.usage.cached_tokens)}</div></div>
+        <div class="stat"><div class="k">消费</div><div class="v">${fmtCost(m.usage?.cost_usd)}</div></div>
+      </div>
+      <p class="muted" style="margin:10px 0 0">计费版本 <span class="mono">${esc(m.pricing_version || '—')}</span> · 最近计费 ${m.last_priced_at ? esc(String(m.last_priced_at)) : '—'}${m.logged_billing_model ? ` · 记账模型 <span class="mono">${esc(m.logged_billing_model)}</span>` : ''}</p>
+      <div style="margin-top:12px"><button class="primary" id="gotoPrice">修改价格</button></div>`,
+      async () => {}, '关闭');
+    dlg.querySelector('#gotoPrice').onclick = () => {
+      dlg.close(); dlg.remove();
+      location.hash = '#pricing?q=' + encodeURIComponent(m.model);
+      toast(`已切到价格页并按「${m.model}」过滤，点对应行直接改价`, 'ok');
+    };
+  };
+
+  view.replaceChildren($(`<div>
+    <div class="stats" style="margin-bottom:16px">
+      <div class="stat"><div class="k">模型数</div><div class="v">${totals.models ?? 0}</div></div>
+      <div class="stat"><div class="k">未配置价格</div><div class="v"${unconf > 0 ? ' style="color:var(--err)"' : ''}>${unconf}</div></div>
+      <div class="stat"><div class="k">近 7 天请求</div><div class="v">${fmtNum(totals.requests)}</div></div>
+      <div class="stat"><div class="k">近 7 天消费</div><div class="v">${fmtCost(totals.cost_usd)}</div></div>
+    </div>
+
+    ${unconf > 0 ? `<div class="card" style="border-color:var(--err)">
+      <h2 style="color:var(--err)">有 ${unconf} 个模型没有配置价格</h2>
+      <p class="muted" style="margin:0 0 6px">${d.strict_billing
+        ? '严格计费已启用，没有默认价：这些模型的请求会被拒绝，用户会收到「未配置价格」(model_price_not_configured) 的错误。'
+        : `当前按兜底价 $${esc(fb?.in ?? '?')}/$${esc(fb?.out ?? '?')} 记账：这些模型先按兜底价出账，补价后自动按新价。`}</p>
+      <p class="muted" style="margin:0">处理：点「修改价格」在价格页为它配全局覆盖（数字或费率表达式），或在渠道的模型重定向里指向有价格的上游模型。</p>
+    </div>` : ''}
+
+    <div class="card">
+      <div class="row" style="margin-bottom:12px">
+        <h2 style="margin:0;flex:1">模型计费（近 ${d.window_days ?? 7} 天）</h2>
+        <input id="bq" placeholder="按模型名过滤…" style="width:200px">
+        ${hasUnconf ? `<label style="margin:0"><input type="checkbox" id="bunconf" style="width:auto"${billingFilter.unconfOnly ? ' checked' : ''}> 只看未配置</label>` : ''}
+        <button id="brefresh">刷新</button>
+      </div>
+      <div id="btbl"></div>
+      <p class="muted" style="margin:10px 0 0">计费版本 <span class="mono">${esc(d.current_pricing_version || '—')}</span> · 排序：未配置在前、花费降序${d.billing_meta_available ? '' : ' · <b>部分模型缺少计费元数据</b>'}。</p>
+    </div>
+  </div>`));
+
+  const tbl = document.getElementById('btbl');
+  const renderTable = () => {
+    const q = billingFilter.q.trim().toLowerCase();
+    const shown = models.filter((m) => (!billingFilter.unconfOnly || m.configured === false) && (!q || m.model.toLowerCase().includes(q)));
+    tbl.innerHTML = table(['模型', '状态', '输入 $/1M', '缓存读', '缓存写5m/1h', '特殊规则', '7天请求', '7天消费', '来源', '操作'], shown, (m) => `<tr>
+      <td class="mono">${esc(m.model)}</td>
+      <td>${statusTag(m)}</td>
+      <td>${pcell(m.price, 'in')}</td>
+      <td>${pcell(m.price, 'cached_in')}</td>
+      <td>${pcell(m.price, 'cache_write_5m')} / ${pcell(m.price, 'cache_write_1h')}</td>
+      <td class="muted" style="max-width:240px">${m.rules?.length ? esc(m.rules.join('、')) : '—'}</td>
+      <td>${fmtNum(m.usage?.requests)}</td>
+      <td>${fmtCost(m.usage?.cost_usd)}</td>
+      <td class="muted">${(m.sources || []).map((s) => BILLING_SRC[s] || s).join('、') || '—'}</td>
+      <td><button data-bd="${esc(m.model)}">详情</button></td></tr>`);
+    tbl.querySelectorAll('[data-bd]').forEach((b) => (b.onclick = () => showDetail(models.find((m) => m.model === b.dataset.bd))));
+  };
+
+  const qInput = document.getElementById('bq');
+  qInput.value = billingFilter.q;
+  qInput.oninput = (e) => { billingFilter.q = e.target.value; renderTable(); };
+  const unconfBox = document.getElementById('bunconf');
+  if (unconfBox) unconfBox.onchange = (e) => { billingFilter.unconfOnly = e.target.checked; renderTable(); };
+  document.getElementById('brefresh').onclick = () => loadModelBilling(view);
+  renderTable();
 }
 
 // ---------------------------------------------------------------- 健康
@@ -715,16 +962,19 @@ async function pageHealth(view) {
 }
 
 async function loadHealth(view) {
-  const [ch, md, events] = await Promise.all([
+  const [ch, md, events, billing] = await Promise.all([
     api('/health/channels?window=60m'),
     api('/health/models?window=24h'),
     api('/health/events?limit=50'),
+    api('/model-billing').catch(() => null), // 计费横幅：失败静默
   ]);
+  const bun = billing?.totals?.unconfigured || 0;
 
   const worst = ['down', 'degraded', 'ok', 'unknown'].find((s) => ch.channels.some((x) => x.state === s)) || 'unknown';
   const gaps = md.missing || [];
 
   view.replaceChildren($(`<div>
+    ${bun > 0 ? `<div class="card" style="border-color:var(--err);margin-bottom:16px;padding:10px 16px"><span style="color:var(--err)">${bun} 个模型未配置价格</span> · <a href="#billing">去处理</a></div>` : ''}
     <div class="stats" style="margin-bottom:16px">
       <div class="stat"><div class="k">整体</div><div class="v">${HEALTH_STATE[worst]?.[0] || worst}</div></div>
       <div class="stat"><div class="k">近 1 小时请求</div><div class="v">${ch.channels.reduce((n, x) => n + x.requests, 0)}</div></div>

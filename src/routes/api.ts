@@ -6,12 +6,14 @@ import {
 import { randomKey } from '../lib/crypto';
 import { requireAdmin, invalidateTokenCache, ensureOwner } from '../lib/auth';
 import { getOptions, setOptions, DEFAULT_OPTIONS } from '../lib/options';
-import { rebuildAbilities, deleteAbilities, listModels, csv } from '../lib/channel';
+import { rebuildAbilities, deleteAbilities, listModels, csv, parseConfig } from '../lib/channel';
+import { listUpstreamModels } from '../lib/upstream-models';
+import { loadModelBilling } from '../lib/model-billing';
 import { reconcile, applyCredit } from '../lib/ledger';
 import { getHeartbeat, runWatchdog } from '../lib/watchdog';
 import { listCooling, deriveState, percentiles, engineOf } from '../lib/health';
 import { getAdaptor, ADAPTORS, OPENAI_COMPATIBLE_PRESETS } from '../relay';
-import { PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, QUOTA_PER_USD, quotaToUSD, validatePriceSpec, isExprSpec, type Price, type PriceSpec } from '../lib/pricing';
+import { PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, QUOTA_PER_USD, quotaToUSD, validatePriceSpec, type Price, type PriceSpec } from '../lib/pricing';
 import { runCli } from '../lib/cli';
 import type { AdaptorContext } from '../relay/adaptor';
 
@@ -350,17 +352,25 @@ api.put('/pricing/overrides', requireAdmin, async (c) => {
   }
 
   const patch: Record<string, unknown> = { ModelPriceOverride: out };
-  let defaultPrice: Price | undefined;
+  let defaultPrice: Price | null | undefined;
   if (body.default_price !== undefined) {
-    if (body.default_price === null || typeof body.default_price !== 'object' || Array.isArray(body.default_price)
-      || typeof (body.default_price as any).expr === 'string') {
-      return c.json(fail('default_price 只支持固定价 {"in":..,"out":..,"cached_in"?:..}，不支持表达式'), 400);
+    // **null = 清除兜底价 = 启用严格计费**（未定价模型 503 拒绝）。兜底价本身必须
+    // 全常量：清不清是静态事实，表达式兜底会让"是否兜底"变成运行期才可知。
+    if (body.default_price === null) {
+      defaultPrice = null;
+      patch.DefaultPrice = null;
+    } else {
+      if (typeof body.default_price !== 'object' || Array.isArray(body.default_price)) {
+        return c.json(fail('default_price 只支持常量 {"in":..,"out":..,"cached_in"?:..} 或 null（启用严格计费）'), 400);
+      }
+      const v = validatePriceSpec(body.default_price);
+      if (!v.ok) return c.json(fail(`default_price 有误：${v.error}`), 400);
+      if (Object.values(v.spec).some((x) => typeof x !== 'number')) {
+        return c.json(fail('default_price 只支持常量（费率表达式只用于模型级价格配置）'), 400);
+      }
+      defaultPrice = v.spec;
+      patch.DefaultPrice = defaultPrice;
     }
-    const v = validatePriceSpec(body.default_price);
-    if (!v.ok) return c.json(fail(`default_price 有误：${v.error}`), 400);
-    if (isExprSpec(v.spec)) return c.json(fail('default_price 只支持固定价'), 400);
-    defaultPrice = v.spec;
-    patch.DefaultPrice = defaultPrice;
   }
 
   await setOptions(c.env, patch);
@@ -481,14 +491,32 @@ api.delete('/channels/:id', requireAdmin, async (c) => {
   return c.json(ok(null, '已删除'));
 });
 
+/**
+ * 渠道测试用哪个模型。传了就必须是该渠道 models 里的一个——测试接口直连上游、
+ * 带着渠道 key，不能让它变成「拿这把 key 调任意模型」的后门。没传时回退第一个，
+ * 只为兼容旧调用；后台 UI 总是显式传。
+ */
+export function resolveTestModel(channel: Pick<ChannelRow, 'models'>, requested: unknown): { model: string } | { error: string } {
+  const models = csv(channel.models);
+  if (!models.length) return { error: '渠道未配置模型' };
+  if (requested !== undefined && requested !== null && typeof requested !== 'string') return { error: 'model 必须是字符串' };
+  const want = (requested ?? '').trim();
+  if (!want) return { model: models[0] };
+  if (!models.includes(want)) return { error: `模型 ${want} 不属于该渠道` };
+  return { model: want };
+}
+
 /** Sends a 1-token chat completion straight at the channel to check credentials. */
 api.post('/channels/:id/test', requireAdmin, async (c) => {
   const id = Number(c.req.param('id'));
   const channel = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
   if (!channel) return c.json(fail('渠道不存在'), 404);
 
-  const model = c.req.query('model') || csv(channel.models)[0];
-  if (!model) return c.json(fail('渠道未配置模型'), 400);
+  // model 支持 JSON body {model}（SPA 走法）与 ?model=（旧调用方兼容）。
+  const bodyModel = await c.req.json<{ model?: unknown }>().then((b) => b?.model).catch(() => undefined);
+  const picked = resolveTestModel(channel, bodyModel ?? c.req.query('model'));
+  if ('error' in picked) return c.json(fail(picked.error), 400);
+  const model = picked.model;
 
   const adaptor = getAdaptor(channel.type);
   const ctx: AdaptorContext = {
@@ -513,6 +541,70 @@ api.post('/channels/:id/test', requireAdmin, async (c) => {
     return c.json(fail(`测试失败: ${e?.message ?? e}`), 200);
   }
 });
+
+/**
+ * 用渠道的 key 请求上游 /models 拉取模型列表（渠道表单的「从上游拉取」按钮）。
+ *
+ * 凭据二选一：
+ *   - {channel_id}           编辑已有渠道：用库存 key，key 绝不回传前端；
+ *   - {type, base_url, key}  新增渠道：内联凭据，只在本次请求内存里用一次，不落库。
+ * 上游错误净化后返回 502 + 截断文本（完整报文可能回显 key，绝不能透传）。
+ */
+api.post('/channels/fetch-models', requireAdmin, async (c) => {
+  const body = await c.req.json<any>().catch(() => null);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json(fail('body 必须是 JSON 对象'), 400);
+
+  let type = '';
+  let baseUrl = '';
+  let key = '';
+  let config: Record<string, unknown> | undefined;
+  if (body.channel_id !== undefined && body.channel_id !== null && body.channel_id !== '') {
+    const id = Number(body.channel_id);
+    if (!Number.isInteger(id) || id <= 0) return c.json(fail('channel_id 必须是正整数'), 400);
+    const channel = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
+    if (!channel) return c.json(fail('渠道不存在'), 404);
+    type = channel.type;
+    baseUrl = channel.base_url ?? '';
+    key = channel.key;
+    config = parseConfig(channel);
+  } else {
+    type = String(body.type ?? '').trim();
+    baseUrl = String(body.base_url ?? '').trim();
+    key = String(body.key ?? '');
+    if (body.config !== undefined && body.config !== null && body.config !== '') {
+      if (typeof body.config === 'string') {
+        try {
+          config = JSON.parse(body.config);
+        } catch {
+          return c.json(fail('config 不是合法 JSON'), 400);
+        }
+      } else if (typeof body.config === 'object' && !Array.isArray(body.config)) {
+        config = body.config;
+      } else {
+        return c.json(fail('config 必须是对象或 JSON 字符串'), 400);
+      }
+    }
+  }
+  if (!['openai', 'openai-responses', 'anthropic', 'gemini', 'azure'].includes(type)) {
+    return c.json(fail(`不支持的渠道类型：${type || '(空)'}`), 400);
+  }
+  if (!key) return c.json(fail('缺少 key（新增渠道请先填 Key；编辑已有渠道可留空改用库存 key）'), 400);
+
+  try {
+    const models = await listUpstreamModels({ type, baseUrl, key, config });
+    return c.json(ok({ models }, `拉取到 ${models.length} 个模型`));
+  } catch (e: any) {
+    return c.json(fail(e?.message ?? '拉取失败'), 502);
+  }
+});
+
+// ---------------------------------------------------------------- model-billing（管理令牌）
+
+/**
+ * 「模型计费」页：每个启用渠道的模型（按 model_mapping 展开）怎么收费、近 7 天用量、
+ * 缓存命中、有没有漏配价。一次返回整页数据，见 lib/model-billing.ts。只读。
+ */
+api.get('/model-billing', requireAdmin, async (c) => c.json(ok(await loadModelBilling(c.env.DB, await getOptions(c.env)))));
 
 // ---------------------------------------------------------------- health（管理令牌）
 

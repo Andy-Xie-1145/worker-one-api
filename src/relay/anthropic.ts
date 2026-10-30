@@ -4,6 +4,34 @@ import type { Usage } from '../lib/billing';
 const DEFAULT_VERSION = '2023-06-01';
 const DEFAULT_MAX_TOKENS = 4096;
 
+/**
+ * Anthropic usage → 我们的 OpenAI 式 Usage。
+ *
+ * Anthropic 的 `input_tokens` **不含**缓存部分（cache_read / cache_creation 是独立
+ * 计数器），而我们全链路的 prompt_tokens 语义是 OpenAI 式「含缓存命中」——所以
+ * 这里把三项相加归一化，并把缓存拆成 cached（读）与 cache_write_5m/1h（写）。
+ * 写缓存按 `usage.cache_creation` 的 TTL 分桶（官方 5m=1.25×、1h=2× 输入价）；
+ * 上游只报总数 `cache_creation_input_tokens` 时整体归入 5m 桶——那是 Claude Code
+ * 的历史默认 TTL，1h 写入单独计价时不会误伤。
+ */
+function anthropicUsage(u: any): Usage {
+  const input = Number(u?.input_tokens ?? 0) || 0;
+  const cacheRead = Number(u?.cache_read_input_tokens ?? 0) || 0;
+  const creation = Number(u?.cache_creation_input_tokens ?? 0) || 0;
+  const breakdown = u?.cache_creation;
+  const cw5 = Number(breakdown?.ephemeral_5m_input_tokens ?? (breakdown ? 0 : creation)) || 0;
+  const cw1 = Number(breakdown?.ephemeral_1h_input_tokens ?? 0) || 0;
+  const usage: Usage = {
+    prompt_tokens: input + cacheRead + cw5 + cw1,
+    completion_tokens: Number(u?.output_tokens ?? 0) || 0,
+    ...(cacheRead > 0 ? { cached_tokens: cacheRead } : {}),
+    ...(cw5 > 0 ? { cache_write_5m_tokens: cw5 } : {}),
+    ...(cw1 > 0 ? { cache_write_1h_tokens: cw1 } : {}),
+  };
+  usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+  return usage;
+}
+
 /** Native Anthropic Messages API <-> OpenAI chat-completions. */
 export const anthropicAdaptor: Adaptor = {
   name: 'anthropic',
@@ -47,11 +75,7 @@ export const anthropicAdaptor: Adaptor = {
   },
 
   convertResponse(json: any, ctx: AdaptorContext) {
-    const usage: Usage = {
-      prompt_tokens: json?.usage?.input_tokens ?? 0,
-      completion_tokens: json?.usage?.output_tokens ?? 0,
-    };
-    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+    const usage = anthropicUsage(json?.usage);
 
     let text = '';
     const toolCalls: any[] = [];
@@ -94,7 +118,11 @@ export const anthropicAdaptor: Adaptor = {
 
     switch (type) {
       case 'message_start': {
-        state.promptTokens = json.message?.usage?.input_tokens ?? 0;
+        const usage = anthropicUsage(json.message?.usage);
+        state.promptTokens = usage.prompt_tokens;
+        state.cacheReadTokens = usage.cached_tokens ?? 0;
+        state.cacheWrite5mTokens = usage.cache_write_5m_tokens ?? 0;
+        state.cacheWrite1hTokens = usage.cache_write_1h_tokens ?? 0;
         return { chunks: [{ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] }] };
       }
       case 'content_block_start': {
@@ -143,6 +171,9 @@ export const anthropicAdaptor: Adaptor = {
         const usage: Usage = {
           prompt_tokens: state.promptTokens,
           completion_tokens: json.usage?.output_tokens ?? 0,
+          ...(state.cacheReadTokens ? { cached_tokens: state.cacheReadTokens } : {}),
+          ...(state.cacheWrite5mTokens ? { cache_write_5m_tokens: state.cacheWrite5mTokens } : {}),
+          ...(state.cacheWrite1hTokens ? { cache_write_1h_tokens: state.cacheWrite1hTokens } : {}),
         };
         usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
         return {

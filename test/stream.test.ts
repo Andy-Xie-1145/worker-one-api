@@ -175,12 +175,24 @@ test('pricing: GPT-6 家族与生图模型按官方 standard 档计价', () => {
 
 test('pricing: Claude 5.5 家族按官方价计价', () => {
   // 2026-10 官方：Opus 5.5 $4/$20（缓存 $0.20），Sonnet 5.5 $2/$10（缓存 $0.10）。
-  assert.deepEqual(resolvePrice('claude-opus-5-5').spec, { in: 4, out: 20, cached_in: 0.2 });
-  assert.deepEqual(resolvePrice('claude-sonnet-5-5').spec, { in: 2, out: 10, cached_in: 0.1 });
+  // 缓存写入按官方口径 5m=1.25×in、1h=2×in（platform.claude.com/docs/en/about-claude/pricing）。
+  assert.deepEqual(resolvePrice('claude-opus-5-5').spec, { in: 4, out: 20, cached_in: 0.2, cache_write_5m: 5, cache_write_1h: 8 });
+  assert.deepEqual(resolvePrice('claude-sonnet-5-5').spec, { in: 2, out: 10, cached_in: 0.1, cache_write_5m: 2.5, cache_write_1h: 4 });
   // 前缀不串门：opus-5-5 不得命中 claude-opus-4 / claude-3-opus 的条目。
   assert.equal(resolvePrice('claude-opus-5-5').source, 'builtin');
   // 1M 输入 + 1M 输出的 Opus 5.5 = $24 = 12_000_000 quota。
   assert.equal(calcQuota('claude-opus-5-5', { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }), 12_000_000);
+  // 缓存写入按各自 TTL 分桶计价：1M fresh + 0.5M 写 5m + 0.5M 写 1h + 1M 输出
+  // = 4 + 2.5 + 4 + 20 = $30.50 = 15_250_000 quota。
+  assert.equal(
+    calcQuota('claude-opus-5-5', {
+      prompt_tokens: 2_000_000,
+      completion_tokens: 1_000_000,
+      cache_write_5m_tokens: 500_000,
+      cache_write_1h_tokens: 500_000,
+    }),
+    15_250_000,
+  );
 });
 
 // ---------------------------------------------------------------- DeepSeek

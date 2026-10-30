@@ -124,10 +124,14 @@ test('price set → get → rm 往返；表达式也要过校验', async () => {
   const after = await run(env, 'price rm my-model');
   assert.match(after.output, /没有覆盖/);
 
-  const bad = await run(env, 'price set broken expr="p *');
+  const bad = await run(env, 'price set broken in="context *"');
   assert.ok(!bad.ok);
   assert.match(bad.output, /无法编译/);
-});
+
+  // 旧版整笔 {expr} 明确拒绝并指路 v2
+  const legacy = await run(env, 'price set broken2 expr="p * 3"');
+  assert.ok(!legacy.ok);
+  assert.match(legacy.output, /已移除/);});
 
 test('price default：兜底价可改并生效于未知模型', async () => {
   const env = envOf();
@@ -160,9 +164,12 @@ test('token price 的坏 JSON 被校验拦下', async () => {
   const env = envOf();
   await run(env, 'token new t');
   const id = /^\s*(\d+)\s/m.exec((await run(env, 'token list')).output)![1];
-  const bad = await run(env, `token price ${id} {"m":{"expr":"p *"}}`);
+  const bad = await run(env, `token price ${id} {"m":{"in":"context *"}}`);
   assert.ok(!bad.ok);
   assert.match(bad.output, /无法编译/);
+  const legacy = await run(env, `token price ${id} {"m":{"expr":"p * 3"}}`);
+  assert.ok(!legacy.ok);
+  assert.match(legacy.output, /已移除/);
 });
 
 test('owner add/sub 调整预算并记账', async () => {

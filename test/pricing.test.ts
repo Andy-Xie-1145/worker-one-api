@@ -55,20 +55,23 @@ test('上游模型名兜底：请求名查不到时按 model_mapping 之后的�
 // ---------------------------------------------------------------- Key × 模型 矩阵
 
 test('同一 Key 的不同模型可以各配各价', () => {
-  const key = { 'model-a': { in: 1, out: 2 }, 'model-b': { expr: 'p * 10' } };
+  const key = { 'model-a': { in: 1, out: 2 }, 'model-b': { in: '10 * (context > 272k ? 2 : 1)', out: 0 } };
   assert.deepEqual(resolvePrice('model-a', undefined, undefined, key).spec, { in: 1, out: 2 });
-  assert.deepEqual(resolvePrice('model-b', undefined, undefined, key).spec, { expr: 'p * 10' });
+  assert.deepEqual(resolvePrice('model-b', undefined, undefined, key).spec, { in: '10 * (context > 272k ? 2 : 1)', out: 0 });
   assert.equal(calcQuota('model-a', m(1_000_000, 1_000_000), undefined, undefined, key), 1_500_000);
-  assert.equal(calcQuota('model-b', m(1_000_000, 0), undefined, undefined, key), 5_000_000);
+  // model-b：100K 输入未过档，in=$10/1M → 1M×$10/1000 = $0.01？不——10 × 100_000 / 1_000_000 = $1 → 500_000 quota
+  assert.equal(calcQuota('model-b', m(100_000, 0), undefined, undefined, key), 500_000);
+  // 过档翻倍：300K 输入 in=$20 → $6 → 3_000_000 quota
+  assert.equal(calcQuota('model-b', m(300_000, 0), undefined, undefined, key), 3_000_000);
 });
 
 test('不同 Key 的同一模型可以各配各价——这就是二维价格矩阵', () => {
   const keyA = { 'gpt-4o': { in: 1, out: 1 } };
-  const keyB = { 'gpt-4o': { expr: 'p * 4 + c * 16' } };
+  const keyB = { 'gpt-4o': { in: 4, out: 16 } };
   const usage = m(1_000_000, 500_000);
   // Key A：$1/M in + $1/M out = $1.50
   assert.equal(calcQuota('gpt-4o', usage, undefined, undefined, keyA), 750_000);
-  // Key B：表达式 $4 in + $16 out = $4 + $8 = $12
+  // Key B：$4 in + $16 out = $4 + $8 = $12
   assert.equal(calcQuota('gpt-4o', usage, undefined, undefined, keyB), 6_000_000);
   // 没有 Key 覆盖的 Key C：内置表 $2.5/$10 = $2.5 + $5 = $7.50
   assert.equal(calcQuota('gpt-4o', usage), 3_750_000);
@@ -83,61 +86,97 @@ test('Key 覆盖可以把免费模型改成收费，反之亦然', () => {
   assert.equal(calcQuota('gpt-4o', m(1_000_000, 1_000_000), undefined, undefined, free), 0);
 });
 
-// ---------------------------------------------------------------- 表达式计费端到端
+// ---------------------------------------------------------------- 表达式计费端到端（v2 按字段费率）
 
-test('表达式：缓存命中自动从 p 中排除、由 cr 单独计价', () => {
-  const key = { 'm': { expr: 'p * 3 + c * 15 + cr * 0.3' } };
-  // prompt 1M 全新：p=1M, cr=0 → $3
-  assert.equal(calcQuota('m', m(1_000_000, 0), undefined, undefined, key), 1_500_000);
-  // prompt 1M 中 200K 缓存命中：p=800K, cr=200K → $2.4 + $0.06 = $2.46
-  assert.equal(calcQuota('m', m(1_000_000, 0, 200_000), undefined, undefined, key), 1_230_000);
-  // 表达式没引用 cr 时，缓存留在 p 里按基础价计（宁可高估不会低估）
-  const noCache = { 'm': { expr: 'p * 3' } };
+test('费率表达式：字段表达式按请求求值，token 数由引擎套用', () => {
+  const key = { 'm': { in: '3 * (context > 272k ? 2 : 1)', out: 15 } };
+  // 100K 输入（未过档）＋ 100K 输出：in=3, out=15 → $1.8
+  assert.equal(calcQuota('m', m(100_000, 100_000), undefined, undefined, key), 900_000);
+  // 300K 输入（过档）：in=6 → $1.8 + $1.5 = $3.3
+  assert.equal(calcQuota('m', m(300_000, 100_000), undefined, undefined, key), 1_650_000);
+});
+
+test('cached_in 省略 = 缓存命中按 in 费率计；配置了就单独计', () => {
+  // 无 cached_in：1M prompt 全部命中缓存 → 全按 in=$3 计（宁可高估）
+  const noCache = { 'm': { in: 3, out: 15 } };
   assert.equal(calcQuota('m', m(1_000_000, 0, 999_999), undefined, undefined, noCache), 1_500_000);
+  // 有 cached_in=$0.3：800K fresh + 200K 命中 → $2.4 + $0.06 = $2.46
+  const key = { 'm': { in: 3, out: 15, cached_in: 0.3 } };
+  assert.equal(calcQuota('m', m(1_000_000, 0, 200_000), undefined, undefined, key), 1_230_000);
 });
 
-test('表达式：len 是完整输入长度，阶梯条件请用它', () => {
-  const key = { 'm': { expr: 'len <= 128000 ? fixed(0.002) : fixed(0.004)' } };
-  // len = prompt_tokens（含缓存部分），不受 cr 排除影响
-  assert.equal(calcQuota('m', m(100_000, 0, 90_000), undefined, undefined, key), 1_000);
-  assert.equal(calcQuota('m', m(200_000, 0, 150_000), undefined, undefined, key), 2_000);
+test('费率表达式支持时间函数（谷时半价）', () => {
+  const key = { 'm': { in: `2 * (hour("Asia/Shanghai") >= 1 && hour("Asia/Shanghai") < 5 ? 0.5 : 1)`, out: 4 } };
+  // 北京时间 02:00（UTC 18:00 前一天）→ 谷时 in=1：1M+1M = $5
+  assert.equal(calcQuota('m', m(1_000_000, 1_000_000), undefined, undefined, key, new Date('2026-07-01T18:00:00Z')), 2_500_000);
+  // 北京时间 12:00（UTC 04:00）→ 峰时 in=2：$6
+  assert.equal(calcQuota('m', m(1_000_000, 1_000_000), undefined, undefined, key, new Date('2026-07-01T04:00:00Z')), 3_000_000);
 });
 
-test('表达式：结果按 ceil 换算 quota，负值被钳到 0', () => {
-  assert.equal(calcQuota('m', m(1_500_000, 0), undefined, undefined, { 'm': { expr: 'p * 2' } }), 1_500_000);
-  // ceil((1.5e6 * 2 / 1e6) * 500000) = ceil(1_500_000) —— 3e6 微美元 = $3
-  // 负结果钳 0
-  assert.equal(calcQuota('m', m(1000, 0), undefined, undefined, { 'm': { expr: '0 - 5' } }), 0);
+test('结果按 ceil 换算 quota', () => {
+  // 1.5M fresh × $2/1M = $3 → 1_500_000
+  assert.equal(calcQuota('m', m(1_500_000, 0), undefined, undefined, { 'm': { in: 2, out: 0 } }), 1_500_000);
+  // 除不尽时向上取整：1_000 tokens × $1/1M = $0.001 → 0.001 × 500_000 = 500
+  assert.equal(calcQuota('m', m(1_000, 0), undefined, undefined, { 'm': { in: 1, out: 0 } }), 500);
+  // 更小：1 token × $1/1M → 0.5 quota → ceil = 1
+  assert.equal(calcQuota('m', m(1, 0), undefined, undefined, { 'm': { in: 1, out: 0 } }), 1);
 });
 
-test('坏表达式在计费时回退默认价而不是按 0 记账', () => {
-  const broken = opts({ 'm': { expr: 'p *' as never } });
+test('字段费率解析失败（坏表达式）在计费时回退默认价而不是按 0 记账', () => {
+  const broken = opts({ 'm': { in: 'context *' } as never });
   const r = calcQuotaDetailed('m', m(1000, 1000), broken);
   assert.equal(r.source, 'default');
   assert.equal(r.quota, calcQuota('m', m(1000, 1000)), '回退默认价 $1/$3');
 });
 
+test('缓存写入分量与 fresh 的扣减关系（Anthropic 口径）', () => {
+  // prompt = input + cache_read + cache_write（归一化后），fresh = prompt − cached − cw5 − cw1
+  // 1M fresh($3) + 0.5M cw5($3.75) + 0.5M cw1($6) = $3 + $1.875 + $3 = $7.875
+  const key = { 'm': { in: 3, out: 0, cache_write_5m: 3.75, cache_write_1h: 6 } };
+  assert.equal(
+    calcQuota('m', { prompt_tokens: 2_000_000, completion_tokens: 0, cache_write_5m_tokens: 500_000, cache_write_1h_tokens: 500_000 }, undefined, undefined, key),
+    3_937_500,
+  );
+  // cache_write 超过 prompt 的部分被钳掉（上游撒谎也不多收）：谎报 999_999 与
+  // 实际最多 100 的结果一致
+  const cwLie = { prompt_tokens: 100, completion_tokens: 0, cache_write_5m_tokens: 999_999 };
+  assert.equal(
+    calcQuota('m', cwLie, undefined, undefined, key),
+    calcQuota('m', { prompt_tokens: 100, completion_tokens: 0, cache_write_5m_tokens: 100 }, undefined, undefined, key),
+  );
+});
+
 // ---------------------------------------------------------------- 校验
 
-test('validatePriceSpec：固定价与表达式的合法/非法形状', () => {
+test('validatePriceSpec：常量与按字段表达式的合法/非法形状', () => {
   assert.ok(validatePriceSpec({ in: 1, out: 2 }).ok);
   assert.ok(validatePriceSpec({ in: 1, out: 2, cached_in: 0.5 }).ok);
   assert.ok(validatePriceSpec({ in: 0, out: 0 }).ok, '免费模型合法');
+  assert.ok(validatePriceSpec({ in: 1, out: 2, cache_write_5m: 1.25, cache_write_1h: 2 }).ok, '缓存写入字段合法');
   assert.ok(!validatePriceSpec({ in: -1, out: 2 }).ok);
-  assert.ok(!validatePriceSpec({ in: 'x', out: 2 }).ok);
-  assert.ok(!validatePriceSpec({ out: 2 }).ok);
+  assert.ok(!validatePriceSpec({ in: Number.NaN, out: 2 }).ok);
+  assert.ok(!validatePriceSpec({ out: 2 }).ok, 'in 必填');
   assert.ok(!validatePriceSpec('string').ok);
   assert.ok(!validatePriceSpec(null).ok);
 
-  assert.ok(validatePriceSpec({ expr: 'p * 3 + c * 15 + cr * 0.3' }).ok);
-  assert.ok(validatePriceSpec({ expr: 'tier("t", len <= 200000 ? p * 2 + c * 12 : p * 4 + c * 18)' }).ok);
-  const bad = validatePriceSpec({ expr: 'p *' });
+  // 字段费率表达式：编译 + 冒烟
+  assert.ok(validatePriceSpec({ in: '4 * (context > 272k ? 0.5 : 1)', out: 20 }).ok);
+  assert.ok(validatePriceSpec({ in: `0.3 * (hour("Asia/Shanghai") < 5 ? 0.5 : 1)`, out: 'has(header("x"), "fast") ? 30 : 20' }).ok);
+  const bad = validatePriceSpec({ in: 'context *', out: 2 });
   assert.ok(!bad.ok && /无法编译/.test(bad.error));
-  // 冒烟：结果为负的表达式被拒
-  const negative = validatePriceSpec({ expr: '0 - p' });
+  // 冒烟：费率为负的表达式被拒
+  const negative = validatePriceSpec({ in: '0 - context', out: 2 });
   assert.ok(!negative.ok && /冒烟/.test(negative.error));
-  // expr 不能与其他字段混用
-  assert.ok(!validatePriceSpec({ expr: 'p * 3', in: 1 }).ok);
+  // 除零在冒烟期暴露（context=0 向量）
+  const divZero = validatePriceSpec({ in: '1000 / context', out: 2 });
+  assert.ok(!divZero.ok && /除零/.test(divZero.error));
+  // 字段值类型不对
+  assert.ok(!validatePriceSpec({ in: true, out: 2 }).ok);
+  assert.ok(!validatePriceSpec({ in: '', out: 2 }).ok);
+
+  // 旧版整笔 {expr} 明确拒绝并指路
+  const legacy = validatePriceSpec({ expr: 'p * 3 + c * 15' });
+  assert.ok(!legacy.ok && /已移除/.test(legacy.error));
 });
 
 test('findPrice 仍用于「未定价」检测：内置+全局，不含 Key、不含默认价', () => {

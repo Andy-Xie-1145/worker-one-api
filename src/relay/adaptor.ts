@@ -76,6 +76,11 @@ export interface StreamState {
   textAcc: string;
   promptTokens: number;
   completionTokens: number;
+  /** Anthropic 流式：message_start 报来的缓存读 token（含在 promptTokens 里）。 */
+  cacheReadTokens?: number;
+  /** Anthropic 流式：缓存写入 5m/1h 分桶（含在 promptTokens 里）。 */
+  cacheWrite5mTokens?: number;
+  cacheWrite1hTokens?: number;
   [k: string]: any;
 }
 
@@ -86,6 +91,9 @@ export function newStreamState(): StreamState {
     textAcc: '',
     promptTokens: 0,
     completionTokens: 0,
+    cacheReadTokens: 0,
+    cacheWrite5mTokens: 0,
+    cacheWrite1hTokens: 0,
   };
 }
 

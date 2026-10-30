@@ -3,7 +3,12 @@ import { type Env, type Vars, type ChannelRow, type TokenRow, type UserRow, Chan
 import { authenticateToken, parseTokenPriceConfig } from '../lib/auth';
 import { getOptions, type Options } from '../lib/options';
 import { preConsume, postConsume, refund, type Usage } from '../lib/billing';
-import { calcQuota, resolvePrice, isExprSpec, quotaToUSD, QUOTA_PER_USD, type PriceSpec } from '../lib/pricing';
+import {
+  calcQuota, resolvePrice, quotaToUSD, QUOTA_PER_USD,
+  resolveBillableModel, resolveRates, sameBillingIdentity, quotaFromRates,
+  MODEL_PRICE_NOT_CONFIGURED, type BillingIdentity, type RateSet, type PriceSpec,
+} from '../lib/pricing';
+import type { ProbeContext } from '../lib/pricing/expr';
 import { selectChannel, mapModel, parseConfig, listModels, csv } from '../lib/channel';
 import { markRateLimited, clearRateLimit } from '../lib/cooldown';
 import {
@@ -94,7 +99,13 @@ relay.get('/pricing', async (c) => {
         model,
         object: 'model_pricing',
         source,
-        price: isExprSpec(spec) ? { expr: spec.expr } : { in: spec.in, out: spec.out, ...(spec.cached_in !== undefined ? { cached_in: spec.cached_in } : {}) },
+        price: {
+          in: spec.in,
+          out: spec.out,
+          ...(spec.cached_in !== undefined ? { cached_in: spec.cached_in } : {}),
+          ...(spec.cache_write_5m !== undefined ? { cache_write_5m: spec.cache_write_5m } : {}),
+          ...(spec.cache_write_1h !== undefined ? { cache_write_1h: spec.cache_write_1h } : {}),
+        },
       };
     }),
   });
@@ -291,25 +302,39 @@ async function handleRelay(
   }
 
   /*
-   * Pre-charge an estimate so concurrent requests cannot overdraw the balance.
+   * 预扣推迟到选中第一个渠道之后（严格计费的前提）。
    *
-   * 两个 ref 是一对：预留写 `pre:…`，结束时（无论结算还是退款）写同后缀的 `fin:…`。
-   * 于是「有 pre 没有 fin」= 这笔预留没人认领，回收器据此把钱退回去
-   * （lib/watchdog.ts 的 reclaimAbandonedReservations）。客户端半路断开时整个请求
-   * 会被运行时拆掉，postConsume / refund 都没机会执行——那种情况只能事后对账。
+   * 价格可能要靠渠道的 model_mapping 才查得到（gemini-flash-lite-latest →
+   * gemini-3.1-flash-lite），而预扣和最终结算必须用同一个计费身份。所以每个渠道
+   * 先解析计费身份：
+   *   - 查不到价 → 这个渠道跳过，不调上游、不预扣（fail-closed，见循环里 pricing 事件）；
+   *   - 第一次解析成功 → 按它预扣，并把身份+费率钉在 reservation 上，结算只认它；
+   *   - 之后换渠道时身份不同（另一条映射指向另一种价）→ 先用旧 fin ref 把旧预扣退掉，
+   *     再生成**一对全新的 pre/fin ref** 按新价重新预扣。旧 ref 已经写过退款，绝不复用。
    *
-   * tokenId 编进 ref 里，是因为退款还要还 tokens.remain_quota，而 credits 行里没有
-   * 任何一列能找回是哪个令牌。
-   *
-   * 估算本身不改：它发生在选渠道之前，还不知道上游模型是谁，因此查不到别名的真实
-   * 价格，最后多半落到 PreConsumedQuota 那个下限上。偏小是安全的——postConsume 会
-   * 按真实价找平。
+   * 请求探针（param/header）在解析费率时注入：body 是已解析的请求体，headers 从
+   * 原始请求读。探针取值不缓存——表达式自己在求值时决定读什么。
    */
-  const preConsumed = estimatePreConsume(body, requestedModel, options, mode, keyOverrides);
-  const reserveRef = `pre:${token.id}:${crypto.randomUUID()}`;
-  const settleRef = `fin:${reserveRef.slice(4)}`;
-  const pre = await preConsume(c.env, token, user, preConsumed, reserveRef);
-  if (!pre.ok) return fail(pre.message ?? '额度不足', 'insufficient_quota', 403);
+  const probes: ProbeContext = {
+    header: (key) => c.req.header(key),
+    param: (path) => pathGet(body, path),
+  };
+  type Reservation = {
+    amount: number;
+    identity: BillingIdentity;
+    rates: RateSet;
+    trace?: { matchedTier?: string };
+    reserveRef: string;
+    settleRef: string;
+  };
+  let reservation: Reservation | null = null;
+  // 没有预扣就没有要退的；有了就用它自己的结算 ref 退，和 postConsume 抢同一个唯一键。
+  const release = async (): Promise<void> => {
+    if (!reservation) return;
+    const r = reservation;
+    reservation = null;
+    await refund(c.env, token, user, r.amount, r.settleRef);
+  };
 
   const tried: number[] = [];
   /*
@@ -323,6 +348,8 @@ async function handleRelay(
   let quotaAttempts = 0;
   let round = 0;
   let lastError: { status: number; body: unknown } | null = null;
+  /** 因查不到价/费率求值失败而跳过的渠道数——全部渠道都因此跳过时，最终错误要如实说。 */
+  let pricingSkips = 0;
 
   /*
    * 403 软熔断的第三维度：机房（colo）。同一个渠道在不同机房面对的地区策略可以
@@ -375,7 +402,7 @@ async function handleRelay(
         c.executionCtx?.waitUntil?.(
           Promise.resolve(written).then(() => alertRouteGap(c.env, { model: requestedModel })),
         );
-        await refund(c.env, token, user, preConsumed, settleRef);
+        await release();
         return fail(`没有可用于模型 ${requestedModel} 的渠道`, 'invalid_request_error', 503);
       }
       break;
@@ -400,16 +427,88 @@ async function handleRelay(
         errorText: selection.earliest.message ?? '',
       });
       flushEvents();
-      await refund(c.env, token, user, preConsumed, settleRef);
+      await release();
       return fail(selection.earliest.message ?? DENY_403_FALLBACK_MESSAGE, 'permission_error', 403);
     }
 
     const channel = selection.channel;
     tried.push(channel.id);
 
+    /*
+     * 计费身份 + 费率，在发出任何上游请求、动任何一分钱之前解析。
+     *
+     * 跳过不占 RetryTimes 配额：tried 每轮都在长，selectChannel 不会重复给出，
+     * 循环必然结束。`stage: 'pricing'` 的事件让「哪个模型没配价/哪条表达式坏了」
+     * 直接落在健康页里，不用开 tail 蹲现场。
+     */
+    const upstreamModel = mapModel(channel, requestedModel);
+    const identity = resolveBillableModel(requestedModel, upstreamModel, options, keyOverrides);
+    if (!identity) {
+      events.push({
+        stage: 'pricing',
+        status: 503,
+        modelName: requestedModel,
+        upstreamModel,
+        channelId: channel.id,
+        channelType: channel.type,
+        userId: user.id,
+        attempt,
+        final: false,
+        errorCode: MODEL_PRICE_NOT_CONFIGURED,
+      });
+      pricingSkips++;
+      continue;
+    }
+    const ratesRes = resolveRates(
+      identity.spec,
+      { context: estimatePromptTokens(body, mode), n: typeof body.n === 'number' ? body.n : 1 },
+      probes,
+    );
+    if (!ratesRes.ok) {
+      events.push({
+        stage: 'pricing',
+        status: 503,
+        modelName: requestedModel,
+        upstreamModel,
+        channelId: channel.id,
+        channelType: channel.type,
+        userId: user.id,
+        attempt,
+        final: false,
+        errorCode: 'pricing_eval_failed',
+        errorText: ratesRes.error,
+      });
+      pricingSkips++;
+      continue;
+    }
+
+    /*
+     * 建立或换签预扣。身份相同就**沿用已钉住的费率**（哪怕时间函数走到了另一档，
+     * 结算也必须和预扣同价）；身份变了才退旧开新。
+     */
+    if (!reservation || !sameBillingIdentity(reservation.identity, identity)) {
+      await release();
+      const amount = estimateCharge(ratesRes.rates, body, mode, options);
+      const reserveRef = `pre:${token.id}:${crypto.randomUUID()}`;
+      const settleRef = `fin:${reserveRef.slice(4)}`;
+      const pre = await preConsume(c.env, token, user, amount, reserveRef);
+      if (!pre.ok) {
+        flushEvents();
+        return fail(pre.message ?? '额度不足', 'insufficient_quota', 403);
+      }
+      reservation = {
+        amount,
+        identity,
+        rates: ratesRes.rates,
+        trace: ratesRes.trace.matchedTier ? { matchedTier: ratesRes.trace.matchedTier } : undefined,
+        reserveRef,
+        settleRef,
+      };
+    }
+
     const attemptStarted = Date.now();
     const result = await attemptUpstream(c, {
-      channel, body, requestedModel, mode, path, token, user, options, keyOverrides, preConsumed, settleRef, started, protocol,
+      channel, body, requestedModel, mode, path, token, user, options, keyOverrides, reservation, started, protocol,
     });
     if (result.kind === 'ok') {
       // 成功即清掉退避计数，否则偶发限流会让这个渠道一直踩着上次的档位往上爬
@@ -498,7 +597,15 @@ async function handleRelay(
   }
   flushEvents();
 
-  await refund(c.env, token, user, preConsumed, settleRef);
+  await release();
+
+  // 一个上游请求都没发出去（全部渠道被定价关卡跳过）：如实告诉用户是价格没配，
+  // 而不是「渠道全部失败」——前者去价格页补一行就能修，后者只会让人去查渠道。
+  if (!lastError && pricingSkips > 0) {
+    if (protocol === 'anthropic') return c.json(anthropicError(`模型 ${requestedModel} 未配置价格（model_price_not_configured）`, 'api_error'), 503);
+    if (protocol === 'gemini') return c.json({ error: { code: 503, message: `模型 ${requestedModel} 未配置价格（model_price_not_configured）`, status: 'UNAVAILABLE' } }, 503);
+    return c.json(errorBody(`模型 ${requestedModel} 未配置价格（strict billing）`, 'invalid_request_error', MODEL_PRICE_NOT_CONFIGURED), 503);
+  }
   if (protocol === 'anthropic') {
     const message = typeof (lastError?.body as any)?.error?.message === 'string' ? (lastError!.body as any).error.message : '上游渠道全部失败';
     return c.json(anthropicError(message, 'api_error'), (lastError?.status ?? 502) as any);
@@ -529,9 +636,15 @@ interface AttemptArgs {
   options: Options;
   /** 这个 Key 的按模型价格配置，见 handleRelay 里的说明。 */
   keyOverrides: Record<string, PriceSpec>;
-  preConsumed: number;
-  /** 结算/退款共用的账本标识，见上面 reserveRef 那段注释。 */
-  settleRef: string;
+  /** 已钉住的预扣：金额、计费身份、费率与一对 pre/fin ref，见 handleRelay 那段注释。 */
+  reservation: {
+    amount: number;
+    identity: BillingIdentity;
+    rates: RateSet;
+    trace?: { matchedTier?: string };
+    reserveRef: string;
+    settleRef: string;
+  };
   started: number;
   protocol: Protocol;
 }
@@ -548,7 +661,7 @@ type AttemptResult =
   | { kind: 'error'; status: number; body: unknown; stage: 'build' | 'network' | 'upstream'; errorText: string };
 
 async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult> {
-  const { channel, body, requestedModel, mode, path, token, user, options, keyOverrides, preConsumed, settleRef, started, protocol } = args;
+  const { channel, body, requestedModel, mode, path, token, user, options, reservation, started, protocol } = args;
 
   const upstreamModel = mapModel(channel, requestedModel);
   const config = parseConfig(channel);
@@ -642,7 +755,9 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
     c.executionCtx.waitUntil(
       postConsume(c.env, {
         token, user, channelId: channel.id, modelName: requestedModel, upstreamModel: ctx.upstreamModel,
-        usage: finalUsage, preConsumed, options, keyOverrides, elapsedMs: Date.now() - started, settleRef,
+        usage: finalUsage, preConsumed: reservation.amount, options, elapsedMs: Date.now() - started,
+        settleRef: reservation.settleRef,
+        billing: { rates: reservation.rates, source: reservation.identity.source, via: reservation.identity.via, trace: reservation.trace },
       }),
     );
     const payload =
@@ -667,7 +782,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
  * accumulating usage so billing can be settled once the stream ends.
  */
 function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof getAdaptor>, ctx: AdaptorContext, args: AttemptArgs): Response {
-  const { channel, body, requestedModel, token, user, options, keyOverrides, preConsumed, settleRef, started, protocol } = args;
+  const { channel, body, requestedModel, token, user, options, reservation, started, protocol } = args;
   const encoder = new TextEncoder();
   const state = newStreamState();
   // Anthropic's stream is explicitly bracketed, so it needs its own state
@@ -686,7 +801,9 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
     c.executionCtx.waitUntil(
       postConsume(c.env, {
         token, user, channelId: channel.id, modelName: requestedModel, upstreamModel: ctx.upstreamModel,
-        usage: finalUsage, preConsumed, options, keyOverrides, elapsedMs: Date.now() - started, settleRef,
+        usage: finalUsage, preConsumed: reservation.amount, options, elapsedMs: Date.now() - started,
+        settleRef: reservation.settleRef,
+        billing: { rates: reservation.rates, source: reservation.identity.source, via: reservation.identity.via, trace: reservation.trace },
       }),
     );
   };
@@ -764,20 +881,36 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
   return new Response(stream, { status: 200, headers: { ...SSE_HEADERS, 'X-OneAPI-Channel': String(channel.id) } });
 }
 
-/** Estimates the pre-charge from prompt size, floored by the configured minimum. */
-function estimatePreConsume(body: ChatRequest, model: string, options: Options, mode: RelayMode = 'chat', keyOverrides: Record<string, PriceSpec> = {}): number {
-  // a free model must stay free —— 只对固定价成立；表达式的"免费"要等求值才知道，
-  // 预扣按估算走正常下限（500 quota = $0.001，结算时找平）。
-  const resolved = resolvePrice(model, options, undefined, keyOverrides);
-  if (!isExprSpec(resolved.spec) && resolved.spec.in === 0 && resolved.spec.out === 0) return 0;
-  // Decisions 请求没有 messages/input，提示词在 state/questions 里；按 messages
-  // 估的话每次都算出 0 字符，预扣永远落到下限上，并发就不再受额度约束。
+/** Estimates the prompt size (chars / 3) for the pre-charge. Decisions 的提示词在 state/questions 里。 */
+function estimatePromptTokens(body: ChatRequest, mode: RelayMode): number {
   const promptSource = mode === 'decisions' ? decisionsPromptPayload(body) : (body.messages ?? body.input ?? '');
-  const promptChars = JSON.stringify(promptSource ?? '').length;
-  const promptTokens = Math.ceil(promptChars / 3);
+  return Math.ceil(JSON.stringify(promptSource ?? '').length / 3);
+}
+
+/**
+ * 用**已钉住的费率**估算预扣额（floored by the configured minimum）。
+ *
+ * 预扣下限只在估算为正时生效：免费的模型（全 0 费率）必须真的 0 预扣——
+ * 若垫 500 quota 下限，免费模型的并发会被这个下限错误地挡住。
+ */
+function estimateCharge(rates: RateSet, body: ChatRequest, mode: RelayMode, options: Options): number {
   const maxOut = Math.min(body.max_tokens ?? body.max_completion_tokens ?? 0, 4096);
-  const estimate = calcQuota(model, { prompt_tokens: promptTokens, completion_tokens: maxOut }, options, undefined, keyOverrides);
-  return Math.max(options.PreConsumedQuota ?? 500, estimate);
+  const estimate = quotaFromRates(rates, {
+    prompt_tokens: estimatePromptTokens(body, mode),
+    completion_tokens: maxOut,
+    n: typeof body.n === 'number' ? body.n : 1,
+  });
+  return estimate > 0 ? Math.max(options.PreConsumedQuota ?? 500, estimate) : 0;
+}
+
+/** 点分路径读请求体（费率表达式的 param() 探针）；缺失一律 null，中间层非对象也 null。 */
+function pathGet(obj: unknown, path: string): unknown {
+  let cur: unknown = obj;
+  for (const seg of path.split('.')) {
+    if (cur === null || typeof cur !== 'object') return null;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur === undefined ? null : cur;
 }
 
 /*

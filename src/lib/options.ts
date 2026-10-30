@@ -29,10 +29,16 @@ export interface Options {
    */
   ModelPriceOverride: Record<string, PriceSpec>;
   /**
-   * 未知模型的兜底价（美元 / 百万 tokens）。价格页可改；不配用内置默认 $1 / $3。
-   * 表达式计费失败时的回退价也是它——**宁可收错方向保守，也不按 0 白送**。
+   * 未知模型的兜底价（美元 / 百万 tokens），**同时是严格计费的开关**：
+   *
+   * - 设了（默认 $1/$3）：查不到价的模型按它记账（宽松模式，宁可收错方向保守也不白送；
+   *   费率表达式求值失败时的回退价也是它）；
+   * - **显式 null**：严格计费——查不到价的请求直接 503 model_price_not_configured，
+   *   不调上游、不预扣。价格数据核对完之后清掉兜底价即启用。
+   *
+   * 只支持常量（清空与否必须是静态事实）；模型级价格才允许费率表达式。
    */
-  DefaultPrice: Price;
+  DefaultPrice: Price | null;
   /**
    * 追加的 decision-only 模型名（见 lib/capability.ts）。
    *

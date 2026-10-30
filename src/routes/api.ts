@@ -29,10 +29,11 @@ function maskKey(key: string): string {
 }
 
 /**
- * 规整一个 Key 的按模型价格配置（tokens.price_config）。
+ * 规整一个渠道的按模型价格覆盖（channels.price_config）。
  * 接受对象或 JSON 字符串；空 / `{}` 归一为 ''；逐条走 validatePriceSpec。
+ * 键是**请求名**（渠道 models 里声明的那个名字）。
  */
-function normalizePriceConfig(input: unknown): { ok: true; json: string } | { ok: false; error: string } {
+function normalizeChannelPriceConfig(input: unknown): { ok: true; json: string } | { ok: false; error: string } {
   if (input === null || input === undefined) return { ok: true, json: '' };
   if (typeof input === 'string') {
     const trimmed = input.trim();
@@ -54,8 +55,8 @@ function normalizePriceConfig(input: unknown): { ok: true; json: string } | { ok
   return { ok: true, json: Object.keys(out).length ? JSON.stringify(out) : '' };
 }
 
-/** DB 里的 JSON 文本 → 响应对象（null = 无覆盖）。 */
-function tokenPriceOut(row: TokenRow): Record<string, PriceSpec> | null {
+/** DB 里的渠道价格 JSON 文本 → 响应对象（null = 无覆盖）。 */
+function channelPriceOut(row: ChannelRow): Record<string, PriceSpec> | null {
   if (!row.price_config) return null;
   try {
     const parsed = JSON.parse(row.price_config);
@@ -241,29 +242,27 @@ async function buildPublicStatus(env: Env, windowSec: number) {
 
 api.get('/tokens', requireAdmin, async (c) => {
   const rows = await c.env.DB.prepare('SELECT * FROM tokens ORDER BY id DESC').all<TokenRow>();
-  return c.json(ok((rows.results ?? []).map((t) => ({ ...t, price_config: tokenPriceOut(t) }))));
+  return c.json(ok(rows.results ?? []));
 });
 
 api.post('/tokens', requireAdmin, async (c) => {
   const b = await c.req.json<any>();
-  const price = normalizePriceConfig(b.price_config);
-  if (!price.ok) return c.json(fail(price.error), 400);
 
   const owner = await ensureOwner(c.env);
   const key = randomKey(24);
   const unlimited = b.unlimited_quota ? 1 : 0;
   await c.env.DB.prepare(
-    'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models, price_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   )
     .bind(
       owner.id, key, TokenStatusEnabled, String(b.name ?? '默认令牌'), now(), now(),
       Number.isFinite(b.expired_time) ? Number(b.expired_time) : -1,
       unlimited ? 0 : Math.max(0, Number(b.remain_quota) || 0),
-      unlimited, String(b.models ?? ''), price.json,
+      unlimited, String(b.models ?? ''),
     )
     .run();
   const token = await c.env.DB.prepare('SELECT * FROM tokens WHERE key = ?').bind(key).first<TokenRow>();
-  return c.json(ok({ ...token!, price_config: tokenPriceOut(token!) }, '令牌已创建'));
+  return c.json(ok(token, '令牌已创建'));
 });
 
 api.put('/tokens/:id', requireAdmin, async (c) => {
@@ -272,16 +271,8 @@ api.put('/tokens/:id', requireAdmin, async (c) => {
   if (!token) return c.json(fail('令牌不存在'), 404);
 
   const b = await c.req.json<any>();
-  // price_config 不出现 = 不修改；显式传 {} / '' / null = 清空。
-  let priceJson = token.price_config;
-  if (b.price_config !== undefined) {
-    const price = normalizePriceConfig(b.price_config);
-    if (!price.ok) return c.json(fail(price.error), 400);
-    priceJson = price.json;
-  }
-
   const unlimited = b.unlimited_quota !== undefined ? (b.unlimited_quota ? 1 : 0) : token.unlimited_quota;
-  await c.env.DB.prepare('UPDATE tokens SET name = ?, status = ?, expired_time = ?, remain_quota = ?, unlimited_quota = ?, models = ?, price_config = ? WHERE id = ?')
+  await c.env.DB.prepare('UPDATE tokens SET name = ?, status = ?, expired_time = ?, remain_quota = ?, unlimited_quota = ?, models = ? WHERE id = ?')
     .bind(
       String(b.name ?? token.name),
       Number(b.status ?? token.status),
@@ -289,7 +280,6 @@ api.put('/tokens/:id', requireAdmin, async (c) => {
       b.remain_quota !== undefined ? Math.max(0, Number(b.remain_quota) || 0) : token.remain_quota,
       unlimited,
       b.models !== undefined ? String(b.models) : token.models,
-      priceJson,
       id,
     )
     .run();
@@ -331,7 +321,7 @@ api.get('/pricing', requireAdmin, async (c) => {
  *   不出现的模型同样视为无覆盖——所以「恢复默认」就是把它从包里去掉。
  * - default_price（可选，只支持固定价）= 未知模型的兜底价，改它不动 overrides。
  * 每条都校验（固定价形状 / 表达式编译+冒烟），任何一条不合法整包拒绝。
- * 每个 Key 还可以在「令牌」里再覆盖一层（tokens.price_config），优先级更高。
+ * 渠道还可以在「渠道」里配自己的价格覆盖（channels.price_config），优先级比这里高。
  */
 api.put('/pricing/overrides', requireAdmin, async (c) => {
   const body = await c.req.json<{ overrides?: Record<string, unknown>; default_price?: unknown }>().catch(() => null);
@@ -421,7 +411,7 @@ api.post('/owner/adjust', requireAdmin, async (c) => {
 
 api.get('/channels', requireAdmin, async (c) => {
   const rows = await c.env.DB.prepare('SELECT * FROM channels ORDER BY id DESC').all<ChannelRow>();
-  return c.json(ok((rows.results ?? []).map((ch) => ({ ...ch, key: maskKey(ch.key) }))));
+  return c.json(ok((rows.results ?? []).map((ch) => ({ ...ch, key: maskKey(ch.key), price_config: channelPriceOut(ch) }))));
 });
 
 api.get('/channels/meta', requireAdmin, (c) =>
@@ -434,37 +424,48 @@ api.get('/channels/meta', requireAdmin, (c) =>
   ),
 );
 
-function channelFromBody(b: any, existing?: ChannelRow): Omit<ChannelRow, 'id' | 'created_time' | 'test_time' | 'response_time' | 'balance' | 'used_quota'> {
+function channelFromBody(b: any, existing?: ChannelRow): { ch: Omit<ChannelRow, 'id' | 'created_time' | 'test_time' | 'response_time' | 'balance' | 'used_quota'>; priceJson?: string; priceError?: string } {
+  // price_config 不出现 = 不修改（编辑时）；显式传 {} / '' / null = 清空。
+  let priceJson: string | undefined;
+  if (b.price_config !== undefined || !existing) {
+    const price = normalizeChannelPriceConfig(b.price_config ?? (existing ? existing.price_config : null));
+    if (!price.ok) return { ch: null as never, priceError: price.error };
+    priceJson = price.json;
+  }
   return {
-    type: String(b.type ?? existing?.type ?? 'openai'),
-    key: b.key !== undefined && b.key !== '' && !String(b.key).includes('****') ? String(b.key) : (existing?.key ?? ''),
-    status: b.status !== undefined ? Number(b.status) : (existing?.status ?? ChannelStatusEnabled),
-    name: String(b.name ?? existing?.name ?? ''),
-    weight: Math.max(1, Number(b.weight ?? existing?.weight ?? 1)),
-    priority: Number(b.priority ?? existing?.priority ?? 0),
-    base_url: String(b.base_url ?? existing?.base_url ?? ''),
-    models: String(b.models ?? existing?.models ?? ''),
-    model_mapping: String(b.model_mapping ?? existing?.model_mapping ?? ''),
-    config: String(b.config ?? existing?.config ?? ''),
-    system_prompt: String(b.system_prompt ?? existing?.system_prompt ?? ''),
+    ch: {
+      type: String(b.type ?? existing?.type ?? 'openai'),
+      key: b.key !== undefined && b.key !== '' && !String(b.key).includes('****') ? String(b.key) : (existing?.key ?? ''),
+      status: b.status !== undefined ? Number(b.status) : (existing?.status ?? ChannelStatusEnabled),
+      name: String(b.name ?? existing?.name ?? ''),
+      weight: Math.max(1, Number(b.weight ?? existing?.weight ?? 1)),
+      priority: Number(b.priority ?? existing?.priority ?? 0),
+      base_url: String(b.base_url ?? existing?.base_url ?? ''),
+      models: String(b.models ?? existing?.models ?? ''),
+      model_mapping: String(b.model_mapping ?? existing?.model_mapping ?? ''),
+      config: String(b.config ?? existing?.config ?? ''),
+      system_prompt: String(b.system_prompt ?? existing?.system_prompt ?? ''),
+      price_config: priceJson !== undefined ? priceJson : (existing?.price_config ?? ''),
+    },
   };
 }
 
 api.post('/channels', requireAdmin, async (c) => {
   const b = await c.req.json<any>();
-  const ch = channelFromBody(b);
+  const { ch, priceError } = channelFromBody(b);
+  if (priceError) return c.json(fail(priceError), 400);
   if (!ch.name) return c.json(fail('渠道名称不能为空'), 400);
   if (!ch.models) return c.json(fail('至少填写一个模型'), 400);
 
   await c.env.DB.prepare(
-    'INSERT INTO channels (type, key, status, name, weight, priority, created_time, base_url, models, model_mapping, config, system_prompt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO channels (type, key, status, name, weight, priority, created_time, base_url, models, model_mapping, config, system_prompt, price_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   )
-    .bind(ch.type, ch.key, ch.status, ch.name, ch.weight, ch.priority, now(), ch.base_url, ch.models, ch.model_mapping, ch.config, ch.system_prompt)
+    .bind(ch.type, ch.key, ch.status, ch.name, ch.weight, ch.priority, now(), ch.base_url, ch.models, ch.model_mapping, ch.config, ch.system_prompt, ch.price_config)
     .run();
 
   const created = await c.env.DB.prepare('SELECT * FROM channels ORDER BY id DESC LIMIT 1').first<ChannelRow>();
   await rebuildAbilities(c.env, created!);
-  return c.json(ok({ ...created!, key: maskKey(created!.key) }, '渠道已创建'));
+  return c.json(ok({ ...created!, key: maskKey(created!.key), price_config: channelPriceOut(created!) }, '渠道已创建'));
 });
 
 api.put('/channels/:id', requireAdmin, async (c) => {
@@ -472,16 +473,17 @@ api.put('/channels/:id', requireAdmin, async (c) => {
   const existing = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
   if (!existing) return c.json(fail('渠道不存在'), 404);
 
-  const ch = channelFromBody(await c.req.json<any>(), existing);
+  const { ch, priceError } = channelFromBody(await c.req.json<any>(), existing);
+  if (priceError) return c.json(fail(priceError), 400);
   await c.env.DB.prepare(
-    'UPDATE channels SET type = ?, key = ?, status = ?, name = ?, weight = ?, priority = ?, base_url = ?, models = ?, model_mapping = ?, config = ?, system_prompt = ? WHERE id = ?',
+    'UPDATE channels SET type = ?, key = ?, status = ?, name = ?, weight = ?, priority = ?, base_url = ?, models = ?, model_mapping = ?, config = ?, system_prompt = ?, price_config = ? WHERE id = ?',
   )
-    .bind(ch.type, ch.key, ch.status, ch.name, ch.weight, ch.priority, ch.base_url, ch.models, ch.model_mapping, ch.config, ch.system_prompt, id)
+    .bind(ch.type, ch.key, ch.status, ch.name, ch.weight, ch.priority, ch.base_url, ch.models, ch.model_mapping, ch.config, ch.system_prompt, ch.price_config, id)
     .run();
 
   const updated = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
   await rebuildAbilities(c.env, updated!);
-  return c.json(ok({ ...updated!, key: maskKey(updated!.key) }, '已保存'));
+  return c.json(ok({ ...updated!, key: maskKey(updated!.key), price_config: channelPriceOut(updated!) }, '已保存'));
 });
 
 api.delete('/channels/:id', requireAdmin, async (c) => {

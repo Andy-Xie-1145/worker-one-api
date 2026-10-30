@@ -1,11 +1,10 @@
 import { type Env, type TokenRow, type UserRow, LogTypeConsume, TokenStatusExhausted } from '../types';
-import { invalidateTokenCache, parseTokenPriceConfig } from './auth';
+import { invalidateTokenCache } from './auth';
 import { calcQuotaDetailed, quotaFromRates, quotaToUSD, LLM_PRICING_VERSION } from './pricing';
 import type { RateSet, PriceSource } from './pricing/llm';
 import type { ExprTrace } from './pricing/expr';
 import { applyCreditGated, applyCredit } from './ledger';
 import type { Options } from './options';
-import type { PriceSpec } from './pricing/llm';
 
 export interface Usage {
   prompt_tokens: number;
@@ -114,8 +113,6 @@ export async function postConsume(
     usage: Usage;
     preConsumed: number;
     options: Options;
-    /** 这个 Key 的按模型价格配置（tokens.price_config 解析结果），结算必须和预扣用同一份。 */
-    keyOverrides?: Record<string, PriceSpec>;
     elapsedMs: number;
     content?: string;
     /**
@@ -137,7 +134,7 @@ export async function postConsume(
   const { token, user, channelId, modelName, usage, preConsumed, options, elapsedMs } = args;
   const detail = args.billing
     ? { quota: quotaFromRates(args.billing.rates, usage), source: args.billing.source, trace: args.billing.trace }
-    : calcQuotaDetailed(modelName, usage, options, args.upstreamModel, args.keyOverrides);
+    : calcQuotaDetailed(modelName, usage, options, args.upstreamModel);
   const quota = detail.quota;
   const delta = quota - preConsumed;
   const now = Math.floor(Date.now() / 1000);

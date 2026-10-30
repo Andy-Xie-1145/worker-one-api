@@ -1,15 +1,15 @@
 import { Hono } from 'hono';
 import { type Env, type Vars, type ChannelRow, type TokenRow, type UserRow, ChannelStatusAutoDisabled } from '../types';
-import { authenticateToken, parseTokenPriceConfig } from '../lib/auth';
+import { authenticateToken } from '../lib/auth';
 import { getOptions, type Options } from '../lib/options';
 import { preConsume, postConsume, refund, type Usage } from '../lib/billing';
 import {
   calcQuota, resolvePrice, quotaToUSD, QUOTA_PER_USD,
   resolveBillableModel, resolveRates, sameBillingIdentity, quotaFromRates,
-  MODEL_PRICE_NOT_CONFIGURED, type BillingIdentity, type RateSet, type PriceSpec,
+  MODEL_PRICE_NOT_CONFIGURED, type BillingIdentity, type RateSet,
 } from '../lib/pricing';
 import type { ProbeContext } from '../lib/pricing/expr';
-import { selectChannel, mapModel, parseConfig, listModels, csv } from '../lib/channel';
+import { selectChannel, mapModel, parseConfig, listModels, csv, parseChannelPriceConfig } from '../lib/channel';
 import { markRateLimited, clearRateLimit } from '../lib/cooldown';
 import {
   markDenied403, clearDenied403, extractDeniedMessage, UNKNOWN_COLO, DENY_403_FALLBACK_MESSAGE,
@@ -85,7 +85,6 @@ relay.get('/pricing', async (c) => {
   if ('error' in auth) return c.json(errorBody(auth.error), auth.status as 401 | 403);
   const capability = c.req.query('capability') === 'decisions' ? 'decisions' : 'chat';
   const options = await getOptions(c.env);
-  const keyOverrides = parseTokenPriceConfig(auth.token);
   const models = filterByCapability(await listModels(c.env), capability, options);
   const allowed = csv(auth.token.models);
   const visible = allowed.length ? models.filter((m) => allowed.includes(m)) : models;
@@ -93,8 +92,11 @@ relay.get('/pricing', async (c) => {
     object: 'list',
     quota_per_usd: QUOTA_PER_USD,
     unit: 'USD per 1M tokens',
+    // 这是**基础价**（全局覆盖 > 内置表 > 兜底）——不带渠道维度：实际计费在路由到
+    // 具体渠道后还可能命中该渠道自己的价格覆盖（渠道 > 全局）。想看渠道价去后台。
+    note: 'base price without channel overrides; actual billing may use a channel-specific price',
     data: visible.map((model) => {
-      const { spec, source } = resolvePrice(model, options, undefined, keyOverrides);
+      const { spec, source } = resolvePrice(model, options);
       return {
         model,
         object: 'model_pricing',
@@ -270,11 +272,6 @@ async function handleRelay(
   }
 
   const options = await getOptions(c.env);
-  /*
-   * 这个 Key 的按模型价格配置。查价优先级：Key 覆盖 > 全局覆盖 > 内置表 > 默认价，
-   * 见 lib/pricing/llm.ts 的 resolvePrice()。预扣和结算必须用同一份，否则找平会错。
-   */
-  const keyOverrides = parseTokenPriceConfig(token);
 
   /*
    * 能力分诊，在花掉任何额度之前。
@@ -437,12 +434,16 @@ async function handleRelay(
     /*
      * 计费身份 + 费率，在发出任何上游请求、动任何一分钱之前解析。
      *
+     * 渠道自己的价格覆盖（channels.price_config）在这一步进链——**路由到谁就按
+     * 谁的价**（渠道 > 全局 > 内置表）。换渠道时身份/费率不同，预扣会退旧开新
+     * （见下面 reservation 那段），所以渠道间价差不会串账。
+     *
      * 跳过不占 RetryTimes 配额：tried 每轮都在长，selectChannel 不会重复给出，
      * 循环必然结束。`stage: 'pricing'` 的事件让「哪个模型没配价/哪条表达式坏了」
      * 直接落在健康页里，不用开 tail 蹲现场。
      */
     const upstreamModel = mapModel(channel, requestedModel);
-    const identity = resolveBillableModel(requestedModel, upstreamModel, options, keyOverrides);
+    const identity = resolveBillableModel(requestedModel, upstreamModel, options, parseChannelPriceConfig(channel));
     if (!identity) {
       events.push({
         stage: 'pricing',
@@ -508,7 +509,7 @@ async function handleRelay(
 
     const attemptStarted = Date.now();
     const result = await attemptUpstream(c, {
-      channel, body, requestedModel, mode, path, token, user, options, keyOverrides, reservation, started, protocol,
+      channel, body, requestedModel, mode, path, token, user, options, reservation, started, protocol,
     });
     if (result.kind === 'ok') {
       // 成功即清掉退避计数，否则偶发限流会让这个渠道一直踩着上次的档位往上爬
@@ -634,8 +635,6 @@ interface AttemptArgs {
   token: TokenRow;
   user: UserRow;
   options: Options;
-  /** 这个 Key 的按模型价格配置，见 handleRelay 里的说明。 */
-  keyOverrides: Record<string, PriceSpec>;
   /** 已钉住的预扣：金额、计费身份、费率与一对 pre/fin ref，见 handleRelay 那段注释。 */
   reservation: {
     amount: number;

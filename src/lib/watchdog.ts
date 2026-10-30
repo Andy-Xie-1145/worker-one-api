@@ -1,10 +1,12 @@
 import type { Env } from '../types';
 import { applyCredit, reconcile } from './ledger';
 import { pruneRelayEvents } from './health';
-import { findPrice, strictBillingEnabled } from './pricing/llm';
-import { listModels } from './channel';
+import { findPrice, strictBillingEnabled, resolveBillableModel } from './pricing/llm';
+import { listModels, mapModel, csv, parseChannelPriceConfig } from './channel';
+import { findUnpricedChannelModels } from './model-billing';
 import { getOptions } from './options';
 import type { Options } from './options';
+import type { ChannelRow } from '../types';
 import { checkRouteGapRecovery } from './route-alert';
 
 /**
@@ -238,11 +240,14 @@ export async function reclaimAbandonedReservations(env: Env, limit = 100): Promi
 }
 
 /**
- * 找出**挂在启用渠道上、但价格表里查不到**的模型。
+ * 找出**挂在启用渠道上、但整条查价链都查不到**的模型。
  *
  * 口径是「声明了就算」而不是「有人用过才算」：等第一笔请求踩进去才发现没定价，
  * 严格计费下用户已经吃了一次 503，宽松计费下已经按默认价记了一笔糊涂账——
  * 警报必须在第一次请求之前就响。
+ *
+ * 渠道维度的判定：一个模型只要在**任一启用渠道**上有价（渠道覆盖 / 全局 / 内置表，
+ * 含映射后的上游名），就不报警——严格计费下选路会自动跳过没价的那个渠道。
  *
  * 名字里带 `:` 的是语音（`asr:azure:speech-to-text` 这种），它们走独立的授权窗口
  * 结算，跟 LLM 价格表无关，必须排除，否则每天都会报一堆假警。
@@ -251,8 +256,19 @@ export async function detectUnpricedModels(env: Env, options?: Options): Promise
   const since = Math.floor(Date.now() / 1000) - 86400;
   const opts = options ?? (await getOptions(env));
   try {
-    const declared = (await listModels(env)).filter((m) => m && !m.includes(':'));
-    const unpriced = declared.filter((model) => !findPrice(model, opts));
+    const channels = await env.DB.prepare('SELECT id, name, type, status, models, model_mapping, price_config FROM channels WHERE status = 1').all<ChannelRow>();
+    // (渠道, 模型) 全都无价 → 这个模型整体无价；有一家有价就不算。
+    const combos = findUnpricedChannelModels(channels.results ?? [], opts);
+    const pricedSomewhere = new Set<string>();
+    for (const channel of channels.results ?? []) {
+      const channelPrices = parseChannelPriceConfig(channel);
+      for (const requested of csv(channel.models ?? '')) {
+        if (requested && !requested.includes(':') && resolveBillableModel(requested, mapModel(channel, requested), opts, channelPrices)) {
+          pricedSomewhere.add(requested);
+        }
+      }
+    }
+    const unpriced = [...new Set(combos.map((c) => c.requested))].filter((m) => !m.includes(':') && !pricedSomewhere.has(m));
     if (!unpriced.length) return [];
     // 近 24h 的用量做补充信息（没被用过的未定价模型 n=0——它还没造成损失，但马上会）。
     const placeholders = unpriced.map(() => '?').join(',');

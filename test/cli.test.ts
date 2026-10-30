@@ -141,9 +141,9 @@ test('price default：兜底价可改并生效于未知模型', async () => {
   assert.match(got.output, /\$2/);
 });
 
-test('token new → key → price → off 往返', async () => {
+test('token new → key → off 往返；Key 级价格已移除并指路', async () => {
   const env = envOf();
-  const created = await run(env, 'token new 测试 --usd 5 --models gpt-4o --price {"gpt-4o":{"in":1,"out":2}}');
+  const created = await run(env, 'token new 测试 --usd 5 --models gpt-4o');
   assert.ok(created.ok, created.output);
   assert.match(created.output, /sk-[0-9a-f]{48}/);
 
@@ -151,8 +151,8 @@ test('token new → key → price → off 往返', async () => {
   assert.match(list.output, /测试/);
 
   const id = /^\s*(\d+)\s/m.exec((await run(env, 'token list')).output)![1];
-  const price = await run(env, `token price ${id}`);
-  assert.match(price.output, /gpt-4o/);
+  const gone = await run(env, `token price ${id}`);
+  assert.ok(!gone.ok && /channel price/.test(gone.output), '指路渠道级');
 
   const off = await run(env, `token off ${id}`);
   assert.ok(off.ok);
@@ -160,16 +160,39 @@ test('token new → key → price → off 往返', async () => {
   assert.ok(del.ok);
 });
 
-test('token price 的坏 JSON 被校验拦下', async () => {
+test('channel price：查看/设置/清空，坏 JSON 拦下', async () => {
   const env = envOf();
-  await run(env, 'token new t');
-  const id = /^\s*(\d+)\s/m.exec((await run(env, 'token list')).output)![1];
-  const bad = await run(env, `token price ${id} {"m":{"in":"context *"}}`);
-  assert.ok(!bad.ok);
-  assert.match(bad.output, /无法编译/);
-  const legacy = await run(env, `token price ${id} {"m":{"expr":"p * 3"}}`);
-  assert.ok(!legacy.ok);
-  assert.match(legacy.output, /已移除/);
+  const added = await run(env, 'channel add openai 上游 https://up.test sk-up --models glm-5.3-flash,m');
+  const id = /#(\d+)/.exec(added.output)![1];
+
+  const empty = await run(env, `channel price ${id}`);
+  assert.ok(empty.ok && /没有价格覆盖/.test(empty.output));
+
+  const set = await run(env, `channel price ${id} {"glm-5.3-flash":{"in":0.1,"out":0.4}}`);
+  assert.ok(set.ok, set.output);
+  assert.match(set.output, /仅该渠道生效/);
+
+  const got = await run(env, `channel price ${id}`);
+  assert.match(got.output, /glm-5.3-flash/);
+  assert.match(got.output, /"in": 0\.1/);
+
+  // show 回显成对象
+  const show = await run(env, `channel show ${id}`);
+  assert.match(show.output, /"price_config": \{/);
+
+  // 渠道价生效：严格计费下，配了渠道价的 glm-5.3-flash 不再算未定价（m 仍未定价）
+  await run(env, 'price default --clear');
+  const check = await run(env, 'billing check');
+  assert.ok(!check.ok, 'm 仍未定价 → 非零退出');
+  assert.ok(!check.output.includes('glm-5.3-flash'), '渠道覆盖让 glm-5.3-flash 有了价');
+  assert.ok(check.output.includes('渠道 #1') && check.output.includes('m'), '只剩 m：' + check.output);
+
+  const bad = await run(env, `channel price ${id} {"m":{"in":"context *"}}`);
+  assert.ok(!bad.ok && /无法编译/.test(bad.output));
+
+  const clear = await run(env, `channel price ${id} --clear`);
+  assert.ok(clear.ok && /回到全局价/.test(clear.output));
+  await run(env, 'price default in=1 out=3');
 });
 
 test('owner add/sub 调整预算并记账', async () => {

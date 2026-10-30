@@ -1,6 +1,7 @@
 import { type Env, type ChannelRow, ChannelStatusEnabled } from '../types';
 import { getCooling } from './cooldown';
 import { getDenied403, UNKNOWN_COLO, type Deny403Entry } from './deny403';
+import type { PriceSpec } from './pricing/llm';
 
 export function csv(value: string): string[] {
   return (value ?? '')
@@ -156,4 +157,23 @@ export function resolveTestModel(channel: Pick<ChannelRow, 'models'>, requested:
   if (!want) return { model: models[0] };
   if (!models.includes(want)) return { error: `模型 ${want} 不属于该渠道` };
   return { model: want };
+}
+
+/**
+ * 解析渠道的按模型价格覆盖（`channels.price_config`，JSON 文本）。
+ *
+ * 坏 JSON / 非对象一律回空表并打日志——渠道价格是**可选**的成本真相，坏了不该
+ * 拖垮请求（后续按全局链解析）；但要让日志喊出来，不能静默。
+ * 存量合法性由保存入口（API/CLI 的 validatePriceSpec）保证，这里只防御。
+ */
+export function parseChannelPriceConfig(channel: Pick<ChannelRow, 'price_config'> & { id?: number }): Record<string, PriceSpec> {
+  if (!channel.price_config) return {};
+  try {
+    const parsed = JSON.parse(channel.price_config);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch {
+    // 落到下面统一报错
+  }
+  console.error(`[pricing] 渠道 #${channel.id ?? '?'} 的 price_config 不是合法 JSON，按无覆盖处理`);
+  return {};
 }

@@ -231,7 +231,43 @@ async function channelCmd(env: Env, args: string[]): Promise<CliResult> {
       const ch = await env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
       if (!ch) return { ok: false, output: `渠道 #${rest[0]} 不存在` };
       const { key, ...safe } = ch;
-      return { ok: true, output: '```json\n' + JSON.stringify({ ...safe, key: key ? `${key.slice(0, 4)}****${key.slice(-4)}` : '' }, null, 2) + '\n```' };
+      // price_config 回显成对象（和读 JSON 文件一样直观），没有就省略。
+      const display = { ...safe, key: key ? `${key.slice(0, 4)}****${key.slice(-4)}` : '' } as Record<string, unknown>;
+      if (ch.price_config) {
+        try { display.price_config = JSON.parse(ch.price_config); } catch { /* 原样保留 */ }
+      }
+      return { ok: true, output: '```json\n' + JSON.stringify(display, null, 2) + '\n```' };
+    }
+    case 'price': {
+      // 渠道级价格覆盖：路由到这个渠道就按这里的价（渠道 > 全局 > 内置表）。
+      // 键是请求名（渠道 models 里声明的那个名字）。
+      const id = Number(rest[0]);
+      const ch = await env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
+      if (!ch) return { ok: false, output: `渠道 #${rest[0]} 不存在` };
+      const raw2 = rest.slice(1).join(' ');
+      if (!raw2) {
+        const cfg = ch.price_config ? JSON.parse(ch.price_config) : {};
+        return { ok: true, output: Object.keys(cfg).length ? '```json\n' + JSON.stringify(cfg, null, 2) + '\n```' : '（该渠道没有价格覆盖，按全局价计）' };
+      }
+      let priceJson = '';
+      if (raw2 !== '--clear') {
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(raw2);
+        } catch {
+          return { ok: false, output: '不是合法 JSON（形状：{"请求名":{"in":1,"out":2}}，字段可写费率表达式）' };
+        }
+        const out: Record<string, unknown> = {};
+        for (const [model, spec] of Object.entries(parsed)) {
+          if (spec === null) continue; // null 条目 = 删除该模型
+          const v = validatePriceSpec(spec);
+          if (!v.ok) return { ok: false, output: `模型 ${model} 的价格配置有误：${v.error}` };
+          out[model] = v.spec;
+        }
+        priceJson = Object.keys(out).length ? JSON.stringify(out) : '';
+      }
+      await env.DB.prepare('UPDATE channels SET price_config = ? WHERE id = ?').bind(priceJson, id).run();
+      return { ok: true, output: priceJson ? `渠道 #${id}「${ch.name}」价格覆盖已更新（仅该渠道生效）` : `渠道 #${id}「${ch.name}」价格覆盖已清空（回到全局价）` };
     }
     case 'on': case 'off': {
       const id = Number(rest[0]);
@@ -330,7 +366,7 @@ async function channelCmd(env: Env, args: string[]): Promise<CliResult> {
       return { ok: true, output: `上游模型 ${models.length} 个（--add 合并进渠道 models）：\n` + models.join(', ') };
     }
     default:
-      return { ok: false, output: '用法：channel list | add <类型> <名称> <base_url> <api_key> --models a,b | set <id> name=... models=... | show <id> | test <id> [模型] | pull <id> [--add] | on <id> | off <id> | del <id>' };
+      return { ok: false, output: '用法：channel list | add <类型> <名称> <base_url> <api_key> --models a,b | set <id> name=... models=... | show <id> | test <id> [模型] | pull <id> [--add] | price <id> [JSON|--clear] | on <id> | off <id> | del <id>' };
   }
 }
 
@@ -342,34 +378,23 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
   switch (sub) {
     case undefined: case 'list': {
       const rows = await env.DB.prepare('SELECT * FROM tokens ORDER BY id').all<TokenRow>();
-      const table2 = table(['ID', '名称', '状态', '剩余', '已用', '模型限制', '定制价'], (rows.results ?? []).map((t) => [
+      const table2 = table(['ID', '名称', '状态', '剩余', '已用', '模型限制'], (rows.results ?? []).map((t) => [
         String(t.id), t.name, t.status === 1 ? '启用' : `停用(${t.status})`,
         t.unlimited_quota ? '无限' : usd(t.remain_quota), usd(t.used_quota), t.models || '全部',
-        t.price_config ? `${Object.keys(JSON.parse(t.price_config || '{}')).length} 条` : '—',
       ]));
       return { ok: true, output: table2 || '（还没有令牌）' };
     }
     case 'new': {
       const name = rest[0];
-      if (!name) return { ok: false, output: '用法：token new <名称> [--usd 10 | --unlimited] [--models a,b] [--price {"模型":{"in":1,"out":2}}]' };
+      if (!name) return { ok: false, output: '用法：token new <名称> [--usd 10 | --unlimited] [--models a,b]' };
       const flags = flagsOf(rest);
-      const priceRaw = flags.get('--price');
-      let priceJson = '';
-      if (priceRaw) {
-        const parsed = JSON.parse(priceRaw);
-        for (const [model, spec] of Object.entries(parsed)) {
-          const v = validatePriceSpec(spec);
-          if (!v.ok) return { ok: false, output: `模型 ${model} 的价格配置有误：${v.error}` };
-        }
-        priceJson = JSON.stringify(parsed);
-      }
       const key = randomKey(24);
       const unlimited = flags.has('--unlimited') ? 1 : 0;
       const usdAmount = Number((flags.get('--usd') ?? '').replace(/^\$/, ''));
       await env.DB.prepare(
-        'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models, price_config) VALUES (?, ?, ?, ?, ?, ?, -1, ?, ?, ?, ?)',
+        'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models) VALUES (?, ?, ?, ?, ?, ?, -1, ?, ?, ?)',
       )
-        .bind(owner.id, key, TokenStatusEnabled, name, now(), now(), unlimited ? 0 : Math.round((Number.isFinite(usdAmount) ? usdAmount : 0) * QUOTA_PER_USD), unlimited, flags.get('--models') ?? '', priceJson)
+        .bind(owner.id, key, TokenStatusEnabled, name, now(), now(), unlimited ? 0 : Math.round((Number.isFinite(usdAmount) ? usdAmount : 0) * QUOTA_PER_USD), unlimited, flags.get('--models') ?? '')
         .run();
       return { ok: true, output: `令牌已创建：sk-${key}${unlimited ? '（无限额度）' : Number.isFinite(usdAmount) ? `（$${usdAmount}）` : '（0 额度，可用 --usd/--unlimited 调整）'}\n请立即保存，密钥只显示这一次。` };
     }
@@ -378,12 +403,12 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
       const t = await env.DB.prepare('SELECT * FROM tokens WHERE id = ?').bind(id).first<TokenRow>();
       if (!t) return { ok: false, output: `令牌 #${rest[0]} 不存在` };
       const kv = kvOf(rest.slice(1));
-      if (!kv.size) return { ok: false, output: `用法：token set <id> name=新名称 models=a,b usd=10 unlimited=1|0 status=1|2 expired=-1\n可改字段：${Object.keys(TOKEN_FIELDS).join(', ')}（价格用 token price 子命令）` };
+      if (!kv.size) return { ok: false, output: `用法：token set <id> name=新名称 models=a,b usd=10 unlimited=1|0 status=1|2 expired=-1\n可改字段：${Object.keys(TOKEN_FIELDS).join(', ')}` };
       const sets: string[] = [];
       const binds: unknown[] = [];
       for (const [field, raw2] of kv) {
         const def = TOKEN_FIELDS[field];
-        if (!def) return { ok: false, output: `不可修改的字段 "${field}"。可改：${Object.keys(TOKEN_FIELDS).join(', ')}；价格请用 token price` };
+        if (!def) return { ok: false, output: `不可修改的字段 "${field}"。可改：${Object.keys(TOKEN_FIELDS).join(', ')}` };
         const value = def.norm(raw2);
         if (value === null || (typeof value === 'number' && !Number.isFinite(value))) {
           return { ok: false, output: `字段 ${field} 的值 "${raw2}" 非法` };
@@ -423,32 +448,12 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
       await invalidateTokenCache(env, t.key);
       return { ok: true, output: `令牌 #${id} 已删除` };
     }
-    case 'price': {
-      const id = Number(rest[0]);
-      const t = await env.DB.prepare('SELECT * FROM tokens WHERE id = ?').bind(id).first<TokenRow>();
-      if (!t) return { ok: false, output: `令牌 #${rest[0]} 不存在` };
-      const raw2 = rest.slice(1).join(' ');
-      if (!raw2) {
-        const cfg = t.price_config ? JSON.parse(t.price_config) : {};
-        return { ok: true, output: Object.keys(cfg).length ? '```json\n' + JSON.stringify(cfg, null, 2) + '\n```' : '（该令牌没有定制价）' };
-      }
-      let priceJson = '';
-      if (raw2 === '--clear') {
-        priceJson = '';
-      } else {
-        const parsed = JSON.parse(raw2);
-        for (const [model, spec] of Object.entries(parsed)) {
-          const v = validatePriceSpec(spec);
-          if (!v.ok) return { ok: false, output: `模型 ${model} 的价格配置有误：${v.error}` };
-        }
-        priceJson = Object.keys(parsed).length ? JSON.stringify(parsed) : '';
-      }
-      await env.DB.prepare('UPDATE tokens SET price_config = ? WHERE id = ?').bind(priceJson, id).run();
-      await invalidateTokenCache(env, t.key);
-      return { ok: true, output: priceJson ? `令牌 #${id} 定制价已更新` : `令牌 #${id} 定制价已清空` };
-    }
+    case 'price':
+      // Key 级价格已按决策删除（令牌混用渠道 + fallback，在 Key 上定价没有意义）。
+      // 渠道级价格在 channel price —— 引过去，别让人对着报错猜。
+      return { ok: false, output: 'Key 级价格已移除：按渠道定价请用 channel price <渠道ID> [JSON|--clear]（路由到谁就按谁的价）' };
     default:
-      return { ok: false, output: '用法：token list | new <名称> [--usd N|--unlimited] [--models a,b] [--price JSON] | set <id> name=... models=... usd=N | key <id> | on <id> | off <id> | del <id> | price <id> [JSON|--clear]' };
+      return { ok: false, output: '用法：token list | new <名称> [--usd N|--unlimited] [--models a,b] | set <id> name=... models=... usd=N | key <id> | on <id> | off <id> | del <id>' };
   }
 }
 
@@ -480,12 +485,12 @@ async function priceCmd(env: Env, args: string[]): Promise<CliResult> {
           spec.cache_write_5m !== undefined || spec.cache_write_1h !== undefined
             ? `${fmtRate(spec.cache_write_5m)}/${fmtRate(spec.cache_write_1h)}`
             : '—',
-          source === 'key' ? 'key' : source === 'global' ? '覆盖' : source === 'builtin' ? '内置' : '默认',
+          source === 'global' ? '覆盖' : source === 'builtin' ? '内置' : '默认',
         ]);
       }
       return {
         ok: true,
-        output: `${rows.length} 个模型（美元 / 1M tokens；缓存写入=5m/1h）：\n` +
+        output: `${rows.length} 个模型（美元 / 1M tokens；缓存写入=5m/1h；基础价，不含渠道覆盖）：\n` +
           table(['模型', '输入', '输出', '缓存命中', '缓存写入', '来源'], rows),
       };
     }
@@ -493,7 +498,7 @@ async function priceCmd(env: Env, args: string[]): Promise<CliResult> {
       const model = rest[0];
       if (!model) return { ok: false, output: '用法：price get <模型名>' };
       const { spec, source } = resolvePrice(model, options);
-      const sourceLabel = source === 'key' ? 'key' : source === 'global' ? '覆盖' : source === 'builtin' ? '内置' : '默认';
+      const sourceLabel = source === 'global' ? '覆盖' : source === 'builtin' ? '内置' : '默认';
       const parts = [
         `输入 ${fmtRate(spec.in)}`,
         `输出 ${fmtRate(spec.out)}`,
@@ -713,9 +718,11 @@ function helpText(command?: string): string {
       '                                         类型：openai | openai-responses | anthropic | gemini | azure',
       'channel set <id> name=... type=... base_url=... key=... models=a,b priority=N weight=N status=1',
       '                                         按字段修改渠道（改 models 自动重建路由索引）',
-      'channel show <id>                        渠道详情（密钥打码）',
+      'channel show <id>                        渠道详情（密钥打码，含价格覆盖）',
       'channel test <id> [模型]                 直连上游测一个模型（不传 = 列表第一个；必须属于该渠道）',
       'channel pull <id> [--add]                用渠道 key 拉上游 /models；--add 合并进 models（去重）',
+      'channel price <id> [JSON | --clear]      该渠道的价格覆盖（{"请求名":{"in":1,"out":2}}，',
+      '                                         仅此渠道生效；渠道 > 全局 > 内置表；--clear 回到全局价）',
       'channel on <id> / off <id> / del <id>    启用 / 停用 / 删除',
     ].join('\n'),
     billing: [
@@ -725,11 +732,11 @@ function helpText(command?: string): string {
     ].join('\n'),
     token: [
       'token list                               令牌列表',
-      'token new <名称> [--usd N | --unlimited] [--models a,b] [--price {"模型":{"in":1,"out":2}}]',
+      'token new <名称> [--usd N | --unlimited] [--models a,b]',
       'token set <id> name=... models=a,b usd=N unlimited=1|0 status=1|2 expired=<unix>',
       'token key <id>                           显示完整密钥',
       'token on <id> / off <id> / del <id>      启用 / 停用 / 删除',
-      'token price <id> [JSON | --clear]        查看设置清除该 Key 的按模型价格',
+      '（Key 级价格已移除：令牌混用渠道且有 fallback，按渠道定价见 channel price）',
     ].join('\n'),
     price: [
       'price list [过滤]                        价格表（含来源与缓存写 5m/1h 价）',

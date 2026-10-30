@@ -5,12 +5,12 @@ LLM API 中转网关，完整运行在 Cloudflare Workers 上，**不依赖任�
 
 定位：**把个人分散在各平台的 API 整合为一个平台，方便统一调度**——所有渠道进一个池子，
 所有客户端（Claude Code / ChatBox / 任意 OpenAI、Anthropic、Gemini SDK）走同一个入口，
-按 Key 精细定价与限额，用量与健康度一目了然。
+按渠道精细定价、按 Key 限额，用量与健康度一目了然。
 
 设计取向：
 删去了全部倍率、注册登录、多用户体系和平台对接面，改为一把管理员令牌管理的
-**个人 API 聚合**，并把内置价格表外显成可配置的「Key × 模型」价格矩阵，
-支持 new-api 风格的表达式动态计费。
+**个人 API 聚合**，并把内置价格表外显成可配置的「渠道 × 模型」价格矩阵
+（路由到哪个渠道就按哪个渠道的价），支持按字段的费率表达式动态计费。
 
 ## 相比前代改造了什么
 
@@ -104,8 +104,8 @@ curl -X POST https://你的站点/api/cli \
 ```
 
 命令与 REST 完全等价（同一套库函数，不存在两套行为）。规则：命令 = 子命令空格分隔，
-参数用 `key=value`，开关用 `--flag value`；带空格的值用引号包裹（`expr="p * 3"`）；
-JSON 参数原样内联（`--price {"模型":{"in":1}}`）。终端里输入 `help` / `help <分组>` 看同款说明。
+参数用 `key=value`，开关用 `--flag value`；带空格的值用引号包裹（`in="4 * (context > 272k ? 2 : 1)"`）；
+JSON 参数原样内联（`channel price 1 '{"m":{"in":1,"out":2}}'`）。终端里输入 `help` / `help <分组>` 看同款说明。
 
 ### 命令总览
 
@@ -127,19 +127,20 @@ channel set <id> name=... type=... base_url=... key=... models=a,b priority=N we
 channel show <id>                                   详情（密钥打码）
 channel test <id> [模型]                            直连上游测一个模型（不传 = 第一个；必须属于该渠道）
 channel pull <id> [--add]                           用渠道 key 拉上游 /models；--add 合并进 models（去重）
+channel price <id> [JSON | --clear]                 该渠道的价格覆盖（{"请求名":{...}}，仅此渠道生效）
 channel on <id> / off <id> / del <id>               启用 / 停用 / 删除
 
 # 令牌
 token list                                          令牌列表
-token new <名称> [--usd N | --unlimited] [--models a,b] [--price JSON]
+token new <名称> [--usd N | --unlimited] [--models a,b]
 token set <id> name=... models=a,b usd=N unlimited=1|0 status=1|2 expired=<unix>
-                                                    按字段修改（价格用 token price）
+                                                    按字段修改
 token key <id>                                      显示完整密钥
 token on <id> / off <id> / del <id>                 启用 / 停用 / 删除
-token price <id> [JSON | --clear]                   该 Key 的按模型价格（JSON 同全局覆盖形状）
+（没有 Key 级价格：令牌混用渠道且有故障转移，价格跟着渠道走——见 channel price）
 
-# 价格（美元 / 1M tokens；四级优先：Key 覆盖 > 全局覆盖 > 内置表 > 默认价）
-price list [过滤]                价格表（标注来源与缓存写 5m/1h 价）
+# 价格（美元 / 1M tokens；渠道覆盖 > 全局覆盖 > 内置表 > 默认价）
+price list [过滤]                价格表（标注来源与缓存写 5m/1h 价；基础价，不含渠道覆盖）
 price get <模型>                 查一个模型的生效价（表达式截断显示）
 price set <模型> in=X out=Y [cached=Z] [cw5=A] [cw1=B]   常量覆盖；字段也可写费率表达式
 price rm <模型>                  清除覆盖，回到内置价
@@ -164,8 +165,8 @@ opt set RetryTimes=3 SystemName=我的网关            修改配置（JSON 值�
 channel add openai deepseek https://api.deepseek.com sk-ds-xxx --models deepseek-v4-flash,deepseek-v4-pro
 price set deepseek-v4-pro in=1.32 out=3.96 cached=0.044
 price set my-model in="4 * (context > 272k ? 2 : 1)" out=20
+channel price 1 '{"z-ai/glm-5.3-flash":{"in":0,"out":0}}'
 token new 笔记本 --unlimited
-token price 2 {"gpt-4o":{"in":1,"out":2}}
 channel pull 1 --add
 billing check
 ```
@@ -192,17 +193,22 @@ fresh = prompt − 缓存命中 − 写缓存5m − 写缓存1h
   （默认 $1/$3）。后台新增「模型计费」页：每个模型按哪个价计、近 7 天用量、
   缓存命中率、有没有漏配价，一眼看完；总览与健康页有未定价警告横幅。
 
-### 价格的四级优先
+### 价格的优先级：渠道 > 全局 > 内置表 > 兜底
 
-同一个 `(Key, 模型)` 格子的价格，按顺序取第一个命中的：
+同一个模型的价格，按顺序取第一个命中的：
 
-1. **Key 覆盖** —— `tokens.price_config`（JSON：`{ "模型名": PriceSpec }`），
-   在后台「令牌」对话框里编辑；不同 Key 配不同价，就是在这里
+1. **渠道覆盖** —— `channels.price_config`（JSON：`{ "请求名": PriceSpec }`，键是渠道
+   models 里写的名字），后台「渠道」编辑弹窗或 CLI `channel price <id> '...'` 配置；
+   **路由到这个渠道就按它的价**——折扣渠道/免费 NIM 各配各的。同一模型在不同渠道
+   可以不同价（换渠道时预扣自动退旧开新，不会串账）
 2. **全局覆盖** —— `options.ModelPriceOverride`，后台「价格」页编辑
    （`PUT /api/pricing/overrides`，整包替换，逐条校验）
 3. **内置价格表** —— `src/lib/pricing/llm.ts` 的 `PRICE_TABLE`，**精确命中**
    （为什么不是前缀匹配，见下面「名字解析」）
 4. **默认价** —— $1 / $3（严格计费下不生效；价格页可改/可清除）
+
+> **没有 Key 级价格**（曾有，已删）：令牌混用各个渠道、渠道间还会故障转移，
+> 在令牌上定价既不合理也没意义——价格跟着**渠道**走。
 
 `PriceSpec` 的**每个字段**（`in` / `out` / `cached_in` / `cache_write_5m` / `cache_write_1h`）
 独立地是数字常量或费率表达式：
@@ -216,7 +222,7 @@ fresh = prompt − 缓存命中 − 写缓存5m − 写缓存1h
 
 同一个模型在不同提供商那里拼写不同（`claude-opus-5.5` 对官方 `claude-opus-5-5`、
 Azure 部署名 `gpt-35-turbo`、聚合器的 `openai/gpt-4o`）。解析规则（`priceNameCandidates`，
-对 Key 覆盖 / 全局覆盖 / 内置表三层统一生效）：
+对渠道覆盖 / 全局覆盖 / 内置表三层统一生效）：
 
 1. **原名** → **剥厂商前缀**（`ALIAS_PREFIXES`：`openai/` `anthropic/` `google/` `deepseek/`
    `zai/` 等）→ **拼写别名**（`PRICE_ALIASES` 显式映射到规范名，`price aliases` 可查全部）
@@ -419,6 +425,6 @@ curl https://your-worker.example/v1/pricing -H "Authorization: Bearer sk-xxxxx"
 - 38 个适配器压缩为 5 种渠道类型（openai / openai-responses / anthropic / gemini / azure）
 - 移除：注册/登录/多用户/兑换码、分组体系、分组倍率/时段折扣、`/internal/*` 平台对接、
   语音授权窗口计费、多币种钱包、邮箱验证、第三方登录
-- 新增：ADMIN_KEY 单管理员、Key × 模型价格矩阵、表达式计费语言、价格外显与可视化改表、
-  协议翻译器（任一入站方言 × 任一上游方言）、内置命令行（终端页 + `/api/cli`）
+- 新增：ADMIN_KEY 单管理员、渠道 × 模型价格矩阵（价格跟着渠道走）、表达式计费语言、
+  价格外显与可视化改表、协议翻译器（任一入站方言 × 任一上游方言）、内置命令行（终端页 + `/api/cli`）
 - 日志写在 D1，量大时需要定期归档（D1 单库写入吞吐有限）

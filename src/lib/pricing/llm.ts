@@ -183,6 +183,17 @@ export const PRICE_TABLE: Record<string, Price> = {
   'ernie-4.0': { in: 4.3, out: 4.3 },
   'ernie-speed': { in: 0, out: 0 },
 
+  // NVIDIA NIM 渠道上的三个模型（名字如 minimaxai/minimax-m3.1-flash 剥厂商前缀后命中这里）。
+  // MiniMax M3.1 Flash：官方美元价 $0.15/$0.60、缓存读 $0.015、缓存写 $0.15
+  // （platform.minimax.io/docs/pricing/overview）。
+  'minimax-m3.1-flash': { in: 0.15, out: 0.6, cached_in: 0.015 },
+  // Step 5 Preview：StepFun 国际版官方美元价 $1.00/$2.70、缓存读 $0.10
+  // （platform.stepfun.ai/docs/en/guides/pricing/details；国内版是 ¥7/¥0.7/¥20，另一市场）。
+  'step-5-preview': { in: 1, out: 2.7, cached_in: 0.1 },
+  // Muse Glimmer 30B：Meta 开放权重，无厂商牌价；按市场共识价（DeepInfra/OpenRouter
+  // 一致的 $0.30/$1.20、缓存读 $0.04，deepinfra.com/meta-models/Muse-Glimmer-30B/api）。
+  'muse-glimmer-30b': { in: 0.3, out: 1.2, cached_in: 0.04 },
+
   /*
    * Typesafe Jev（OpenRouter Decisions API，见 relay/decisions.ts）。
    *
@@ -288,7 +299,7 @@ function priceNameCandidates(model: string): string[] {
   return out;
 }
 
-export type PriceSource = 'key' | 'global' | 'builtin' | 'default';
+export type PriceSource = 'channel' | 'global' | 'builtin' | 'default';
 
 export interface PriceResolution {
   spec: PriceSpec;
@@ -316,14 +327,12 @@ function lookupBuiltin(model: string): Price | null {
 }
 
 /**
- * 一个名字的整条查价链：候选名逐个走 **Key 覆盖 > 全局覆盖 > 内置表**，
- * 第一个命中即返回（候选名的先后就是解析优先级，见 priceNameCandidates）。
+ * 一个名字的整条查价链：候选名逐个走 **全局覆盖 > 内置表**，第一个命中即返回
+ * （候选名的先后就是解析优先级，见 priceNameCandidates）。渠道覆盖不在这条链里——
+ * 它是**按渠道**生效的，只在 resolveBillableModel 的入口处判定。
  */
-function cascade(model: string, options?: Options, keyOverrides?: OverrideTable): PriceResolution | null {
+function cascade(model: string, options?: Options): PriceResolution | null {
   for (const name of priceNameCandidates(model)) {
-    if (keyOverrides && Object.prototype.hasOwnProperty.call(keyOverrides, name)) {
-      return { spec: keyOverrides[name], source: 'key', canonical: name };
-    }
     const global = options?.ModelPriceOverride;
     if (global && Object.prototype.hasOwnProperty.call(global, name)) {
       return { spec: global[name], source: 'global', canonical: name };
@@ -336,7 +345,7 @@ function cascade(model: string, options?: Options, keyOverrides?: OverrideTable)
 }
 
 /**
- * 查价，**查不到就回 null**（内置表 + 全局覆盖，不含 Key 级）。
+ * 查价，**查不到就回 null**（内置表 + 全局覆盖）。
  *
  * 和 resolvePrice 的区别只有兜底：resolvePrice 永远给得出一个价，于是"这个模型根本
  * 没定价"和"这个模型就是 $1/$3"在调用方看来一模一样。线上因此把 gemini-flash-lite-latest
@@ -348,35 +357,28 @@ export function findPrice(model: string, options?: Options): PriceSpec | null {
 }
 
 /**
- * 查价，四级优先：**Key 覆盖 > 全局覆盖 > 内置表 > 默认价**，名字按候选序列精确解析
+ * 查价（**无渠道维度**的全局视图）：全局覆盖 > 内置表 > 默认价，名字按候选序列精确解析
  * （原名 → 剥厂商前缀 → 别名规范名 → 快照剥离，见 priceNameCandidates）。
  *
- * `upstreamModel` 是渠道 model_mapping 之后的真实模型名。**实际发给上游的那个模型才是
- * 计价真相**，三条规则：
- *   1. 运维在覆盖里给**请求名**显式定的价最优先（对外价是管理员明确的决定）；
- *   2. 否则映射改了名 → **只按上游名查**，查不到就是查不到，绝不退回请求名的表价——
- *      否则 deepseek-v4-flash →（映射）→ 无价的 deepseek/deepseek-v4.1-flash 会被旧价放行；
- *   3. 没有映射 → 按请求名查。
- * 两边最终落到同一个规范名的别名链自然通过。
+ * 实际计费走 resolveBillableModel——它会先问「这个渠道有没有自己的价」。
+ * 这个函数给的是渠道没配价时的落点，也是 /v1/pricing 展示的「基础价」。
  *
- * 同一个模型名，不同的 Key（keyOverrides 来自 `tokens.price_config`）可以有不同的价格；
- * 同一个 Key 里，不同的模型也可以各配各的——这就是「Key × 模型」二维价格矩阵。
+ * `upstreamModel` 是渠道 model_mapping 之后的真实模型名。映射改了名 → 只按上游名查，
+ * 查不到就是查不到，绝不退回请求名的表价——否则 deepseek-v4-flash →（映射）→
+ * 无价的 deepseek/deepseek-v4.1-flash 会被旧价放行。没有映射 → 按请求名查。
  */
 export function resolvePrice(
   model: string,
   options?: Options,
   upstreamModel?: string,
-  keyOverrides?: OverrideTable,
 ): PriceResolution {
-  const adminKey = lookupOverride(keyOverrides, model);
-  if (adminKey) return { spec: adminKey, source: 'key' };
   const adminGlobal = lookupOverride(options?.ModelPriceOverride, model);
   if (adminGlobal) return { spec: adminGlobal, source: 'global' };
   if (upstreamModel && upstreamModel !== model) {
-    const hit = cascade(upstreamModel, options, keyOverrides);
+    const hit = cascade(upstreamModel, options);
     return hit ? { spec: hit.spec, source: hit.source } : { spec: options?.DefaultPrice ?? DEFAULT_PRICE, source: 'default' };
   }
-  const hit = cascade(model, options, keyOverrides);
+  const hit = cascade(model, options);
   return hit ? { spec: hit.spec, source: hit.source } : { spec: options?.DefaultPrice ?? DEFAULT_PRICE, source: 'default' };
 }
 
@@ -411,30 +413,26 @@ export interface BillingIdentity {
 /**
  * 解析计费身份，**查不到价时回 null**（严格计费的 fail-closed 入口）。
  *
- * 与 resolvePrice 的差别只有两点：多带 `via`/命中名（模型计费页与日志要展示），
- * 以及**兜底价在这里显式判定**——`options.DefaultPrice` 未设置时返回 null
- * （请求将被 503 model_price_not_configured 拒绝），设置了则给 default 身份。
- */
-/**
- * 解析计费身份，**查不到价时回 null**（严格计费的 fail-closed 入口）。
- *
- * 与 resolvePrice 同一套三条规则（管理员请求名显式价 > 映射改名只认上游名 > 请求名），
- * 差别只有两点：多带 `via`/命中名（模型计费页与日志要展示），以及**兜底价在这里显式
- * 判定**——`options.DefaultPrice` 未设置时返回 null（请求将被 503
- * model_price_not_configured 拒绝），设置了则给 default 身份。
+ * 优先级（渠道 > 全局 > 内置表；Key 级已按决策删除——令牌混用渠道还有 fallback，
+ * 在 Key 上定价没有意义）：
+ *   1. **渠道覆盖**（`channels.price_config`，按**请求名**的候选序列精确命中）——
+ *      「这家渠道的真实价」：折扣渠道/免费 NIM 各配各的，路由到谁就按谁的价；
+ *   2. 全局覆盖按请求名（管理员明确的对外价）；
+ *   3. 映射改名 → 只按上游名走 全局覆盖 > 内置表；没有映射 → 按请求名走同一条链；
+ *   4. 都没有 → 兜底价（设了）或 null（严格计费 503）。
  */
 export function resolveBillableModel(
   requested: string,
   upstreamModel: string | undefined,
   options?: Options,
-  keyOverrides?: OverrideTable,
+  channelPrices?: OverrideTable,
 ): BillingIdentity | null {
-  const adminKey = lookupOverride(keyOverrides, requested);
-  if (adminKey) return { billingModel: requested, spec: adminKey, source: 'key', via: 'requested' };
+  const channelHit = lookupOverride(channelPrices, requested);
+  if (channelHit) return { billingModel: requested, spec: channelHit, source: 'channel', via: 'requested' };
   const adminGlobal = lookupOverride(options?.ModelPriceOverride, requested);
   if (adminGlobal) return { billingModel: requested, spec: adminGlobal, source: 'global', via: 'requested' };
   const mapped = upstreamModel && upstreamModel !== requested;
-  const hit = cascade(mapped ? upstreamModel! : requested, options, keyOverrides);
+  const hit = cascade(mapped ? upstreamModel! : requested, options);
   if (!hit) {
     if (options?.DefaultPrice) {
       return { billingModel: requested, spec: options.DefaultPrice, source: 'default', via: 'requested' };
@@ -579,11 +577,10 @@ export function calcQuotaDetailed(
   usage: Billable,
   options?: Options,
   upstreamModel?: string,
-  keyOverrides?: OverrideTable,
   now?: Date,
   probes?: ProbeContext,
 ): QuotaDetail {
-  const { spec, source } = resolvePrice(model, options, upstreamModel, keyOverrides);
+  const { spec, source } = resolvePrice(model, options, upstreamModel);
   const params: RateParams = { context: Math.max(0, usage.prompt_tokens), n: usage.n ?? 1 };
   const resolved = resolveRates(spec, params, probes, now);
   if (resolved.ok) {
@@ -611,11 +608,10 @@ export function calcQuota(
   usage: Billable,
   options?: Options,
   upstreamModel?: string,
-  keyOverrides?: OverrideTable,
   now?: Date,
   probes?: ProbeContext,
 ): number {
-  return calcQuotaDetailed(model, usage, options, upstreamModel, keyOverrides, now, probes).quota;
+  return calcQuotaDetailed(model, usage, options, upstreamModel, now, probes).quota;
 }
 
 export function quotaToUSD(quota: number): number {
@@ -633,7 +629,7 @@ const RATE_FIELDS_FOR_VALIDATE: Array<{ key: keyof Price & string; required: boo
 ];
 
 /**
- * 校验一条 PriceSpec（保存 Key 配置 / 全局覆盖 / 内置兜底价时调用）。
+ * 校验一条 PriceSpec（保存渠道覆盖 / 全局覆盖 / 内置兜底价时调用）。
  *
  * 每个字段独立校验：非负有限数字，或**费率表达式**（编译 + 冒烟：拿几组典型
  * 输入长度、探针全缺失、三个时刻实跑，结果必须是有限、非负的数字）。

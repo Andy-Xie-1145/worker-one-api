@@ -52,15 +52,6 @@ export interface TokenRow {
   unlimited_quota: number;
   used_quota: number;
   models: string;
-  /**
-   * 这个 Key 的**按模型价格配置**（JSON 文本，'' = 无覆盖）。
-   *
-   * 形状：`{ "<模型名>": PriceSpec }`，PriceSpec 是固定价
-   * `{"in":美元/1M输入,"out":美元/1M输出,"cached_in"?:...}` 或表达式
-   * `{"expr":"p * 3 + c * 15"}`。查价优先级：Key 覆盖 > 全局覆盖 > 内置表 > 默认价。
-   * 见 lib/pricing/llm.ts 的 resolvePrice()。
-   */
-  price_config: string;
 }
 
 export interface ChannelRow {
@@ -81,6 +72,15 @@ export interface ChannelRow {
   model_mapping: string;
   config: string;
   system_prompt: string;
+  /**
+   * 这个渠道的**按模型价格覆盖**（JSON 文本，'' = 无覆盖）。
+   *
+   * 形状：`{ "<请求名>": PriceSpec }`，PriceSpec 每字段是常量或费率表达式
+   * （见 lib/pricing/llm.ts）。**只按请求名命中**（渠道 models 里声明的那个名字，
+   * 候选序列同全局解析）；查价优先级：渠道覆盖 > 全局覆盖 > 内置表 > 默认价/严格。
+   * （Key 级价格已按决策删除：令牌混用渠道且会 fallback，在 Key 上定价没有意义。）
+   */
+  price_config: string;
 }
 
 export const RoleUser = 1;

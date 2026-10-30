@@ -333,8 +333,7 @@ async function pageTokens(view) {
 
   view.replaceChildren($(`<div class="card">
     <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">令牌</h2><button class="primary" id="new">新建令牌</button></div>
-    ${table(['ID', '名称', '密钥', '状态', '剩余额度', '已用', '过期时间', '模型限制', '定制价', '操作'], rows, (t) => {
-      const pc = (t.price_config && typeof t.price_config === 'object') ? Object.keys(t.price_config).length : 0;
+    ${table(['ID', '名称', '密钥', '状态', '剩余额度', '已用', '过期时间', '模型限制', '操作'], rows, (t) => {
       return `<tr>
       <td>${t.id}</td><td>${esc(t.name)}</td>
       <td><code>sk-${esc(t.key.slice(0, 6))}…</code> <button data-copy="${esc(t.key)}">复制</button></td>
@@ -342,7 +341,6 @@ async function pageTokens(view) {
       <td>${t.unlimited_quota ? '<span class="tag">无限</span>' : usd(t.remain_quota)}</td>
       <td>${usd(t.used_quota)}</td><td>${t.expired_time < 0 ? '永不' : ts(t.expired_time)}</td>
       <td class="mono">${esc(t.models || '全部')}</td>
-      <td>${pc ? pc + ' 项' : '—'}</td>
       <td><button data-edit="${t.id}">编辑</button> <button class="danger" data-del="${t.id}">删除</button></td></tr>`;
     })}
   </div>`));
@@ -357,13 +355,11 @@ async function pageTokens(view) {
     <label><input type="checkbox" id="unl" style="width:auto" ${t.unlimited_quota ? 'checked' : ''}> 无限额度</label>
     <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
     <label>可用模型（逗号分隔，留空表示全部）</label><input id="models" value="${esc(t.models || '')}">
-    <label>价格配置（可选 JSON）</label>
-    <textarea id="price_config" placeholder='{"my-model":{"in":1.32,"out":3.96,"cached_in":0.044},"long-ctx":{"in":"4*(context>272k?2:1)"}}'>${t.price_config ? esc(JSON.stringify(t.price_config, null, 2)) : ''}</textarea>
-    <p class="muted" style="margin:4px 0 0">同一模型在此 Key 上的价格覆盖全局价格覆盖与内置价格表。留空 = 不修改（新建时留空 = 不配置）；提交 <code>{}</code> 表示清空。</p>
+    <p class="muted" style="margin:4px 0 0">价格按<b>渠道</b>配置（渠道页「价格覆盖」）——令牌混用渠道且有故障转移，在令牌上定价没有意义。</p>
     ${t.id ? `<label>状态</label><select id="status"><option value="1"${t.status === 1 ? ' selected' : ''}>启用</option><option value="2"${t.status === 2 ? ' selected' : ''}>禁用</option></select>` : ''}`;
 
   const collect = (dlg) => {
-    const body = {
+    return {
       name: val(dlg, 'name') || '默认令牌',
       remain_quota: Math.round((parseFloat(val(dlg, 'quota')) || 0) * QUOTA_PER_USD),
       unlimited_quota: dlg.querySelector('#unl').checked,
@@ -371,14 +367,6 @@ async function pageTokens(view) {
       models: val(dlg, 'models').trim(),
       ...(dlg.querySelector('#status') ? { status: Number(val(dlg, 'status')) } : {}),
     };
-    const raw = val(dlg, 'price_config').trim();
-    if (raw) {
-      let pc;
-      try { pc = JSON.parse(raw); } catch { throw new Error('价格配置不是合法 JSON'); }
-      if (!pc || typeof pc !== 'object' || Array.isArray(pc)) throw new Error('价格配置必须是 JSON 对象');
-      body.price_config = pc; // 编辑：缺省字段 = 不修改，{} = 清空；新建：留空即无
-    }
-    return body;
   };
 
   document.getElementById('new').onclick = () => dialog('新建令牌', form(), async (dlg) => {
@@ -438,6 +426,9 @@ async function pageChannels(view) {
       <div><label>状态</label><select id="status"><option value="1"${ch.status === 1 ? ' selected' : ''}>启用</option><option value="2"${ch.status === 2 ? ' selected' : ''}>禁用</option></select></div>
     </div>
     <label>模型重定向 JSON（可选，如 {"gpt-4":"gpt-4o"}）</label><textarea id="model_mapping">${esc(ch.model_mapping || '')}</textarea>
+    <label>价格覆盖 JSON（可选，仅本渠道生效：渠道价 &gt; 全局覆盖 &gt; 内置表）</label>
+    <textarea id="price_config" placeholder='{"glm-5.3-flash":{"in":0.15,"out":0.5,"cached_in":0.03},"my-model":{"in":"4*(context>272k?2:1)","out":20}}'>${ch.price_config && typeof ch.price_config === 'object' ? esc(JSON.stringify(ch.price_config, null, 2)) : ''}</textarea>
+    <p class="muted" style="margin:4px 0 0">键是<b>模型列表里写的名字</b>（请求名）；路由到本渠道就按这里的价。留空 = 不修改（新建时留空 = 无覆盖）；提交 <code>{}</code> 表示清空。</p>
     <label>渠道额外配置 JSON（可选，如 {"api_version":"2024-10-21"}）</label><textarea id="config">${esc(ch.config || '')}</textarea>
     <label>系统提示词（可选，注入到每个请求）</label><textarea id="system_prompt">${esc(ch.system_prompt || '')}</textarea>`;
 
@@ -507,7 +498,7 @@ async function pageChannels(view) {
       const v = val(dlg, f).trim();
       if (v) { try { JSON.parse(v); } catch { throw new Error(`${f} 不是合法 JSON`); } }
     }
-    return {
+    const body = {
       name: val(dlg, 'name'), type: val(dlg, 'type'), key: val(dlg, 'key'),
       base_url: val(dlg, 'base_url').trim(), models: val(dlg, 'models').trim(),
       priority: Number(val(dlg, 'priority')) || 0, weight: Number(val(dlg, 'weight')) || 1,
@@ -515,6 +506,15 @@ async function pageChannels(view) {
       model_mapping: val(dlg, 'model_mapping').trim(), config: val(dlg, 'config').trim(),
       system_prompt: val(dlg, 'system_prompt'),
     };
+    // 价格覆盖：留空 = 不修改（新建时 = 无覆盖）；有内容 = JSON 对象整包提交（{} = 清空）。
+    const raw = val(dlg, 'price_config').trim();
+    if (raw) {
+      let pc;
+      try { pc = JSON.parse(raw); } catch { throw new Error('价格覆盖不是合法 JSON'); }
+      if (!pc || typeof pc !== 'object' || Array.isArray(pc)) throw new Error('价格覆盖必须是 JSON 对象');
+      body.price_config = pc;
+    }
+    return body;
   };
 
   document.getElementById('new').onclick = () => {
@@ -645,7 +645,7 @@ async function loadPricing(view) {
         <input id="q" placeholder="按模型名过滤…" style="width:200px">
         <label style="margin:0"><input type="checkbox" id="coveredOnly" style="width:auto"> 仅看已覆盖</label>
       </div>
-      <p class="muted" style="margin:0 0 10px">生效价优先级：令牌 price_config &gt; 全局覆盖（标「已覆盖」）&gt; 内置表（标「内置」）。
+      <p class="muted" style="margin:0 0 10px">生效价优先级：渠道价格覆盖（渠道页配置，仅该渠道生效）&gt; 全局覆盖（标「已覆盖」）&gt; 内置表（标「内置」）&gt; 兜底价/严格计费。
       前缀别名：${aliases.length ? aliases.map((a) => `<code>${esc(a)}</code>`).join('、') + ' —— 请求的模型名命中前缀时先剥掉前缀再查表' : '无'}。
       内部额度：1 美元 = ${p.quota_per_usd ?? QUOTA_PER_USD} quota。保存为<b>整包替换</b>：与内置值相同的行、被删除的行都会从覆盖里清除。</p>
       <div id="tbl"></div>
@@ -825,7 +825,7 @@ async function loadPricing(view) {
 
 // ---------------------------------------------------------------- 模型计费
 
-const BILLING_SRC = { table: '内置', alias: '别名', mapping: '映射', override: '全局', key: 'Key', default: '兜底' };
+const BILLING_SRC = { table: '内置', alias: '别名', mapping: '映射', override: '全局', channel: '渠道', default: '兜底' };
 let billingFilter = { q: '', unconfOnly: false };
 
 async function pageModelBilling(view) {

@@ -23,8 +23,8 @@ export interface Options {
    */
   HealthEventsEnabled: boolean;
   /**
-   * 全局模型价格覆盖：`模型名 → PriceSpec`（固定价或表达式），美元 / 百万 tokens。
-   * 查价优先级：**Key 覆盖（tokens.price_config）> 全局覆盖 > 内置价格表 > 默认价**。
+   * 全局模型价格覆盖：`模型名 → PriceSpec`（常量或费率表达式），美元 / 百万 tokens。
+   * 查价优先级：**渠道覆盖（channels.price_config）> 全局覆盖 > 内置价格表 > 默认价**。
    * 编辑入口：后台「价格」页（PUT /api/pricing/overrides，带校验）。
    */
   ModelPriceOverride: Record<string, PriceSpec>;

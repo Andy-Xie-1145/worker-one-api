@@ -15,7 +15,7 @@ import {
   LLM_PRICING_VERSION, QUOTA_PER_USD, resolveBillableModel, strictBillingEnabled, stripAliasPrefix,
   type BillingIdentity, type Price, type RateSpec,
 } from './pricing/llm';
-import { csv, mapModel } from './channel';
+import { csv, mapModel, parseChannelPriceConfig } from './channel';
 import type { Options } from './options';
 import type { ChannelRow } from '../types';
 
@@ -24,7 +24,7 @@ export const MODEL_BILLING_WINDOW_DAYS = 7;
 /**
  * 价格来源，按页面上的说法：内置价格表 / 别名 / 渠道映射 / 全局覆盖 / Key 覆盖 / 兜底价。
  */
-export type PriceSourceLabel = 'table' | 'alias' | 'mapping' | 'override' | 'key' | 'default';
+export type PriceSourceLabel = 'table' | 'alias' | 'mapping' | 'override' | 'channel' | 'default';
 
 /** 列表价视图：字段原样透传（数字或费率表达式），expr_fields 标出哪些是表达式。 */
 export type PriceView = Price & { expr_fields: string[] };
@@ -39,13 +39,13 @@ export interface ResolvedView {
   via: 'requested' | 'upstream' | null;
 }
 
-/** 请求名 + 上游名 → 价格视图。默认实现见 resolvePriceView，测试可以替换。 */
-export type PriceResolver = (requested: string, upstream: string, options: Options) => ResolvedView;
+/** 请求名 + 上游名 + 渠道价格覆盖 → 价格视图。默认实现见 resolvePriceView，测试可以替换。 */
+export type PriceResolver = (requested: string, upstream: string, options: Options, channelPrices?: Record<string, Price>) => ResolvedView;
 
 const UNCONFIGURED: ResolvedView = { configured: false, price: null, billingModel: null, source: null, via: null };
 
 function labelOf(identity: BillingIdentity, requested: string): PriceSourceLabel {
-  if (identity.source === 'key') return 'key';
+  if (identity.source === 'channel') return 'channel';
   if (identity.source === 'global') return 'override';
   if (identity.source === 'default') return 'default';
   // 内置表：按映射后的上游名命中 = 渠道映射在起作用；请求名剥过厂商前缀才命中 = 别名；其余 = 直接命中内置表。
@@ -67,8 +67,8 @@ function exprFieldsOf(price: Price): string[] {
   return EXPR_FIELDS.filter((f) => typeof rec[f.key as string] === 'string').map((f) => f.label);
 }
 
-export function resolvePriceView(requested: string, upstream: string, options: Options): ResolvedView {
-  const identity = resolveBillableModel(requested, upstream, options);
+export function resolvePriceView(requested: string, upstream: string, options: Options, channelPrices?: Record<string, Price>): ResolvedView {
+  const identity = resolveBillableModel(requested, upstream, options, channelPrices);
   if (!identity) return UNCONFIGURED;
   return {
     configured: true,
@@ -192,7 +192,7 @@ export interface ModelBillingReport {
 }
 
 export interface ModelBillingInput {
-  channels: Array<Pick<ChannelRow, 'id' | 'name' | 'type' | 'status' | 'models' | 'model_mapping' | 'priority'>>;
+  channels: Array<Pick<ChannelRow, 'id' | 'name' | 'type' | 'status' | 'models' | 'model_mapping' | 'priority' | 'price_config'>>;
   usage: UsageRow[];
   options: Options;
   now: number;
@@ -273,7 +273,7 @@ export function buildModelBilling(input: ModelBillingInput): ModelBillingReport 
     for (const [channelId, { declared }] of chans) {
       const ch = channelById.get(channelId);
       const upstream = ch ? mapModel(ch as ChannelRow, model) : model;
-      const view = resolve(model, upstream, input.options);
+      const view = resolve(model, upstream, input.options, ch ? parseChannelPriceConfig(ch) : undefined);
       const u = usageBy.get(key(model, channelId)) ?? { ...emptyUsage(), model_name: model, channel_id: channelId };
       addUsage(total, u);
       const entry: ChannelEntry = {
@@ -378,7 +378,7 @@ export function usageSQL(withMeta: boolean): string {
 }
 
 /** 渠道只取计费页要的列，key / base_url / config 一个字节都不读。 */
-export const CHANNELS_SQL = 'SELECT id, name, type, status, models, model_mapping, priority FROM channels';
+export const CHANNELS_SQL = 'SELECT id, name, type, status, models, model_mapping, priority, price_config FROM channels';
 
 export async function loadModelBilling(
   db: D1Database,
@@ -420,15 +420,17 @@ export function fallbackActive(options?: Options): boolean {
 
 /**
  * 找出启用渠道上查不到价的 (渠道, 模型) 组合——严格计费下这些组合会以
- * model_price_not_configured 拒绝，部署前必须清零（审计脚本与 CLI 的 `billing check`）。
+ * model_price_not_configured 拒绝（该渠道被跳过），部署前必须清零
+ * （审计脚本与 CLI 的 `billing check`）。渠道自己的价格覆盖算「有价」。
  */
 export function findUnpricedChannelModels(channels: ChannelRow[], options?: Options): UnpricedRow[] {
   const out: UnpricedRow[] = [];
   for (const channel of channels) {
     if (channel.status !== 1) continue;
+    const channelPrices = parseChannelPriceConfig(channel);
     for (const requested of (channel.models ?? '').split(',').map((m) => m.trim()).filter(Boolean)) {
       const upstream = mapModel(channel, requested);
-      if (!resolveBillableModel(requested, upstream, options)) {
+      if (!resolveBillableModel(requested, upstream, options, channelPrices)) {
         out.push({ channelId: channel.id, channelName: channel.name, channelType: channel.type, requested, upstream });
       }
     }

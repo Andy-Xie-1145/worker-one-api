@@ -12,7 +12,6 @@ import {
 } from '../types';
 import { timingSafeEqual } from './crypto';
 import { applyCredit } from './ledger';
-import type { PriceSpec } from './pricing/llm';
 
 // ---------------------------------------------------------------- 管理面：唯一管理员令牌
 
@@ -169,19 +168,5 @@ export async function invalidateTokenCache(env: Env, key: string): Promise<void>
     await env.CACHE.delete(`token:${key}`);
   } catch {
     // KV 故障时静默——TTL 到期自然一致。
-  }
-}
-
-/**
- * 解析令牌上的按模型价格配置（`tokens.price_config`，JSON 文本）。
- * 缺失、空串或损坏都返回空对象——坏配置只会失去覆盖效果，不会让请求失败。
- */
-export function parseTokenPriceConfig(token: TokenRow): Record<string, PriceSpec> {
-  if (!token.price_config) return {};
-  try {
-    const parsed = JSON.parse(token.price_config);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
   }
 }

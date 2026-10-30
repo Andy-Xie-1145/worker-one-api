@@ -136,10 +136,12 @@ test('表达式字段的 expr_fields 与特殊规则', () => {
   assert.ok(priceRules({ in: 1, out: 0 }).includes('输出不计费'));
 });
 
-test('usageSQL：带/不带 billing_meta 两版；CHANNELS_SQL 不取 key/base_url/config', () => {
+test('usageSQL：带/不带 billing_meta 两版；CHANNELS_SQL 不取 key/base_url/渠道config', () => {
   assert.ok(usageSQL(true).includes('json_valid(billing_meta)'));
   assert.ok(!usageSQL(false).includes('billing_meta'));
-  assert.ok(!/key|base_url|config/i.test(CHANNELS_SQL.replace(/model_mapping/, '')));
+  // price_config 是渠道价格覆盖（计费要用的白名单字段），不算泄露；
+  // key / base_url / config（渠道密钥配置）一个字都不许取。
+  assert.ok(!/key|base_url|config/i.test(CHANNELS_SQL.replace(/model_mapping|price_config/g, '')));
 });
 
 test('resolvePriceView：未配置视图的形状', () => {

@@ -44,7 +44,7 @@ export function isDecisionOnlyModel(model: string, options?: Options, channelDec
 }
 
 /**
- * `decisions` 类型渠道声明出的决策模型全集：只挂在 decisions 类型启用渠道上、
+ * `decisions` / `systemone` 类型渠道声明出的决策模型全集：只挂在这两类启用渠道上、
  * 且不在任何启用 chat 渠道上的模型（两边都挂的模型两扇门都开）。
  *
  * 一条聚合 SQL 拿全量；查询失败按空集处理（分诊退回静态规则，不拦请求）。
@@ -53,8 +53,8 @@ export async function channelDeclaredDecisionOnly(env: Env): Promise<Set<string>
   try {
     const rows = await env.DB.prepare(
       `SELECT a.model AS model,
-              MAX(CASE WHEN c.type = 'decisions' THEN 1 ELSE 0 END) AS on_decision,
-              MAX(CASE WHEN c.type <> 'decisions' THEN 1 ELSE 0 END) AS on_chat
+              MAX(CASE WHEN c.type IN ('decisions', 'systemone') THEN 1 ELSE 0 END) AS on_decision,
+              MAX(CASE WHEN c.type NOT IN ('decisions', 'systemone') THEN 1 ELSE 0 END) AS on_chat
          FROM abilities a JOIN channels c ON c.id = a.channel_id
         WHERE a.enabled = 1 AND c.status = 1
         GROUP BY a.model`,

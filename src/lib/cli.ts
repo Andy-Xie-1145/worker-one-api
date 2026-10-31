@@ -18,7 +18,7 @@ import { TokenStatusEnabled, TokenStatusDisabled, ChannelStatusEnabled, ChannelS
 /** channel set 允许修改的字段 → 归一化（返回 null 表示值非法）。 */
 const CHANNEL_FIELDS: Record<string, (v: string) => unknown> = {
   name: (v) => v,
-  type: (v) => ['openai', 'openai-responses', 'anthropic', 'gemini', 'azure', 'decisions'].includes(v) ? v : null,
+  type: (v) => ['openai', 'openai-responses', 'anthropic', 'gemini', 'azure', 'decisions', 'systemone'].includes(v) ? v : null,
   base_url: (v) => v,
   key: (v) => v,
   models: (v) => v,
@@ -215,7 +215,7 @@ async function channelCmd(env: Env, args: string[]): Promise<CliResult> {
       const flags = flagsOf(rest);
       const models = flags.get('--models') ?? '';
       if (!type || !name || !models) {
-        return { ok: false, output: '用法：channel add <类型:openai|openai-responses|anthropic|gemini|azure|decisions> <名称> <base_url> <api_key> --models m1,m2 [--priority 0] [--weight 1]（decisions = Decision API，模型自动按决策模型计）' };
+        return { ok: false, output: '用法：channel add <类型:openai|openai-responses|anthropic|gemini|azure|decisions|systemone> <名称> <base_url> <api_key> --models m1,m2 [--priority 0] [--weight 1]（decisions/systemone = 决策接口，模型自动按决策模型计）' };
       }
       await env.DB.prepare(
         'INSERT INTO channels (type, key, status, name, weight, priority, created_time, base_url, models) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -746,8 +746,12 @@ function helpText(command?: string): string {
     '    anthropic        = Anthropic Messages',
     '    gemini           = Google Gemini',
     '    azure            = Azure OpenAI',
-    '    decisions        = Decision API（出站默认 /decide；渠道里的模型全部自动视为',
-    '                       决策模型，只能经 POST /v1/decisions 调用）',
+    '    decisions        = Decision API（OpenAI 方言：input + questions 数组；',
+    '                       出站 /v1/decisions，模型 gpt-6-luna 等）',
+    '    systemone        = System One（TypeSafe 方言：state + questions 对象；',
+    '                       出站 /v1/systemone，模型 jev-latest 等）',
+    '                       这两类渠道的模型全部自动视为决策模型（POST /v1/decisions 调用），',
+    '                       且网关在两种方言间自动翻译——任一方言的客户端可调任意上游',
     '  priority 大者优先路由；weight 是同优先级内的随机权重。',
     '  例：channel add openai deepseek https://api.deepseek.com sk-xxx --models deepseek-v4-pro --priority 5',
     '',
@@ -795,15 +799,20 @@ function helpText(command?: string): string {
     '    no_stream_options     true = 流式请求不追加 stream_options.include_usage',
     '    例：channel set 3 config=\'{"api_version":"2024-10-01","extra_headers":{"x-title":"claude-code"}}\'',
     '',
-    '  ※ 决策模型（Decision API）推荐用专用类型 decisions：',
-    '    channel add decisions mydec https://dec.example.com sk-xxx --models decide-x,decide-y',
-    '    · 出站路径默认 /decide，直接拼在 base_url 后（无自动 /v1）；各家路径不统一，',
-    '      用 config.decisions_path 改：channel set <id> config=\'{"decisions_path":"systemone"}\'',
-    '      （上游带 /v1 时把 base_url 写到 …/v1，或路径写 v1/systemone）',
-    '    · 渠道里的模型全部自动视为决策模型（客户端走 POST /v1/decisions），无需声明。',
-    '    兼容方式：openai 类型渠道也可承载（OpenRouter 主机白名单自动启用；其他上游',
-    '    config 写 {"decisions":true} 或 {"decisions_path":"..."}），但模型需在',
-    '    「设置 → 仅决策接口的模型」声明（例：opt set DecisionOnlyModels=["foo/decide-x"]；',
+    '  ※ 决策接口（Decision API / System One 是两种方言，网关自动翻译）：',
+    '    channel add decisions oai-dec https://api.openai.com sk-xxx --models gpt-6-luna',
+    '    channel add systemone jev https://api.typesafe.ai sk-xxx --models jev-latest',
+    '    · 出站默认路径：decisions→v1/decisions，systemone→v1/systemone（直接拼 base_url，',
+    '      无自动 /v1）；不统一的上游用 config.decisions_path 改：',
+    '      channel set <id> config=\'{"decisions_path":"custom/decide"}\'',
+    '    · 渠道里的模型自动按决策模型分诊（客户端 POST /v1/decisions；入站方言按',
+    '      state/input 自动识别并翻译到上游方言，answers 双向翻回）。',
+    '    · 计价提示：gpt-6-luna 走决策接口输出免费（$0.10/M 输入、缓存 $0.01），与 chat',
+    '      行不同价——在决策渠道上配渠道价：',
+    '      channel price <id> \'{"gpt-6-luna":{"in":0.1,"out":0,"cached_in":0.01}}\'',
+    '    兼容方式：openai 类型渠道也可承载 TypeSafe 方言决策（OpenRouter 主机白名单',
+    '    自动启用；其他上游 config 写 {"decisions":true} 或 {"decisions_path":"..."}），',
+    '    但模型需在「设置 → 仅决策接口的模型」声明（例：opt set DecisionOnlyModels=["foo/x"]；',
     '    内置规则自动识别 jev 前缀）。',
   ].join('\n');
 

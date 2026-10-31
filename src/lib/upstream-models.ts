@@ -73,7 +73,8 @@ async function listByType(input: UpstreamListingInput): Promise<string[]> {
   switch (input.type) {
     case 'openai':
     case 'openai-responses':
-    case 'decisions': {
+    case 'decisions':
+    case 'systemone': {
       // OpenAI 形状：GET /v1/models（Bearer）。decisions 类型上游若也有 /v1/models
       // 就直接用；没有的厂商手填模型名即可（拉取失败不影响渠道本身）。
       // base 已带 /v1 时不重复加前缀（与 relay 的 apiPrefix 行为一致）。

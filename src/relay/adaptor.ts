@@ -41,6 +41,14 @@ export interface AdaptorContext {
   /** Path suffix after /v1, e.g. "chat/completions". */
   path: string;
   config: Record<string, any>;
+  /**
+   * decisions 方言三元组（mode='decisions' 时由 relay 填，adaptor 消费）：
+   * from = 客户端方言，to = 上游方言，keys = 请求翻译记录的问题键序
+   * （answers 回翻用）。见 relay/decisions-translate.ts。
+   */
+  decisionsFrom?: import('./decisions-translate').DecisionsDialect;
+  decisionsTo?: import('./decisions-translate').DecisionsDialect;
+  decisionsKeys?: string[] | null;
 }
 
 export interface Adaptor {

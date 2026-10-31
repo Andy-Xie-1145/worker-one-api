@@ -2,6 +2,7 @@ import type { Usage } from '../lib/billing';
 import type { ChannelRow } from '../types';
 import { type AdaptorContext, type BuiltRequest, type ChatRequest, joinURL } from './adaptor';
 import { estimateTokens } from './sse';
+import { translateDecisionsRequest, translateDecisionsResponse } from './decisions-translate';
 
 /**
  * OpenRouter Decisions API（Jev）。
@@ -17,14 +18,16 @@ import { estimateTokens } from './sse';
 export const DECISIONS_PATH = 'alpha/decisions';
 
 /**
- * `decisions` 渠道类型的默认出站路径。
+ * `decisions`（OpenAI 方言）与 `systemone`（TypeSafe 方言）类型的默认出站路径。
  *
- * Decision API 的路径各用各的（/decide、/systemone、/decision…），没有统一约定，
- * 所以这个默认只是个起点——用 `config.decisions_path` 改成上游的真实路径。
- * 路径**直接拼在 base_url 后**（buildDecisionsRequest 不走 apiPrefix，无自动 /v1）：
- * 上游是 https://host/v1/decide 就把 base_url 写到 …/v1，或路径写 v1/decide。
+ * Decision API 的路径各家并不统一，默认值来自两家的官方文档（2026-11-01 核对）：
+ * OpenAI Decisions = /v1/decisions，TypeSafe System One = /v1/systemone；
+ * 不一样的上游用 `config.decisions_path` 改。路径**直接拼在 base_url 后**
+ * （buildDecisionsRequest 不走 apiPrefix，无自动 /v1）：上游是
+ * https://host/custom/decide 就把 base_url 或路径写全。
  */
-export const DEFAULT_DECISIONS_TYPE_PATH = 'decide';
+export const OPENAI_DECISIONS_PATH = 'v1/decisions';
+export const SYSTEMONE_PATH = 'v1/systemone';
 
 /**
  * 默认认得 Decisions 的上游主机。
@@ -95,11 +98,11 @@ export function decisionsSupport(
   channel: ChannelRow,
   config: Record<string, any>,
 ): { ok: true; path: string } | { ok: false; reason: string } {
-  // 专用类型自带声明：路径默认 /decide，config.decisions_path 可改（各家的
-  // Decision API 路径并不统一）。
-  if (channel.type === 'decisions') {
+  // 专用类型自带声明：默认路径来自各家官方文档，config.decisions_path 可改。
+  if (channel.type === 'decisions' || channel.type === 'systemone') {
     const custom = typeof config?.decisions_path === 'string' ? config.decisions_path.trim() : '';
-    return { ok: true, path: custom ? custom.replace(/^\/+/, '') : DEFAULT_DECISIONS_TYPE_PATH };
+    const fallback = channel.type === 'decisions' ? OPENAI_DECISIONS_PATH : SYSTEMONE_PATH;
+    return { ok: true, path: custom ? custom.replace(/^\/+/, '') : fallback };
   }
   const explicit = config?.decisions_path;
   if (typeof explicit === 'string' && explicit.trim()) return { ok: true, path: explicit.trim().replace(/^\/+/, '') };
@@ -121,10 +124,11 @@ function hostOf(baseURL: string): string | null {
 }
 
 /**
- * 构造上游 Decisions 请求。
- *
- * 只改 model（套用渠道的 model_mapping）。`stream_options` 是防御性剥除——带
- * `stream: true` 的请求在 handleRelay 里已经被 400 挡掉了，这里不做任何静默改写。
+ * 构造上游 Decisions 请求：先按渠道方言翻译（state↔input、questions 对象↔数组、
+ * noul↔predicate、criteria↔options，未知字段透传），再套 model_mapping 改 model。
+ * 翻译记录的键序写回 ctx.decisionsKeys，answers 回翻用它。
+ * `stream_options` 是防御性剥除——带 `stream: true` 的请求在 handleRelay 里已经
+ * 被 400 挡掉了，这里不做任何静默改写。
  */
 export function buildDecisionsRequest(
   req: ChatRequest,
@@ -133,6 +137,15 @@ export function buildDecisionsRequest(
   headers: Record<string, string>,
 ): BuiltRequest {
   const { stream_options: _streamOptions, ...rest } = req as Record<string, unknown>;
-  const body = { ...rest, model: ctx.upstreamModel };
+  const from = ctx.decisionsFrom ?? 'systemone';
+  const to = ctx.decisionsTo ?? 'systemone';
+  const translated = translateDecisionsRequest(rest, from, to);
+  ctx.decisionsKeys = translated.keys;
+  const body = { ...translated.body, model: ctx.upstreamModel };
   return { url: joinURL(base, ctx.path), headers, body: JSON.stringify(body) };
+}
+
+/** 上游 Decisions 响应 → 客户端方言（answers 数组↔对象按键序回翻；usage 另算）。 */
+export function convertDecisionsResponse(json: any, ctx: AdaptorContext): unknown {
+  return translateDecisionsResponse(json, ctx.decisionsTo ?? 'systemone', ctx.decisionsFrom ?? 'systemone', ctx.decisionsKeys ?? null);
 }

@@ -30,6 +30,7 @@ import {
   newGeminiEncoder, encodeGeminiChunk, finishGeminiStream, geminiErrorEvent,
 } from '../relay/gemini-inbound';
 import { filterByCapability, isDecisionOnlyModel, channelDeclaredDecisionOnly } from '../lib/capability';
+import { detectDecisionsDialect, decisionsDialectOf } from '../relay/decisions-translate';
 import {
   type AnthropicRequest,
   anthropicToChatRequest,
@@ -294,6 +295,11 @@ async function handleRelay(
     return fail(`模型 ${requestedModel} 只支持决策接口，请改用 POST /v1/decisions`, 'invalid_request_error', 400);
   }
   /*
+   * 入站决策方言：state = TypeSafe（System One），input = OpenAI（Decisions）。
+   * 识别不了（两种主字段都没有）按不翻译透传——attemptUpstream 里 from=to。
+   */
+  const decisionsDialect = mode === 'decisions' ? detectDecisionsDialect(body) : undefined;
+  /*
    * Decisions 不是流式接口，`stream: true` 就是调用错误，明说。
    *
    * 早先这里是静默 `delete body.stream`。那样请求确实能成，但客户端会一直以为自己
@@ -515,7 +521,7 @@ async function handleRelay(
 
     const attemptStarted = Date.now();
     const result = await attemptUpstream(c, {
-      channel, body, requestedModel, mode, path, token, user, options, reservation, started, protocol,
+      channel, body, requestedModel, mode, path, token, user, options, decisionsDialect, reservation, started, protocol,
     });
     if (result.kind === 'ok') {
       // 成功即清掉退避计数，否则偶发限流会让这个渠道一直踩着上次的档位往上爬
@@ -641,6 +647,8 @@ interface AttemptArgs {
   token: TokenRow;
   user: UserRow;
   options: Options;
+  /** 入站决策方言（state=systemone / input=openai）；null = 不翻译透传。 */
+  decisionsDialect?: 'systemone' | 'openai' | null;
   /** 已钉住的预扣：金额、计费身份、费率与一对 pre/fin ref，见 handleRelay 那段注释。 */
   reservation: {
     amount: number;
@@ -688,15 +696,18 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
       const message = `渠道 ${channel.name} 不支持决策接口：${support.reason}`;
       return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
     }
-    // 路径由渠道决定（decisions 类型默认 /decide，config.decisions_path 可覆盖）。
+    // 路径由渠道决定（decisions→/v1/decisions、systemone→/v1/systemone，config.decisions_path 可覆盖）。
     ctx.path = support.path;
-  } else if (channel.type === 'decisions') {
+    // 方言：入站识别不了（null）就按上游方言处理 = 不翻译透传。
+    ctx.decisionsTo = decisionsDialectOf(channel);
+    ctx.decisionsFrom = args.decisionsDialect ?? ctx.decisionsTo;
+  } else if (channel.type === 'decisions' || channel.type === 'systemone') {
     /*
      * Decision API 渠道只承接决策请求。正常情况下到不了这里——它的模型在分诊层
      * 就已按决策模型拦下 chat；这条守卫是给「模型同时挂在 chat 渠道」的边角：
      * 500 = 跳过此渠道继续换下一个，而不是把整条路径打死。
      */
-    const message = `渠道 ${channel.name} 是 Decision API 渠道，只承接 POST /v1/decisions`;
+    const message = `渠道 ${channel.name} 是决策专用渠道（${channel.type}），只承接 POST /v1/decisions`;
     return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
   }
 

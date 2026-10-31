@@ -1,7 +1,7 @@
 import { type Adaptor, type AdaptorContext, type ChatRequest, type StreamState, joinURL } from './adaptor';
 import type { Usage } from '../lib/billing';
 import { estimateTokens } from './sse';
-import { buildDecisionsRequest, normalizeDecisionsUsage } from './decisions';
+import { buildDecisionsRequest, convertDecisionsResponse, normalizeDecisionsUsage } from './decisions';
 
 /**
  * Generic OpenAI-compatible adaptor. Covers OpenAI itself plus every vendor
@@ -38,12 +38,12 @@ export const openaiAdaptor: Adaptor = {
 
   convertResponse(json: any, ctx: AdaptorContext) {
     /*
-     * Decisions 响应原样回给客户端。
-     *
-     * 连 model 字段都不改写：客户端要的是 OpenRouter 的那份 JSON，任何"顺手规整
-     * 一下"都会让它和上游文档对不上，而这个接口还在 alpha，形状随时会加字段。
+     * Decisions 响应翻回客户端方言（state/input 两族的外壳字段原样，answers
+     * 按请求翻译记录的键序数组↔对象），usage 从上游原始 JSON 解析。
+     * 连 model 字段都不改写：客户端要的是上游那份语义，任何"顺手规整一下"
+     * 都会让它和上游文档对不上，而这族接口还在快速演化。
      */
-    if (ctx.mode === 'decisions') return { body: json, usage: normalizeDecisionsUsage(json?.usage) };
+    if (ctx.mode === 'decisions') return { body: convertDecisionsResponse(json, ctx), usage: normalizeDecisionsUsage(json?.usage) };
     const usage: Usage = normalizeUsage(json?.usage);
     if (json && typeof json === 'object' && json.model) json.model = ctx.requestedModel;
     return { body: json, usage };

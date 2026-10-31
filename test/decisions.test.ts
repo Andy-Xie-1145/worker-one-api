@@ -128,7 +128,7 @@ function makeDB(w: World) {
         const ch = w.channels.find((c: any) => c.id === a.channel_id);
         if (!ch || ch.status !== 1) continue;
         const e = rows.get(a.model) ?? { d: 0, c: 0 };
-        if (ch.type === 'decisions') e.d = 1; else e.c = 1;
+        if (ch.type === 'decisions' || ch.type === 'systemone') e.d = 1; else e.c = 1;
         rows.set(a.model, e);
       }
       return { results: [...rows].map(([model, e]) => ({ model, on_decision: e.d, on_chat: e.c })) };
@@ -561,20 +561,21 @@ test('非 OpenAI 形状的渠道被挡在决策接口之外，而不是当成 ch
 
 const DMODEL = 'foo/decide-x';
 
-function makeDecisionWorld(over: { config?: string } = {}): World {
+function makeDecisionWorld(over: { config?: string; type?: string; base?: string } = {}): World {
+  const type = over.type ?? 'decisions';
   return makeWorld({
     abilities: [{ group: 'default', model: DMODEL, channel_id: 8, priority: 0, weight: 1 }],
     channels: [
       {
-        id: 8, type: 'decisions', key: 'dec-secret', status: 1, name: 'my-decisions',
-        weight: 1, priority: 0, base_url: 'https://dec.example.com', models: DMODEL,
+        id: 8, type, key: 'dec-secret', status: 1, name: 'my-decisions',
+        weight: 1, priority: 0, base_url: over.base ?? 'https://dec.example.com', models: DMODEL,
         group: 'default', model_mapping: '', config: over.config ?? '', system_prompt: '',
       },
     ],
   });
 }
 
-test('decisions 类型：模型自动是决策模型（无需声明），chat 被拒，决策走 /decide', async () => {
+test('decisions 类型：模型自动是决策模型（无需声明），chat 被拒，决策走 /v1/decisions', async () => {
   const w = makeDecisionWorld();
   // chat 门：分诊按渠道维度把它拦下（不靠 DecisionOnlyModels，也不靠 jev 前缀）
   const chatRes = await call(w, '/v1/chat/completions', { model: DMODEL, messages: [{ role: 'user', content: 'hi' }] });
@@ -587,20 +588,23 @@ test('decisions 类型：模型自动是决策模型（无需声明），chat �
   const decList = await ((await call(w, '/v1/models?capability=decisions', {}, { method: 'GET' })).json as any)();
   assert.ok(decList.data.some((m: any) => m.id === DMODEL), '决策列表可见');
 
-  // 决策门：出站打 https://dec.example.com/decide（决策路径直接拼 base_url，不加 /v1）
-  const script = scriptFetch([{ status: 200, body: { id: 'd1', answers: {} } }]);
+  // 决策门：出站打 https://dec.example.com/v1/decisions（OpenAI 方言默认路径）；
+  // 客户端也说 OpenAI 方言（input）→ 不翻译透传
+  const script = scriptFetch([{ status: 200, body: { id: 'd1', answers: [{ choice: 'yes' }] } }]);
   let res: Response;
   try {
-    res = await call(w, '/v1/decisions', { model: DMODEL, state: { ctx: 1 }, questions: { q: { type: 'choice' } } });
+    res = await call(w, '/v1/decisions', { model: DMODEL, input: 'ctx', questions: [{ type: 'predicate', instructions: 'q' }] });
   } finally {
     script.restore();
   }
   assert.equal(res.status, 200);
   assert.equal(script.calls.length, 1);
-  assert.match(script.calls[0].url, /dec\.example\.com\/decide$/, `URL 应为 /decide：${script.calls[0].url}`);
+  assert.match(script.calls[0].url, /dec\.example\.com\/v1\/decisions$/, `URL 应为 /v1/decisions：${script.calls[0].url}`);
   assert.equal(script.calls[0].headers.Authorization, 'Bearer dec-secret');
   assert.equal(script.calls[0].body.model, DMODEL);
-  assert.ok(net(w) < 0, '按 jev 行之外的兜底价结算（这里按默认 $1/$3）');
+  const out = await (res as any).clone().json();
+  assert.ok(Array.isArray(out.answers), '同方言透传：answers 数组原样');
+  assert.ok(net(w) < 0, '按兜底价结算（默认 $1/$3）');
 });
 
 test('decisions 类型：config.decisions_path 改路径（各家 Decision API 路径不统一）', async () => {
@@ -615,14 +619,80 @@ test('decisions 类型：config.decisions_path 改路径（各家 Decision API �
   }
 });
 
-test('decisions 类型：decisionsSupport 单元——默认 decide，自定义优先，剥开头斜杠', async () => {
+test('decisionsSupport 单元：双类型默认路径（v1/decisions、v1/systemone），自定义优先，剥开头斜杠', async () => {
   const { decisionsSupport } = await import('../src/relay/decisions');
-  const ch = { type: 'decisions', base_url: 'https://x.test', key: 'k', models: '', config: '' } as never;
-  assert.deepEqual(decisionsSupport(ch, {}), { ok: true, path: 'decide' });
-  assert.deepEqual(decisionsSupport(ch, { decisions_path: '/systemone/' }), { ok: true, path: 'systemone/' });
+  const dec = { type: 'decisions', base_url: 'https://x.test', key: 'k', models: '', config: '' } as never;
+  assert.deepEqual(decisionsSupport(dec, {}), { ok: true, path: 'v1/decisions' });
+  assert.deepEqual(decisionsSupport(dec, { decisions_path: '/custom/decide/' }), { ok: true, path: 'custom/decide/' });
+  const so = { type: 'systemone', base_url: 'https://x.test', key: 'k', models: '', config: '' } as never;
+  assert.deepEqual(decisionsSupport(so, {}), { ok: true, path: 'v1/systemone' });
+  assert.deepEqual(decisionsSupport(so, { decisions_path: 'so2' }), { ok: true, path: 'so2' });
   // chat 渠道（openai 类型）不受影响：无声明 + 非白名单主机仍拒绝
   const openaiCh = { type: 'openai', base_url: 'https://api.deepseek.com', key: 'k', models: '', config: '' } as never;
   assert.ok(!decisionsSupport(openaiCh, {}).ok);
+});
+
+/* ------------------------------------------------ 跨方言翻译端到端 */
+
+test('跨方言：OpenAI 客户端调 systemone 渠道——请求译成 state/对象，answers 译回数组', async () => {
+  const w = makeDecisionWorld({ type: 'systemone', base: 'https://so.example.com' });
+  const script = scriptFetch([{ status: 200, body: { id: 'so1', answers: { q0: { choice: 'billing' }, q1: { p: 0.9 } }, usage: { input_tokens: 7 } } }]);
+  let res: Response;
+  try {
+    res = await call(w, '/v1/decisions', {
+      model: DMODEL,
+      input: '重复扣费了',
+      questions: [
+        { type: 'choice', instructions: '部门', options: { billing: '支付' } },
+        { type: 'predicate', instructions: '重复扣费' },
+      ],
+    });
+  } finally {
+    script.restore();
+  }
+  assert.equal(res.status, 200);
+  // 上游收到 TypeSafe 方言：/v1/systemone + state + questions 对象（合成 q0/q1）
+  assert.match(script.calls[0].url, /so\.example\.com\/v1\/systemone$/, script.calls[0].url);
+  const up = script.calls[0].body;
+  assert.equal(up.state, '重复扣费了');
+  assert.equal(up.input, undefined);
+  assert.equal(up.questions.q0.type, 'choice');
+  assert.deepEqual(up.questions.q0.criteria, { billing: '支付' }, 'options→criteria');
+  assert.equal(up.questions.q1.type, 'noul', 'predicate→noul');
+  // 客户端拿回 OpenAI 方言：answers 数组按序
+  const out = await (res as any).clone().json();
+  assert.deepEqual(out.answers, [{ choice: 'billing' }, { p: 0.9 }]);
+});
+
+test('跨方言：TypeSafe 客户端调 decisions 渠道——请求译成 input/数组，answers 译回对象', async () => {
+  const w = makeDecisionWorld();
+  const script = scriptFetch([{ status: 200, body: { id: 'oai1', answers: [{ choice: 'tech' }, { p: 0.2 }], usage: { input_tokens: 3 } } }]);
+  let res: Response;
+  try {
+    res = await call(w, '/v1/decisions', {
+      model: DMODEL,
+      state: { ctx: 'api 500 了' },
+      questions: {
+        dept: { type: 'choice', instructions: '谁处理', criteria: { tech: '故障' } },
+        urgent: { type: 'noul', instructions: '紧急吗' },
+      },
+    });
+  } finally {
+    script.restore();
+  }
+  assert.equal(res.status, 200);
+  // 上游收到 OpenAI 方言：/v1/decisions + input + questions 数组（按原键序）
+  assert.match(script.calls[0].url, /dec\.example\.com\/v1\/decisions$/, script.calls[0].url);
+  const up = script.calls[0].body;
+  assert.deepEqual(up.input, { ctx: 'api 500 了' });
+  assert.equal(up.state, undefined);
+  assert.equal(up.questions.length, 2);
+  assert.equal(up.questions[0].type, 'choice');
+  assert.deepEqual(up.questions[0].options, { tech: '故障' }, 'criteria→options');
+  assert.equal(up.questions[1].type, 'predicate', 'noul→predicate');
+  // 客户端拿回 TypeSafe 方言：answers 按原问题名键控
+  const out = await (res as any).clone().json();
+  assert.deepEqual(out.answers, { dept: { choice: 'tech' }, urgent: { p: 0.2 } });
 });
 
 let failed = 0;

@@ -181,7 +181,7 @@ function makeDB(w: World) {
         const ch = w.channels.find((c: any) => c.id === a.channel_id);
         if (!ch || ch.status !== 1) continue;
         const e = rows.get(a.model) ?? { d: 0, c: 0 };
-        if (ch.type === 'decisions') e.d = 1; else e.c = 1;
+        if (ch.type === 'decisions' || ch.type === 'systemone') e.d = 1; else e.c = 1;
         rows.set(a.model, e);
       }
       return { results: [...rows].map(([model, e]) => ({ model, on_decision: e.d, on_chat: e.c })) };

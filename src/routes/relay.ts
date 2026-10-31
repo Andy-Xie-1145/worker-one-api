@@ -29,7 +29,7 @@ import {
   GeminiInboundError, geminiToChatRequest, chatResponseToGemini,
   newGeminiEncoder, encodeGeminiChunk, finishGeminiStream, geminiErrorEvent,
 } from '../relay/gemini-inbound';
-import { filterByCapability, isDecisionOnlyModel } from '../lib/capability';
+import { filterByCapability, isDecisionOnlyModel, channelDeclaredDecisionOnly } from '../lib/capability';
 import {
   type AnthropicRequest,
   anthropicToChatRequest,
@@ -60,7 +60,8 @@ relay.get('/models', async (c) => {
   if ('error' in auth) return c.json(errorBody(auth.error), auth.status as 401 | 403);
   const capability = c.req.query('capability') === 'decisions' ? 'decisions' : 'chat';
   const options = await getOptions(c.env);
-  const models = filterByCapability(await listModels(c.env), capability, options);
+  // decisions 类型渠道上的模型自动按决策模型分诊（与请求时分诊同一份规则）。
+  const models = filterByCapability(await listModels(c.env), capability, options, await channelDeclaredDecisionOnly(c.env));
   const allowed = csv(auth.token.models);
   const visible = allowed.length ? models.filter((m) => allowed.includes(m)) : models;
   return c.json({
@@ -85,7 +86,7 @@ relay.get('/pricing', async (c) => {
   if ('error' in auth) return c.json(errorBody(auth.error), auth.status as 401 | 403);
   const capability = c.req.query('capability') === 'decisions' ? 'decisions' : 'chat';
   const options = await getOptions(c.env);
-  const models = filterByCapability(await listModels(c.env), capability, options);
+  const models = filterByCapability(await listModels(c.env), capability, options, await channelDeclaredDecisionOnly(c.env));
   const allowed = csv(auth.token.models);
   const visible = allowed.length ? models.filter((m) => allowed.includes(m)) : models;
   return c.json({
@@ -280,7 +281,12 @@ async function handleRelay(
    * 语焉不详的 404，而普通模型走 /v1/decisions 会被 OpenRouter 拒；两种都是
    * 客户端选错了门，说清楚是哪扇门比转发一个上游错误有用得多。
    */
-  const decisionOnly = isDecisionOnlyModel(requestedModel, options);
+  // 静态规则没命中时再问渠道维度：decisions 类型渠道上的模型自动是决策模型
+  //（含剥厂商前缀后的裸名匹配，见 isDecisionOnlyModel）。
+  let decisionOnly = isDecisionOnlyModel(requestedModel, options);
+  if (!decisionOnly) {
+    decisionOnly = isDecisionOnlyModel(requestedModel, options, await channelDeclaredDecisionOnly(c.env));
+  }
   if (mode === 'decisions' && !decisionOnly) {
     return fail(`模型 ${requestedModel} 不是决策模型，请改用 /v1/chat/completions`, 'invalid_request_error', 400);
   }
@@ -682,8 +688,16 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
       const message = `渠道 ${channel.name} 不支持决策接口：${support.reason}`;
       return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
     }
-    // 路径由渠道决定（config.decisions_path 可覆盖），不用路由里写死的那个。
+    // 路径由渠道决定（decisions 类型默认 /decide，config.decisions_path 可覆盖）。
     ctx.path = support.path;
+  } else if (channel.type === 'decisions') {
+    /*
+     * Decision API 渠道只承接决策请求。正常情况下到不了这里——它的模型在分诊层
+     * 就已按决策模型拦下 chat；这条守卫是给「模型同时挂在 chat 渠道」的边角：
+     * 500 = 跳过此渠道继续换下一个，而不是把整条路径打死。
+     */
+    const message = `渠道 ${channel.name} 是 Decision API 渠道，只承接 POST /v1/decisions`;
+    return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
   }
 
   let built;

@@ -120,7 +120,19 @@ function makeDB(w: World) {
     }
     // 各种计数器更新（users/tokens/channels）不影响断言，吞掉。
     if (/^UPDATE /.test(one)) return { meta: { changes: 1 } };
-    throw new Error(`未预期的 SQL: ${one}`);
+    if (/MAX\(CASE WHEN c\.type/.test(one)) {
+      // channelDeclaredDecisionOnly：decisions 类型启用渠道上的模型 → 决策模型。
+      const rows = new Map<string, { d: number; c: number }>();
+      for (const a of w.abilities) {
+        if (a.enabled === 0) continue;
+        const ch = w.channels.find((c: any) => c.id === a.channel_id);
+        if (!ch || ch.status !== 1) continue;
+        const e = rows.get(a.model) ?? { d: 0, c: 0 };
+        if (ch.type === 'decisions') e.d = 1; else e.c = 1;
+        rows.set(a.model, e);
+      }
+      return { results: [...rows].map(([model, e]) => ({ model, on_decision: e.d, on_chat: e.c })) };
+    }    throw new Error(`未预期的 SQL: ${one}`);
   };
 
   const stmt = (sql: string, binds: any[] = []) => ({
@@ -543,6 +555,74 @@ test('非 OpenAI 形状的渠道被挡在决策接口之外，而不是当成 ch
   assert.equal(res!.status, 500);
   assert.match((await res!.json<any>()).error.message, /不支持决策接口/);
   assert.equal(net(w), 0, '构造失败也要退款');
+});
+
+/* ------------------------------------------------ decisions 专用渠道类型 */
+
+const DMODEL = 'foo/decide-x';
+
+function makeDecisionWorld(over: { config?: string } = {}): World {
+  return makeWorld({
+    abilities: [{ group: 'default', model: DMODEL, channel_id: 8, priority: 0, weight: 1 }],
+    channels: [
+      {
+        id: 8, type: 'decisions', key: 'dec-secret', status: 1, name: 'my-decisions',
+        weight: 1, priority: 0, base_url: 'https://dec.example.com', models: DMODEL,
+        group: 'default', model_mapping: '', config: over.config ?? '', system_prompt: '',
+      },
+    ],
+  });
+}
+
+test('decisions 类型：模型自动是决策模型（无需声明），chat 被拒，决策走 /decide', async () => {
+  const w = makeDecisionWorld();
+  // chat 门：分诊按渠道维度把它拦下（不靠 DecisionOnlyModels，也不靠 jev 前缀）
+  const chatRes = await call(w, '/v1/chat/completions', { model: DMODEL, messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(chatRes.status, 400);
+  assert.match((await chatRes.json<any>()).error.message, /只支持决策接口/);
+
+  // /v1/models 默认藏起，?capability=decisions 显式可查
+  const list = await ((await call(w, '/v1/models', {}, { method: 'GET' })).json as any)();
+  assert.ok(!list.data.some((m: any) => m.id === DMODEL), '默认列表不出现');
+  const decList = await ((await call(w, '/v1/models?capability=decisions', {}, { method: 'GET' })).json as any)();
+  assert.ok(decList.data.some((m: any) => m.id === DMODEL), '决策列表可见');
+
+  // 决策门：出站打 https://dec.example.com/decide（决策路径直接拼 base_url，不加 /v1）
+  const script = scriptFetch([{ status: 200, body: { id: 'd1', answers: {} } }]);
+  let res: Response;
+  try {
+    res = await call(w, '/v1/decisions', { model: DMODEL, state: { ctx: 1 }, questions: { q: { type: 'choice' } } });
+  } finally {
+    script.restore();
+  }
+  assert.equal(res.status, 200);
+  assert.equal(script.calls.length, 1);
+  assert.match(script.calls[0].url, /dec\.example\.com\/decide$/, `URL 应为 /decide：${script.calls[0].url}`);
+  assert.equal(script.calls[0].headers.Authorization, 'Bearer dec-secret');
+  assert.equal(script.calls[0].body.model, DMODEL);
+  assert.ok(net(w) < 0, '按 jev 行之外的兜底价结算（这里按默认 $1/$3）');
+});
+
+test('decisions 类型：config.decisions_path 改路径（各家 Decision API 路径不统一）', async () => {
+  const w = makeDecisionWorld({ config: '{"decisions_path":"systemone"}' });
+  const script = scriptFetch([{ status: 200, body: { ok: 1 } }]);
+  try {
+    const res = await call(w, '/v1/decisions', { model: DMODEL, questions: {} });
+    assert.equal(res.status, 200);
+    assert.match(script.calls[0].url, /\/systemone$/, `URL 应为 /systemone：${script.calls[0].url}`);
+  } finally {
+    script.restore();
+  }
+});
+
+test('decisions 类型：decisionsSupport 单元——默认 decide，自定义优先，剥开头斜杠', async () => {
+  const { decisionsSupport } = await import('../src/relay/decisions');
+  const ch = { type: 'decisions', base_url: 'https://x.test', key: 'k', models: '', config: '' } as never;
+  assert.deepEqual(decisionsSupport(ch, {}), { ok: true, path: 'decide' });
+  assert.deepEqual(decisionsSupport(ch, { decisions_path: '/systemone/' }), { ok: true, path: 'systemone/' });
+  // chat 渠道（openai 类型）不受影响：无声明 + 非白名单主机仍拒绝
+  const openaiCh = { type: 'openai', base_url: 'https://api.deepseek.com', key: 'k', models: '', config: '' } as never;
+  assert.ok(!decisionsSupport(openaiCh, {}).ok);
 });
 
 let failed = 0;

@@ -42,6 +42,7 @@ LLM API 中转网关，完整运行在 Cloudflare Workers 上，**不依赖任�
 | type | 说明 |
 |---|---|
 | `openai` | **OpenAI Chat Completion**：通用 OpenAI 兼容接口，配 base_url 即可接入 DeepSeek、Moonshot、Groq、智谱、DashScope、SiliconFlow、OpenRouter、xAI 等 |
+| `decisions` | **Decision API**：决策接口专用（出站默认 `/decide`，`config.decisions_path` 可改）；渠道里的模型**自动**全部视为决策模型，只能经 `POST /v1/decisions` 调用 |
 | `openai-responses` | **OpenAI Responses**：打上游的 `/v1/responses`；中枢 chat 形状会自动翻译过去（system→instructions、tool_calls→function_call item、max_tokens→max_output_tokens） |
 | `anthropic` | **Anthropic Messages**：Anthropic 原生 Messages API，双向转换（含 tool_use / 图片 / system） |
 | `gemini` | **Google Gemini**：generateContent，双向转换（含 functionCall / inlineData） |
@@ -344,20 +345,44 @@ Decisions 不是流式接口，带 `stream: true` 会在预扣之前直接 400�
 
 ### 接入一个决策渠道
 
-**Decisions 不是独立的渠道类型**——它是 `openai` 形状渠道上的一条路径能力
-（`alpha/decisions`，不在 /v1 下）。能不能承载由 `decisionsSupport()` 判定，
-而不是看渠道类型：`openai` 类型同时承载 DeepSeek、Groq 等无数厂商，若按类型放行，
-一个配错的渠道会把 key 发给根本不存在的路径且不重试。
+**推荐：专用类型 `decisions`（Decision API）**——出站默认 `/decide`，
+`config.decisions_path` 改成上游真实路径（各家并不统一：/decide、/systemone、
+/decision 都有），**渠道里的模型自动全部视为决策模型**，无需任何声明：
 
 ```bash
-# OpenRouter：主机命中白名单，自动启用
-channel add openai jev https://openrouter.ai/api sk-or-xxx --models '~typesafe/jev-latest,typesafe/jev-1.13'
-
-# 其他 OpenAI 兼容上游：config 里显式声明
-channel set <id> config='{"decisions":true}'              # 默认路径 alpha/decisions
-channel set <id> config='{"decisions_path":"my/decisions"}' # 自定义路径
+channel add decisions mydec https://dec.example.com sk-xxx --models decide-x,decide-y
+channel set <id> config='{"decisions_path":"systemone"}'   # 上游路径是 /systemone 时
+channel set <id> config='{"no_version_prefix":true}'        # 上游 URL 不带 /v1 时
 ```
 
+**兼容方式：OpenAI 形状渠道 + 声明**。能不能承载由 `decisionsSupport()` 判定
+（OpenRouter 主机白名单自动启用；其他上游在 config 写 `{"decisions":true}` 或
+`{"decisions_path":"..."}`）。出站路径按请求入口动态换：客户端打 `/v1/decisions`
+才走决策路径，同一渠道的 chat 请求照走 chat/completions，互不干扰：
+
+```bash
+# OpenRouter：主机命中白名单，自动启用（路径 alpha/decisions）
+channel add openai jev https://openrouter.ai/api sk-or-xxx --models '~typesafe/jev-latest,typesafe/jev-1.13'
+```
+
+网页端等价操作：渠道编辑弹窗勾选「此渠道承载决策接口」并填出站路径
+（勾选会写入 config 的 `decisions` / `decisions_path`，取消勾选自动移除；
+类型选 Decision API 时开关自动锁定，路径输入仍可改）。
+
+### 声明决策模型
+
+- **`decisions` 类型渠道：无需声明**——模型自动按决策模型分诊。
+- **挂在 OpenAI 形状渠道上的决策模型**：内置规则自动识别 `jev` 前缀
+  （`jev-latest`、`~typesafe/jev-1.13` 等都命中）；其余在
+  「设置 → 仅决策接口的模型」（`options.DecisionOnlyModels`，JSON 数组）追加：
+
+```bash
+opt set DecisionOnlyModels=["foo/decide-x"]
+```
+
+不声明的后果：模型被当普通 chat 模型暴露在 `/v1/models`，chat 请求发去上游的
+chat/completions（自定义决策上游多半 404），而 `/v1/decisions` 会以
+「不是决策模型」400 拒绝——两个门都进不去。
 ### 能力分诊
 
 规则集中在 `src/lib/capability.ts` 一处：`GET /v1/models` 默认只列 chat 模型

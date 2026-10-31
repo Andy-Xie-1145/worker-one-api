@@ -430,6 +430,9 @@ async function pageChannels(view) {
     <textarea id="price_config" placeholder='{"glm-5.3-flash":{"in":0.15,"out":0.5,"cached_in":0.03},"my-model":{"in":"4*(context>272k?2:1)","out":20}}'>${ch.price_config && typeof ch.price_config === 'object' ? esc(JSON.stringify(ch.price_config, null, 2)) : ''}</textarea>
     <p class="muted" style="margin:4px 0 0">键是<b>模型列表里写的名字</b>（请求名）；路由到本渠道就按这里的价。留空 = 不修改（新建时留空 = 无覆盖）；提交 <code>{}</code> 表示清空。</p>
     <label>渠道额外配置 JSON（可选，如 {"api_version":"2024-10-21"}）</label><textarea id="config">${esc(ch.config || '')}</textarea>
+    <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input type="checkbox" id="decisions" style="width:auto"> 此渠道承载决策接口（客户端 <code>POST /v1/decisions</code>）</label>
+    <input id="decisions_path" placeholder="出站路径，默认 alpha/decisions（如 decide、systemone）">
+    <p class="muted" style="margin:4px 0 0">最省事的做法：类型直接选 <b>Decision API</b>（decisions）——出站默认 /decide，此路径可改，且<b>该渠道的模型全部自动视为决策模型</b>，无需任何声明。OpenAI 形状渠道也可承载（OpenRouter 自动启用；勾选写入 <code>{"decisions":true}</code>，取消勾选移除），但模型需在「设置 → 仅决策接口的模型」声明。路径不需要 /v1 前缀时，在 config 里加 <code>"no_version_prefix":true</code>。</p>
     <label>系统提示词（可选，注入到每个请求）</label><textarea id="system_prompt">${esc(ch.system_prompt || '')}</textarea>`;
 
   // 从上游拉取模型列表：POST /api/channels/fetch-models。新建渠道用表单现输入的
@@ -491,6 +494,35 @@ async function pageChannels(view) {
     dlg.querySelector('#preset').onchange = (e) => { if (e.target.value) dlg.querySelector('#base_url').value = e.target.value; };
     dlg.querySelector('#fill').onclick = () => { dlg.querySelector('#models').value = meta.known_models.join(','); };
     dlg.querySelector('#fetchModels').onclick = () => fetchUpstreamModels(dlg, ch);
+    // 决策接口开关：类型选 decisions 时勾选并锁定（类型本身就是声明，路径输入仍可改）；
+    // openai 形状渠道按 openrouter.ai 白名单 / config 反推。
+    const dec = dlg.querySelector('#decisions');
+    const decPath = dlg.querySelector('#decisions_path');
+    const typeSel = dlg.querySelector('#type');
+    if (dec && decPath && typeSel) {
+      let cfg = {};
+      try { cfg = ch.config ? JSON.parse(ch.config) : {}; } catch { cfg = {}; }
+      if (cfg.decisions_path) decPath.value = String(cfg.decisions_path);
+      let host = '';
+      try { host = ch.base_url ? new URL(ch.base_url).hostname.toLowerCase() : ''; } catch { host = ''; }
+      const whitelisted = host === 'openrouter.ai' || host.endsWith('.openrouter.ai');
+      const sync = () => {
+        if (typeSel.value === 'decisions') {
+          dec.checked = true; dec.disabled = true;
+          decPath.disabled = false;
+          decPath.placeholder = '出站路径，默认 decide（可改：systemone / decision …）';
+        } else if (whitelisted) {
+          dec.checked = true; dec.disabled = true; decPath.disabled = true;
+          decPath.placeholder = 'openrouter.ai 白名单自动启用（alpha/decisions）';
+        } else {
+          dec.disabled = false; decPath.disabled = false;
+          decPath.placeholder = '出站路径，默认 alpha/decisions（如 decide、systemone）';
+          dec.checked = cfg.decisions === true || !!cfg.decisions_path;
+        }
+      };
+      typeSel.onchange = sync;
+      sync();
+    }
   };
 
   const collect = (dlg) => {
@@ -513,6 +545,31 @@ async function pageChannels(view) {
       try { pc = JSON.parse(raw); } catch { throw new Error('价格覆盖不是合法 JSON'); }
       if (!pc || typeof pc !== 'object' || Array.isArray(pc)) throw new Error('价格覆盖必须是 JSON 对象');
       body.price_config = pc;
+    }
+    // 决策接口：decisions 类型只落 decisions_path（类型本身就是声明）；
+    // openai 形状渠道按开关写 decisions / decisions_path。
+    const dec = dlg.querySelector('#decisions');
+    const decPathVal = val(dlg, 'decisions_path').trim();
+    if (body.type === 'decisions') {
+      let cfg;
+      try { cfg = body.config ? JSON.parse(body.config) : {}; } catch { throw new Error('渠道额外配置不是合法 JSON'); }
+      if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {};
+      if (decPathVal) cfg.decisions_path = decPathVal;
+      else delete cfg.decisions_path;
+      body.config = Object.keys(cfg).length ? JSON.stringify(cfg) : '';
+    } else if (dec && !dec.disabled) {
+      let cfg;
+      try { cfg = body.config ? JSON.parse(body.config) : {}; } catch { throw new Error('渠道额外配置不是合法 JSON'); }
+      if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {};
+      if (dec.checked) {
+        cfg.decisions = true;
+        if (decPathVal) cfg.decisions_path = decPathVal;
+        else delete cfg.decisions_path;
+      } else {
+        delete cfg.decisions;
+        delete cfg.decisions_path;
+      }
+      body.config = Object.keys(cfg).length ? JSON.stringify(cfg) : '';
     }
     return body;
   };
@@ -1123,9 +1180,9 @@ async function pageSettings(view) {
         <div><label>渠道冷却上限（秒）</label><input id="ChannelCooldownMaxSec" type="number" min="0" value="${cur.ChannelCooldownMaxSec ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.ChannelCooldownMaxSec ?? '—')}</p></div>
       </div>
       <label><input type="checkbox" id="HealthEventsEnabled" style="width:auto" ${cur.HealthEventsEnabled ? 'checked' : ''}> 记录健康事件（失败请求写入 relay_events，供健康页统计）</label>
-      <label>仅决策接口的模型（JSON 数组，如 ["~typesafe/jev-latest"]）</label>
+      <label>仅决策接口的模型（JSON 数组，如 ["~typesafe/jev-latest", "foo/decide-x"]）</label>
       <textarea id="DecisionOnlyModels">${esc(JSON.stringify(cur.DecisionOnlyModels ?? [], null, 2))}</textarea>
-      <p class="muted" style="margin:4px 0 0">列在这里的模型不会出现在 <code>/v1/models</code>，发去 <code>/v1/chat/completions</code> 会被明确拒绝，只能走 <code>POST /v1/decisions</code>。内置规则已覆盖 Jev，这里<b>只能追加</b>。</p>
+      <p class="muted" style="margin:4px 0 0">列在这里的模型不会出现在 <code>/v1/models</code>，发去 <code>/v1/chat/completions</code> 会被明确拒绝，只能走 <code>POST /v1/decisions</code>。<b>Decision API 类型（decisions）的渠道无需在此声明——它的模型自动视为决策模型。</b>这里只用于：内置规则（自动识别 <code>jev</code> 前缀）之外、挂在 OpenAI 形状渠道上的决策模型——不声明会被当普通 chat 模型暴露，chat 请求发上游多半 404，决策请求则被 400 拒绝。</p>
       <div style="margin-top:12px"><button class="primary" id="saveOpts">保存系统设置</button></div>
     </div>
     <div class="card"><h2>自检</h2>

@@ -74,7 +74,19 @@ function makeDB(w: World) {
     if (/^INSERT INTO credits/.test(one)) return {};
     if (/^INSERT INTO logs/.test(one)) return {};
     if (/^UPDATE /.test(one)) return { meta: { changes: 1 } };
-    throw new Error(`未预期的 SQL: ${one}`);
+    if (/MAX\(CASE WHEN c\.type/.test(one)) {
+      // channelDeclaredDecisionOnly：decisions 类型启用渠道上的模型 → 决策模型。
+      const rows = new Map<string, { d: number; c: number }>();
+      for (const a of w.abilities) {
+        if (a.enabled === 0) continue;
+        const ch = w.channels.find((c: any) => c.id === a.channel_id);
+        if (!ch || ch.status !== 1) continue;
+        const e = rows.get(a.model) ?? { d: 0, c: 0 };
+        if (ch.type === 'decisions') e.d = 1; else e.c = 1;
+        rows.set(a.model, e);
+      }
+      return { results: [...rows].map(([model, e]) => ({ model, on_decision: e.d, on_chat: e.c })) };
+    }    throw new Error(`未预期的 SQL: ${one}`);
   };
   const stmt = (sql: string, binds: any[] = []) => ({
     bind: (...b: any[]) => stmt(sql, b),

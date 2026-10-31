@@ -72,10 +72,11 @@ async function listByType(input: UpstreamListingInput): Promise<string[]> {
   const config = input.config ?? {};
   switch (input.type) {
     case 'openai':
-    case 'openai-responses': {
-      // OpenAI 形状：GET /v1/models（Bearer）。base 已带 /v1 的渠道也不受影响
-      //（joinURL 前会去尾斜杠，但 /v1 重复由用户配置决定——与 relay 的 apiPrefix 行为一致，
-      // 这里保守地不在 base 以 /v\d+ 结尾时再加前缀）。
+    case 'openai-responses':
+    case 'decisions': {
+      // OpenAI 形状：GET /v1/models（Bearer）。decisions 类型上游若也有 /v1/models
+      // 就直接用；没有的厂商手填模型名即可（拉取失败不影响渠道本身）。
+      // base 已带 /v1 时不重复加前缀（与 relay 的 apiPrefix 行为一致）。
       const prefix = /\/v\d+$/.test(base) ? '' : 'v1/';
       const json = await getJson(joinURL(base, `${prefix}models`), { Authorization: `Bearer ${input.key}` });
       return (json?.data ?? []).map((m: any) => m?.id);

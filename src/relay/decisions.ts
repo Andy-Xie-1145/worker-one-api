@@ -17,6 +17,16 @@ import { estimateTokens } from './sse';
 export const DECISIONS_PATH = 'alpha/decisions';
 
 /**
+ * `decisions` 渠道类型的默认出站路径。
+ *
+ * Decision API 的路径各用各的（/decide、/systemone、/decision…），没有统一约定，
+ * 所以这个默认只是个起点——用 `config.decisions_path` 改成上游的真实路径。
+ * 路径**直接拼在 base_url 后**（buildDecisionsRequest 不走 apiPrefix，无自动 /v1）：
+ * 上游是 https://host/v1/decide 就把 base_url 写到 …/v1，或路径写 v1/decide。
+ */
+export const DEFAULT_DECISIONS_TYPE_PATH = 'decide';
+
+/**
  * 默认认得 Decisions 的上游主机。
  *
  * **能力属于渠道，不属于 adaptor。** `openai` 这个 type 同时承载 DeepSeek、Groq、
@@ -85,6 +95,12 @@ export function decisionsSupport(
   channel: ChannelRow,
   config: Record<string, any>,
 ): { ok: true; path: string } | { ok: false; reason: string } {
+  // 专用类型自带声明：路径默认 /decide，config.decisions_path 可改（各家的
+  // Decision API 路径并不统一）。
+  if (channel.type === 'decisions') {
+    const custom = typeof config?.decisions_path === 'string' ? config.decisions_path.trim() : '';
+    return { ok: true, path: custom ? custom.replace(/^\/+/, '') : DEFAULT_DECISIONS_TYPE_PATH };
+  }
   const explicit = config?.decisions_path;
   if (typeof explicit === 'string' && explicit.trim()) return { ok: true, path: explicit.trim().replace(/^\/+/, '') };
   if (config?.decisions === true) return { ok: true, path: DECISIONS_PATH };

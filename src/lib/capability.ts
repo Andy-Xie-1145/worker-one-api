@@ -1,3 +1,4 @@
+import type { Env } from '../types';
 import type { Options } from './options';
 import { stripAliasPrefix } from './pricing/llm';
 
@@ -27,7 +28,7 @@ export type Capability = 'chat' | 'decisions';
 const DECISION_ONLY_PREFIXES = ['jev'];
 
 /** 这个模型是不是只能走 /v1/decisions。 */
-export function isDecisionOnlyModel(model: string, options?: Options): boolean {
+export function isDecisionOnlyModel(model: string, options?: Options, channelDeclared?: Set<string>): boolean {
   const name = (model ?? '').trim();
   if (!name) return false;
   // 运维追加的名字按原样匹配：写进配置的是客户端实际发来的那个串。
@@ -37,14 +38,41 @@ export function isDecisionOnlyModel(model: string, options?: Options): boolean {
   if (extra.includes(name)) return true;
   const bare = stripAliasPrefix(name);
   if (extra.includes(bare)) return true;
+  // decisions 类型渠道的模型自动视为决策模型（channelDeclared 由调用方查库注入）。
+  if (channelDeclared?.has(name) || channelDeclared?.has(bare)) return true;
   return DECISION_ONLY_PREFIXES.some((prefix) => bare.startsWith(prefix));
 }
 
-export function modelCapability(model: string, options?: Options): Capability {
-  return isDecisionOnlyModel(model, options) ? 'decisions' : 'chat';
+/**
+ * `decisions` 类型渠道声明出的决策模型全集：只挂在 decisions 类型启用渠道上、
+ * 且不在任何启用 chat 渠道上的模型（两边都挂的模型两扇门都开）。
+ *
+ * 一条聚合 SQL 拿全量；查询失败按空集处理（分诊退回静态规则，不拦请求）。
+ */
+export async function channelDeclaredDecisionOnly(env: Env): Promise<Set<string>> {
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT a.model AS model,
+              MAX(CASE WHEN c.type = 'decisions' THEN 1 ELSE 0 END) AS on_decision,
+              MAX(CASE WHEN c.type <> 'decisions' THEN 1 ELSE 0 END) AS on_chat
+         FROM abilities a JOIN channels c ON c.id = a.channel_id
+        WHERE a.enabled = 1 AND c.status = 1
+        GROUP BY a.model`,
+    ).all<{ model: string; on_decision: number; on_chat: number }>();
+    return new Set(
+      (rows.results ?? []).filter((r) => r.on_decision === 1 && r.on_chat === 0).map((r) => r.model),
+    );
+  } catch (error) {
+    console.error('[capability] 决策渠道模型扫描失败，按空集处理：', error);
+    return new Set();
+  }
+}
+
+export function modelCapability(model: string, options?: Options, channelDeclared?: Set<string>): Capability {
+  return isDecisionOnlyModel(model, options, channelDeclared) ? 'decisions' : 'chat';
 }
 
 /** 按能力筛一份模型名单。/v1/models 默认只给 'chat'。 */
-export function filterByCapability(models: string[], capability: Capability, options?: Options): string[] {
-  return models.filter((m) => modelCapability(m, options) === capability);
+export function filterByCapability(models: string[], capability: Capability, options?: Options, channelDeclared?: Set<string>): string[] {
+  return models.filter((m) => modelCapability(m, options, channelDeclared) === capability);
 }

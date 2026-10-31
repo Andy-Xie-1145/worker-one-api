@@ -280,9 +280,15 @@ Azure 部署名 `gpt-35-turbo`、聚合器的 `openai/gpt-4o`）。解析规则�
 
 ### 渠道运维三件套
 
-- **测试选模型**：渠道页点「测试」弹窗选择该渠道 models 里的一个模型再测
-  （显式传的 model 必须 ∈ 渠道 models——测试带渠道 key 直连上游，不能变成
-  「拿这把 key 调任意模型」的后门）。
+- **测试选模型**：渠道页点「测试」——**单个模型直接测，多个模型弹窗选**；命令行的
+  `channel test <id> [模型]` 等价。（显式传的 model 必须 ∈ 渠道 models——测试带渠道 key
+  直连上游，不能变成「拿这把 key 调任意模型」的后门。）
+- **测试走原生协议**：探针按渠道类型发对应的最小请求，**不是一律 chat/completions**
+  （上游不一定支持它）：`openai`/`azure` → chat/completions、`openai-responses` →
+  responses、`anthropic` → v1/messages、`gemini` → models/{m}:generateContent、
+  `decisions` → `{base}/decisions`、`systemone` → `{base}/systemone`。请求由对应
+  adaptor 构造，所以测的就是中继真正会走的那条路；成功/失败消息都带协议标签、
+  真实出站 URL 与耗时。
 - **从上游拉取模型**：新增/编辑渠道时用 key 请求上游 `/models`（5 种渠道类型各自的
   端点与鉴权头，Gemini 分页取全并剥 `models/` 前缀，Azure 取 deployment 名），
   复选后追加合并进模型列表；编辑已有渠道可走库存 key，key 不回传前端。

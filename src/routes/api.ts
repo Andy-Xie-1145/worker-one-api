@@ -7,12 +7,13 @@ import { randomKey } from '../lib/crypto';
 import { requireAdmin, invalidateTokenCache, ensureOwner } from '../lib/auth';
 import { getOptions, setOptions, DEFAULT_OPTIONS } from '../lib/options';
 import { rebuildAbilities, deleteAbilities, listModels, csv, parseConfig, resolveTestModel } from '../lib/channel';
+import { buildProbeRequest } from '../lib/channel-probe';
 import { listUpstreamModels } from '../lib/upstream-models';
 import { loadModelBilling } from '../lib/model-billing';
 import { reconcile, applyCredit } from '../lib/ledger';
 import { getHeartbeat, runWatchdog } from '../lib/watchdog';
 import { listCooling, deriveState, percentiles, engineOf } from '../lib/health';
-import { getAdaptor, ADAPTORS, OPENAI_COMPATIBLE_PRESETS } from '../relay';
+import { ADAPTORS, OPENAI_COMPATIBLE_PRESETS } from '../relay';
 import { PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, QUOTA_PER_USD, quotaToUSD, validatePriceSpec, type Price, type PriceSpec } from '../lib/pricing';
 import { runCli } from '../lib/cli';
 import type { AdaptorContext } from '../relay/adaptor';
@@ -493,7 +494,13 @@ api.delete('/channels/:id', requireAdmin, async (c) => {
   return c.json(ok(null, '已删除'));
 });
 
-/** Sends a 1-token chat completion straight at the channel to check credentials. */
+/**
+ * 探一发上游，验证渠道凭据与连通性。
+ *
+ * 请求形状按渠道类型决定（见 lib/channel-probe.ts）：chat 渠道发 1-token 的
+ * chat/completions；decisions / systemone 发各自方言的最小决策请求——**不能**
+ * 拿 chat 形状去测决策渠道，那测的是端点错误不是渠道好坏。
+ */
 api.post('/channels/:id/test', requireAdmin, async (c) => {
   const id = Number(c.req.param('id'));
   const channel = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
@@ -505,28 +512,29 @@ api.post('/channels/:id/test', requireAdmin, async (c) => {
   if ('error' in picked) return c.json(fail(picked.error), 400);
   const model = picked.model;
 
-  const adaptor = getAdaptor(channel.type);
-  const ctx: AdaptorContext = {
-    channel,
-    upstreamModel: model,
-    requestedModel: model,
-    mode: 'chat',
-    path: 'chat/completions',
-    config: (() => { try { return JSON.parse(channel.config || '{}'); } catch { return {}; } })(),
-  };
+  const probeRes = buildProbeRequest(channel, model);
+  if (!probeRes.ok) return c.json(fail(probeRes.error), 200);
+  const probe = probeRes.probe;
+  const kindLabel = probe.label;
 
   const started = Date.now();
   try {
-    const built = adaptor.buildRequest({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }, ctx);
-    const resp = await fetch(built.url, { method: 'POST', headers: built.headers, body: built.body, signal: AbortSignal.timeout(30_000) });
+    const resp = await fetch(probe.url, {
+      method: 'POST',
+      headers: probe.built.headers,
+      body: probe.built.body,
+      signal: AbortSignal.timeout(30_000),
+    });
     const elapsed = Date.now() - started;
     const text = await resp.text();
     await c.env.DB.prepare('UPDATE channels SET test_time = ?, response_time = ? WHERE id = ?').bind(now(), elapsed, id).run();
-    if (!resp.ok) return c.json(fail(`测试失败 (${resp.status}，耗时 ${elapsed}ms): ${text.slice(0, 500)}`), 200);
-    return c.json(ok({ elapsed_ms: elapsed, model }, `测试成功（${model}），耗时 ${elapsed}ms`));
+    if (!resp.ok) {
+      return c.json(fail(`测试失败（${kindLabel} ${probe.url}，HTTP ${resp.status}，耗时 ${elapsed}ms）：${text.slice(0, 500)}`), 200);
+    }
+    return c.json(ok({ elapsed_ms: elapsed, model, url: probe.url, kind: probe.kind }, `测试成功（${model}，${kindLabel}），耗时 ${elapsed}ms`));
   } catch (e: any) {
     // 网络/构建失败没有可用的上游耗时，如实说，不要编一个数字。
-    return c.json(fail(`测试失败: ${e?.message ?? e}`), 200);
+    return c.json(fail(`测试失败（${kindLabel} ${probe.url}）：${e?.message ?? e}`), 200);
   }
 });
 

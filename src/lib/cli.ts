@@ -3,10 +3,9 @@ import { getOptions, setOptions, DEFAULT_OPTIONS } from './options';
 import { ensureOwner, invalidateTokenCache } from './auth';
 import { applyCredit, reconcile } from './ledger';
 import { rebuildAbilities, deleteAbilities, listModels, resolveTestModel, parseConfig } from './channel';
+import { buildProbeRequest } from './channel-probe';
 import { getHeartbeat, runWatchdog } from './watchdog';
 import { randomKey } from './crypto';
-import { getAdaptor } from '../relay';
-import type { AdaptorContext } from '../relay/adaptor';
 import { listUpstreamModels } from './upstream-models';
 import { loadModelBilling, findUnpricedChannelModels, fallbackActive } from './model-billing';
 import {
@@ -310,8 +309,9 @@ async function channelCmd(env: Env, args: string[]): Promise<CliResult> {
       return { ok: true, output: `渠道 #${id}「${updated!.name}」已更新（模型：${updated!.models || '—'}，状态=${updated!.status}）` };
     }
     case 'test': {
-      // 真测试：与后台按钮同一语义——显式 model 必须 ∈ 渠道 models（堵 key 后门），
-      // 直连上游发一个 1-token 请求，回写 test_time / response_time。
+      // 真测试：与后台按钮**同一份探针构造**（lib/channel-probe.ts）——按渠道类型走
+      // 各自原生协议（chat / Responses / Messages / Gemini / Decision / System One），
+      // 不再一律 chat/completions。显式 model 必须 ∈ 渠道 models（堵 key 后门）。
       const id = Number(rest[0]);
       const ch = await env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();
       if (!ch) return { ok: false, output: `渠道 #${rest[0]} 不存在` };
@@ -319,26 +319,25 @@ async function channelCmd(env: Env, args: string[]): Promise<CliResult> {
       if ('error' in picked) return { ok: false, output: picked.error };
       const model = picked.model;
 
-      const adaptor = getAdaptor(ch.type);
-      const ctx: AdaptorContext = {
-        channel: ch,
-        upstreamModel: model,
-        requestedModel: model,
-        mode: 'chat',
-        path: 'chat/completions',
-        config: (() => { try { return JSON.parse(ch.config || '{}'); } catch { return {}; } })(),
-      };
+      const probeRes = buildProbeRequest(ch, model);
+      if (!probeRes.ok) return { ok: false, output: probeRes.error };
+      const probe = probeRes.probe;
+
       const started = Date.now();
       try {
-        const built = adaptor.buildRequest({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }, ctx);
-        const resp = await fetch(built.url, { method: 'POST', headers: built.headers, body: built.body, signal: AbortSignal.timeout(30_000) });
+        const resp = await fetch(probe.url, {
+          method: 'POST',
+          headers: probe.built.headers,
+          body: probe.built.body,
+          signal: AbortSignal.timeout(30_000),
+        });
         const elapsed = Date.now() - started;
         const text = await resp.text().catch(() => '');
         await env.DB.prepare('UPDATE channels SET test_time = ?, response_time = ? WHERE id = ?').bind(Math.floor(Date.now() / 1000), elapsed, id).run();
-        if (!resp.ok) return { ok: false, output: `测试失败 (${resp.status})：${text.slice(0, 300)}` };
-        return { ok: true, output: `测试成功：模型 ${model}，耗时 ${elapsed}ms` };
+        if (!resp.ok) return { ok: false, output: `测试失败（${probe.label} ${probe.url}，HTTP ${resp.status}，耗时 ${elapsed}ms）：${text.slice(0, 300)}` };
+        return { ok: true, output: `测试成功：模型 ${model}（${probe.label}），耗时 ${elapsed}ms` };
       } catch (e: any) {
-        return { ok: false, output: `测试失败：${e?.message ?? e}` };
+        return { ok: false, output: `测试失败（${probe.label} ${probe.url}）：${e?.message ?? e}` };
       }
     }
     case 'pull': {
@@ -762,7 +761,10 @@ function helpText(command?: string): string {
     '  渠道详情 JSON（密钥打码；price_config 回显成对象）。',
     '',
     'channel test <id> [模型]',
-    '  直连上游发一个 1-token 请求测连通性，回写测试时间/耗时。',
+    '  直连上游发一个最小请求测连通性，回写测试时间/耗时。请求按渠道类型走各自',
+    '  原生协议（不是一律 chat/completions）：openai/azure → chat/completions、',
+    '  openai-responses → responses、anthropic → v1/messages、gemini → models/{m}:generateContent、',
+    '  decisions → {base}/decisions、systemone → {base}/systemone。',
     '  不传模型 = 该渠道列表第一个；显式传的模型必须属于该渠道（测试带渠道 key，',
     '  不允许变成"拿这把 key 调任意模型"的后门）。',
     '  例：channel test 3 deepseek-v4-pro',

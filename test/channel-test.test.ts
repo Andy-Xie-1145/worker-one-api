@@ -165,7 +165,7 @@ test('端点：即使上游失败也回写 response_time（前端「响应」列
     assert.equal(res.status, 200, '测试失败也是 200（success:false）——这是既有契约');
     const body = await res.json() as any;
     assert.equal(body.success, false);
-    assert.match(body.message, /测试失败 \(401/, body.message);
+    assert.match(body.message, /测试失败（OpenAI Chat Completions .*HTTP 401/, body.message);
     assert.match(body.message, /耗时 \d+ms/, '失败信息带耗时');
     assert.equal(env._updates.length, 1, '失败也要写 test_time/response_time');
     assert.equal(env._updates[0].id, 6);
@@ -183,9 +183,133 @@ test('端点：成功消息带耗时，并回写 response_time', async () => {
     const res = await call(env, 6, { body: { model: 'gpt-a' } });
     const body = await res.json() as any;
     assert.equal(body.success, true);
-    assert.match(body.message, /测试成功（gpt-a），耗时 \d+ms/);
+    assert.match(body.message, /测试成功（gpt-a，OpenAI Chat Completions），耗时 \d+ms/);
     assert.equal(env._updates.length, 1);
     assert.equal(typeof env._updates[0].test_time, 'number');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+/* ------------------------------------- 探针按渠道类型走原生协议（不是一律 chat） */
+
+test('探针：openai-responses 渠道打 /responses（body 是 input，不是 messages）', async () => {
+  const CH = { ...CHANNEL, id: 11, type: 'openai-responses', base_url: 'https://api.openai.com/v1', models: 'gpt-6-sol' };
+  const env: any = makeEnv(CH);
+  const original = globalThis.fetch;
+  let seen: { url: string; body: any } = { url: '', body: null };
+  globalThis.fetch = (async (url: any, init: any) => {
+    seen = { url: String(url), body: JSON.parse(init?.body ?? '{}') };
+    return new Response(JSON.stringify({ id: 'r1', output: [] }), { status: 200 });
+  }) as any;
+  try {
+    const body = await (await call(env, 11, { body: { model: 'gpt-6-sol' } })).json() as any;
+    assert.equal(body.success, true, JSON.stringify(body));
+    assert.equal(seen.url, 'https://api.openai.com/v1/responses', '不能打 chat/completions');
+    assert.ok('input' in seen.body && seen.body.messages === undefined);
+    assert.match(body.message, /OpenAI Responses/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('探针：anthropic 渠道打 /v1/messages（body 是 messages+max_tokens，没有 chat 字段）', async () => {
+  const CH = { ...CHANNEL, id: 12, type: 'anthropic', base_url: 'https://api.anthropic.com', models: 'claude-opus-5-5' };
+  const env: any = makeEnv(CH);
+  const original = globalThis.fetch;
+  let seen: { url: string; body: any; headers: any } = { url: '', body: null, headers: {} };
+  globalThis.fetch = (async (url: any, init: any) => {
+    seen = { url: String(url), body: JSON.parse(init?.body ?? '{}'), headers: init?.headers ?? {} };
+    return new Response(JSON.stringify({ id: 'm1', content: [] }), { status: 200 });
+  }) as any;
+  try {
+    const body = await (await call(env, 12, { body: { model: 'claude-opus-5-5' } })).json() as any;
+    assert.equal(body.success, true, JSON.stringify(body));
+    assert.equal(seen.url, 'https://api.anthropic.com/v1/messages');
+    assert.ok(seen.body.max_tokens !== undefined, 'anthropic 必需 max_tokens');
+    assert.equal(seen.headers['x-api-key'], 'upstream-secret');
+    assert.match(body.message, /Anthropic Messages/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('探针：gemini 渠道打 /{version}/models/{model}:generateContent', async () => {
+  const CH = { ...CHANNEL, id: 13, type: 'gemini', base_url: 'https://generativelanguage.googleapis.com', models: 'gemini-3.8-flash' };
+  const env: any = makeEnv(CH);
+  const original = globalThis.fetch;
+  let seen: { url: string; body: any; headers: any } = { url: '', body: null, headers: {} };
+  globalThis.fetch = (async (url: any, init: any) => {
+    seen = { url: String(url), body: JSON.parse(init?.body ?? '{}'), headers: init?.headers ?? {} };
+    return new Response(JSON.stringify({ candidates: [] }), { status: 200 });
+  }) as any;
+  try {
+    const body = await (await call(env, 13, { body: { model: 'gemini-3.8-flash' } })).json() as any;
+    assert.equal(body.success, true, JSON.stringify(body));
+    assert.equal(seen.url, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent');
+    assert.ok(Array.isArray(seen.body.contents), 'Gemini 用 contents');
+    assert.equal(seen.headers['x-goog-api-key'], 'upstream-secret');
+    assert.match(body.message, /Gemini/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('探针：decisions 渠道打 {base}/decisions，body 是 input+questions 数组', async () => {
+  const CH = { ...CHANNEL, id: 14, type: 'decisions', base_url: 'https://api.openai.com/v1', models: 'gpt-6-luna' };
+  const env: any = makeEnv(CH);
+  const original = globalThis.fetch;
+  let seen: { url: string; body: any } = { url: '', body: null };
+  globalThis.fetch = (async (url: any, init: any) => {
+    seen = { url: String(url), body: JSON.parse(init?.body ?? '{}') };
+    return new Response(JSON.stringify({ id: 'd1', answers: [] }), { status: 200 });
+  }) as any;
+  try {
+    const body = await (await call(env, 14, { body: { model: 'gpt-6-luna' } })).json() as any;
+    assert.equal(body.success, true, JSON.stringify(body));
+    assert.equal(seen.url, 'https://api.openai.com/v1/decisions');
+    assert.ok('input' in seen.body);
+    assert.ok(Array.isArray(seen.body.questions));
+    assert.equal(seen.body.questions[0].type, 'predicate');
+    assert.match(body.message, /Decision API/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('探针：systemone 渠道打 {base}/systemone，body 是 state+questions 对象（题型 noul）', async () => {
+  const CH = { ...CHANNEL, id: 15, type: 'systemone', base_url: 'https://api.typesafe.ai/v1', models: 'jev-latest' };
+  const env: any = makeEnv(CH);
+  const original = globalThis.fetch;
+  let seen: { url: string; body: any } = { url: '', body: null };
+  globalThis.fetch = (async (url: any, init: any) => {
+    seen = { url: String(url), body: JSON.parse(init?.body ?? '{}') };
+    return new Response(JSON.stringify({ id: 's1', answers: {} }), { status: 200 });
+  }) as any;
+  try {
+    const body = await (await call(env, 15, { body: { model: 'jev-latest' } })).json() as any;
+    assert.equal(body.success, true, JSON.stringify(body));
+    assert.equal(seen.url, 'https://api.typesafe.ai/v1/systemone');
+    assert.equal(seen.body.state, 'ping');
+    assert.equal(seen.body.questions.ok.type, 'noul');
+    assert.match(body.message, /System One/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('探针：失败消息带协议标签、真实出站 URL 与 HTTP 状态', async () => {
+  const CH = { ...CHANNEL, id: 11, type: 'openai-responses', base_url: 'https://api.openai.com/v1', models: 'gpt-6-sol' };
+  const env: any = makeEnv(CH);
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ error: { message: 'model not found' } }), { status: 404 })) as any;
+  try {
+    const body = await (await call(env, 11, { body: { model: 'gpt-6-sol' } })).json() as any;
+    assert.equal(body.success, false);
+    assert.match(body.message, /OpenAI Responses/);
+    assert.match(body.message, /https:\/\/api\.openai\.com\/v1\/responses/);
+    assert.match(body.message, /HTTP 404/);
+    assert.match(body.message, /model not found/, '上游可读原因透出');
   } finally {
     globalThis.fetch = original;
   }

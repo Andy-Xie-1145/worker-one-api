@@ -95,6 +95,18 @@ Responses 的 `previous_response_id` 无法被无状态网关服务，直接 400
 - 唯一账户 `owner` 在第一次令牌鉴权时懒创建（username `owner`，走账本预存
   $10,000 预算）；后台「总览」页可以随时调整预算。**没有第二个账户，没有注册。**
 
+### 密钥从不回显
+
+明文 `sk-` 密钥只走两条通道：**剪贴板** 和 **显式取回**（`token key <id>` /
+`GET /api/tokens/:id/key`）。理由是回显的代价不对称——终端滚动历史、截图、录屏、
+AI 会话记录都会把屏幕上出现过的东西留存下来，而密钥轮换很贵。
+
+- 令牌列表 / 创建接口只返回 `sk-` + 前 6 位遮罩（`key_masked`），列表响应里没有任何明文；
+- 后台「新建令牌」建完自动把密钥写进剪贴板，页面不显示（剪贴板不可用时降级为该行「复制」）；
+- CLI `token new` 只回报 `#ID`、名称和遮罩，取明文要敲 `token key <id>`——
+  输出单行，方便 `KEY=$(... | jq -r .data.output)` 捕获；
+- 每次取回明文都会写一条管理日志（`取回令牌 #N 明文密钥`），密钥万一外泄能回溯。
+
 ## 内置命令行
 
 管理面内置一个命令解释器：后台「终端」页直接敲命令；同样的命令也可以在真终端里用：
@@ -137,11 +149,12 @@ channel price <id> [JSON | --clear]                 该渠道的价格覆盖（{
 channel on <id> / off <id> / del <id>               启用 / 停用 / 删除
 
 # 令牌
-token list                                          令牌列表
+token list                                          令牌列表（密钥只显示 sk- 前 6 位遮罩）
 token new <名称> [--usd N | --unlimited] [--models a,b]
+                                                    建令牌，回 #ID + 名称 + 遮罩，**不打印明文**
 token set <id> name=... models=a,b usd=N unlimited=1|0 status=1|2 expired=<unix>
                                                     按字段修改
-token key <id>                                      显示完整密钥
+token key <id>                                      取回完整密钥（唯一的明文出口）
 token on <id> / off <id> / del <id>                 启用 / 停用 / 删除
 （没有 Key 级价格：令牌混用渠道且有故障转移，价格跟着渠道走——见 channel price）
 
@@ -473,7 +486,7 @@ npm run deploy
 
 ## 使用
 
-在后台「令牌」页创建密钥（需要的话给某个 Key 单独配价格），然后：
+在后台「令牌」页创建密钥（建完自动进剪贴板，页面不回显明文；要再复制点该行「复制」），然后：
 
 ```bash
 curl https://your-worker.example/v1/chat/completions \

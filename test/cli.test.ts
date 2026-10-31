@@ -155,16 +155,30 @@ test('price default：兜底价可改并生效于未知模型', async () => {
   assert.match(got.output, /\$2/);
 });
 
-test('token new → key → off 往返；Key 级价格已移除并指路', async () => {
+test('token new → key → off 往返；明文不回显，Key 级价格已移除并指路', async () => {
   const env = envOf();
   const created = await run(env, 'token new 测试 --usd 5 --models gpt-4o');
   assert.ok(created.ok, created.output);
-  assert.match(created.output, /sk-[0-9a-f]{48}/);
+  // 不回显：只给 #id + 名称 + 前 6 位遮罩 + 取回方法
+  assert.doesNotMatch(created.output, /sk-[0-9a-f]{48}/, 'token new 绝不能打印明文密钥');
+  assert.match(created.output, /令牌 #(\d+)「测试」已创建/);
+  assert.match(created.output, /sk-[0-9a-f]{6}…（明文不显示）/);
+  assert.match(created.output, /token key \d+/);
+  const id = /令牌 #(\d+)/.exec(created.output)![1];
 
   const list = await run(env, 'token list');
   assert.match(list.output, /测试/);
+  assert.match(list.output, /sk-[0-9a-f]{6}…/, '列表只显示遮罩');
+  assert.doesNotMatch(list.output, /sk-[0-9a-f]{48}/, '列表绝不能带明文');
 
-  const id = /^\s*(\d+)\s/m.exec((await run(env, 'token list')).output)![1];
+  // 唯一的明文出口：token key，单行输出方便 $(...) 捕获；取回要留审计日志
+  const plain = await run(env, `token key ${id}`);
+  assert.ok(plain.ok, plain.output);
+  assert.match(plain.output, /^sk-[0-9a-f]{48}$/, 'token key 才是显式取回通道');
+  const audit = await run(env, 'logs 10');
+  assert.match(audit.output, /管理/, '取回明文要落管理日志');
+  assert.match(audit.output, new RegExp(`取回令牌 #${id}「测试」明文密钥`));
+
   const gone = await run(env, `token price ${id}`);
   assert.ok(!gone.ok && /channel price/.test(gone.output), '指路渠道级');
 

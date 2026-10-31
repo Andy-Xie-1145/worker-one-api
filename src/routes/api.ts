@@ -4,6 +4,7 @@ import {
   ChannelStatusEnabled, TokenStatusEnabled, LogTypeManage,
 } from '../types';
 import { randomKey } from '../lib/crypto';
+import { publicToken, revealTokenKey } from '../lib/token-key';
 import { requireAdmin, invalidateTokenCache, ensureOwner } from '../lib/auth';
 import { getOptions, setOptions, DEFAULT_OPTIONS } from '../lib/options';
 import { rebuildAbilities, deleteAbilities, listModels, csv, parseConfig, resolveTestModel } from '../lib/channel';
@@ -241,9 +242,13 @@ async function buildPublicStatus(env: Env, windowSec: number) {
 
 // ---------------------------------------------------------------- tokens（管理令牌）
 
+/**
+ * 令牌列表**不含明文**：只给 key_masked。明文只能由 GET /tokens/:id/key 显式取回
+ * （SPA 的「复制」按钮 / 脚本），否则一次 GET 就能把全部 key 捞走。
+ */
 api.get('/tokens', requireAdmin, async (c) => {
   const rows = await c.env.DB.prepare('SELECT * FROM tokens ORDER BY id DESC').all<TokenRow>();
-  return c.json(ok(rows.results ?? []));
+  return c.json(ok((rows.results ?? []).map(publicToken)));
 });
 
 api.post('/tokens', requireAdmin, async (c) => {
@@ -263,7 +268,19 @@ api.post('/tokens', requireAdmin, async (c) => {
     )
     .run();
   const token = await c.env.DB.prepare('SELECT * FROM tokens WHERE key = ?').bind(key).first<TokenRow>();
-  return c.json(ok(token, '令牌已创建'));
+  // 创建响应同样只回遮罩：明文要就给剪贴板，不要给"回显"。
+  return c.json(ok(publicToken(token!), '令牌已创建'));
+});
+
+/**
+ * 唯一返回明文的管理接口。调用方负责不进 DOM/不回显（SPA 直接丢剪贴板）。
+ * 每次取回写一条管理日志——密钥外泄时至少能回溯「什么时候被谁取过」。
+ */
+api.get('/tokens/:id/key', requireAdmin, async (c) => {
+  const id = Number(c.req.param('id'));
+  const token = await c.env.DB.prepare('SELECT * FROM tokens WHERE id = ?').bind(id).first<TokenRow>();
+  if (!token) return c.json(fail('令牌不存在'), 404);
+  return c.json(ok({ id, name: token.name, key: await revealTokenKey(c.env, token) }));
 });
 
 api.put('/tokens/:id', requireAdmin, async (c) => {

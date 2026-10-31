@@ -327,6 +327,27 @@ async function loadDashboard(view) {
 
 // ---------------------------------------------------------------- 令牌
 
+/**
+ * 取明文密钥的唯一前端路径：拿到后立刻写剪贴板，明文不落 DOM、不进 toast。
+ * 这样页面被截图 / 被 AI 读取 DOM 都不会带出明文（明文只在网络响应里一闪而过）。
+ */
+async function copyTokenKey(id, btn, onFail) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('/tokens/' + id + '/key');
+    await navigator.clipboard.writeText(r.key);
+    toast('密钥已复制到剪贴板（明文不显示）', 'ok');
+    return true;
+  } catch (e) {
+    const msg = e.message || e;
+    if (onFail) onFail(msg);
+    else toast('复制失败：' + msg + '（浏览器需在安全上下文且窗口有焦点）', 'err');
+    return false;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function pageTokens(view) {
   const rows = await api('/tokens');
   const STATUS = { 1: ['启用', 'ok'], 2: ['已禁用', 'err'], 3: ['已过期', 'warn'], 4: ['额度耗尽', 'warn'] };
@@ -336,7 +357,7 @@ async function pageTokens(view) {
     ${table(['ID', '名称', '密钥', '状态', '剩余额度', '已用', '过期时间', '模型限制', '操作'], rows, (t) => {
       return `<tr>
       <td>${t.id}</td><td>${esc(t.name)}</td>
-      <td><code>sk-${esc(t.key.slice(0, 6))}…</code> <button data-copy="${esc(t.key)}">复制</button></td>
+      <td><code>${esc(t.key_masked || (t.key ? 'sk-' + String(t.key).slice(0, 6) + '…' : 'sk-…'))}</code> <button data-copy="${t.id}">复制</button></td>
       <td><span class="tag ${STATUS[t.status]?.[1] || ''}">${STATUS[t.status]?.[0] || t.status}</span></td>
       <td>${t.unlimited_quota ? '<span class="tag">无限</span>' : usd(t.remain_quota)}</td>
       <td>${usd(t.used_quota)}</td><td>${t.expired_time < 0 ? '永不' : ts(t.expired_time)}</td>
@@ -345,9 +366,7 @@ async function pageTokens(view) {
     })}
   </div>`));
 
-  view.querySelectorAll('[data-copy]').forEach((b) => (b.onclick = () => {
-    navigator.clipboard.writeText('sk-' + b.dataset.copy); toast('完整密钥已复制', 'ok');
-  }));
+  view.querySelectorAll('[data-copy]').forEach((b) => (b.onclick = () => copyTokenKey(Number(b.dataset.copy), b)));
 
   const form = (t = {}) => `
     <label>名称</label><input id="name" value="${esc(t.name || '')}">
@@ -356,6 +375,7 @@ async function pageTokens(view) {
     <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
     <label>可用模型（逗号分隔，留空表示全部）</label><input id="models" value="${esc(t.models || '')}">
     <p class="muted" style="margin:4px 0 0">价格按<b>渠道</b>配置（渠道页「价格覆盖」）——令牌混用渠道且有故障转移，在令牌上定价没有意义。</p>
+    ${t.id ? '' : '<p class="muted" style="margin:4px 0 0">密钥创建后<b>自动进剪贴板</b>，页面不回显明文；要再复制，点列表里该行的「复制」。</p>'}
     ${t.id ? `<label>状态</label><select id="status"><option value="1"${t.status === 1 ? ' selected' : ''}>启用</option><option value="2"${t.status === 2 ? ' selected' : ''}>禁用</option></select>` : ''}`;
 
   const collect = (dlg) => {
@@ -371,8 +391,11 @@ async function pageTokens(view) {
 
   document.getElementById('new').onclick = () => dialog('新建令牌', form(), async (dlg) => {
     const t = await api('/tokens', { method: 'POST', body: collect(dlg) });
-    await navigator.clipboard.writeText('sk-' + t.key).catch(() => {});
-    toast('令牌已创建，密钥已复制到剪贴板', 'ok');
+    // 明文只在「取回 → 剪贴板」这一跳里存在，绝不进 DOM/toast：否则 AI 自动化截图、
+    // 读页面都能把新 Key 带走。剪贴板不可用（无焦点/非安全上下文）时降级到该行「复制」。
+    await copyTokenKey(t.id, null, (why) => {
+      toast(`令牌 #${t.id}「${t.name}」已创建；剪贴板不可用（${why}），请点该行「复制」按钮`, 'err');
+    });
     pageTokens(view);
   });
 
@@ -1123,7 +1146,7 @@ async function pageLogs(view) {
 async function pageTerminal(view) {
   view.replaceChildren($(`<div class="card">
     <h2>终端</h2>
-    <p class="muted" style="margin-bottom:6px">终端里的命令与 REST 完全等价（同一套库函数），也可以在真终端里用 curl 调：</p>
+    <p class="muted" style="margin-bottom:6px">终端里的命令与 REST 完全等价（同一套库函数），也可以在真终端里用 curl 调。注意：<code>token key &lt;id&gt;</code> 等命令会打印明文密钥，共享屏幕 / 录屏时先确认。</p>
     <p class="mono" style="white-space:pre-wrap;word-break:break-all;margin:0 0 12px">curl -X POST ${esc(location.origin)}/api/cli -H "Authorization: Bearer &lt;管理令牌&gt;" -H "Content-Type: application/json" -d '{"command":"status"}'</p>
     <div class="term">
       <div class="term-out" id="termOut"><div class="term-hint">输入 help 查看可用命令。</div></div>

@@ -6,6 +6,7 @@ import { rebuildAbilities, deleteAbilities, listModels, resolveTestModel, parseC
 import { buildProbeRequest } from './channel-probe';
 import { getHeartbeat, runWatchdog } from './watchdog';
 import { randomKey } from './crypto';
+import { maskTokenKey, revealTokenKey } from './token-key';
 import { listUpstreamModels } from './upstream-models';
 import { loadModelBilling, findUnpricedChannelModels, fallbackActive } from './model-billing';
 import {
@@ -377,8 +378,8 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
   switch (sub) {
     case undefined: case 'list': {
       const rows = await env.DB.prepare('SELECT * FROM tokens ORDER BY id').all<TokenRow>();
-      const table2 = table(['ID', '名称', '状态', '剩余', '已用', '模型限制'], (rows.results ?? []).map((t) => [
-        String(t.id), t.name, t.status === 1 ? '启用' : `停用(${t.status})`,
+      const table2 = table(['ID', '名称', '密钥', '状态', '剩余', '已用', '模型限制'], (rows.results ?? []).map((t) => [
+        String(t.id), t.name, maskTokenKey(t.key), t.status === 1 ? '启用' : `停用(${t.status})`,
         t.unlimited_quota ? '无限' : usd(t.remain_quota), usd(t.used_quota), t.models || '全部',
       ]));
       return { ok: true, output: table2 || '（还没有令牌）' };
@@ -390,12 +391,23 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
       const key = randomKey(24);
       const unlimited = flags.has('--unlimited') ? 1 : 0;
       const usdAmount = Number((flags.get('--usd') ?? '').replace(/^\$/, ''));
+      const models = flags.get('--models') ?? '';
       await env.DB.prepare(
         'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models) VALUES (?, ?, ?, ?, ?, ?, -1, ?, ?, ?)',
       )
-        .bind(owner.id, key, TokenStatusEnabled, name, now(), now(), unlimited ? 0 : Math.round((Number.isFinite(usdAmount) ? usdAmount : 0) * QUOTA_PER_USD), unlimited, flags.get('--models') ?? '')
+        .bind(owner.id, key, TokenStatusEnabled, name, now(), now(), unlimited ? 0 : Math.round((Number.isFinite(usdAmount) ? usdAmount : 0) * QUOTA_PER_USD), unlimited, models)
         .run();
-      return { ok: true, output: `令牌已创建：sk-${key}${unlimited ? '（无限额度）' : Number.isFinite(usdAmount) ? `（$${usdAmount}）` : '（0 额度，可用 --usd/--unlimited 调整）'}\n请立即保存，密钥只显示这一次。` };
+      const created = await env.DB.prepare('SELECT * FROM tokens WHERE key = ?').bind(key).first<TokenRow>();
+      const quotaText = unlimited ? '无限额度' : Number.isFinite(usdAmount) ? `$${usdAmount}` : '0 额度（可用 --usd/--unlimited 调整）';
+      // 只回 #id + 名称 + 遮罩：终端滚动历史、截图、AI 会话都可能被留存，明文回显即泄露。
+      return {
+        ok: true,
+        output: [
+          `令牌 #${created!.id}「${name}」已创建（${quotaText}${models ? `，模型：${models}` : ''}）`,
+          `密钥：${maskTokenKey(key)}（明文不显示）`,
+          `取回明文：token key ${created!.id}   ※ 会打印完整密钥，别在共享屏幕/录屏环境敲`,
+        ].join('\n'),
+      };
     }
     case 'set': {
       const id = Number(rest[0]);
@@ -429,7 +441,8 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
       const id = Number(rest[0]);
       const t = await env.DB.prepare('SELECT * FROM tokens WHERE id = ?').bind(id).first<TokenRow>();
       if (!t) return { ok: false, output: `令牌 #${rest[0]} 不存在` };
-      return { ok: true, output: `sk-${t.key}` };
+      // 同一个取回实现（含审计日志）：输出单行，方便 KEY=$(...) 捕获。
+      return { ok: true, output: await revealTokenKey(env, t) };
     }
     case 'on': case 'off': {
       const id = Number(rest[0]);
@@ -822,19 +835,24 @@ function helpText(command?: string): string {
   const token = [
     '──────── 令牌（token）',
     '',
+    '※ 明文密钥从不回显：新建/列表只给 sk- 前 6 位遮罩。要明文必须显式取回',
+    '  （token key <id>），因为终端滚动历史、截图、AI 会话记录都会把回显留下来。',
+    '',
     'token list',
-    '  令牌列表：ID / 名称 / 状态 / 剩余额度 / 已用 / 模型限制。',
+    '  令牌列表：ID / 名称 / 密钥遮罩 / 状态 / 剩余额度 / 已用 / 模型限制。',
     '',
     'token new <名称> [--usd N | --unlimited] [--models a,b]',
-    '  创建令牌并显示完整密钥（只显示这一次）。--usd 设额度；--unlimited 不限额；',
-    '  --models 限制这把 Key 只能调指定模型（逗号分隔，留空 = 全部）。',
+    '  创建令牌，只回报 #ID、名称和密钥遮罩，不打印明文。',
+    '  --usd 设额度；--unlimited 不限额；--models 限制这把 Key 只能调指定模型（逗号分隔，留空 = 全部）。',
     '  例：token new 笔记本 --unlimited --models deepseek-v4-pro,gpt-4o',
+    '  拿明文：token key <id>',
     '',
     'token set <id> name=... models=a,b usd=N unlimited=1|0 status=1|2 expired=<unix>',
     '  按字段修改（一次可改多个）；expired 为 unix 秒，-1 = 永不过期。',
     '',
     'token key <id>',
-    '  显示完整密钥（sk- 前缀）。',
+    '  显示完整密钥（sk- 前缀）——这是唯一的明文出口，输出单行方便 $(...) 捕获。',
+    '  例：KEY=$(curl -s .../api/cli -d \'{"command":"token key 3"}\' | jq -r .data.output)',
     '',
     'token on <id> / token off <id> / token del <id>',
     '  启用 / 停用 / 删除令牌。',

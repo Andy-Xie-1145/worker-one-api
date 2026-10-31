@@ -58,6 +58,9 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.
 .toast{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:8px;padding:10px 14px;box-shadow:var(--shadow);max-width:360px}
 .toast.err{border-left-color:var(--err)}
 .toast.ok{border-left-color:var(--ok)}
+.build-banner{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:99;display:flex;gap:10px;align-items:center;
+  background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:8px;
+  padding:10px 14px;box-shadow:var(--shadow);max-width:min(720px,92vw)}
 dialog{border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);color:var(--text);padding:0;max-width:620px;width:92vw;box-shadow:var(--shadow)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
 .dlg-body{padding:18px;max-height:74vh;overflow:auto}
@@ -89,6 +92,18 @@ const app = document.getElementById('app');
 const KEY_STORAGE = 'oneapi_admin_key';
 let state = { owner: null, status: null, page: 'dashboard' };
 const QUOTA_PER_USD = 500000;
+
+/**
+ * 前端构建号，必须与 src/lib/version.ts 的 SPA_BUILD 一致（test/spa-build 会钉住）。
+ *
+ * 为什么需要：SPA 是单文件 + hash 路由，页面打开后就不再请求 HTML。标签页挂久了，
+ * 浏览器里跑的还是旧 JS，而 Worker 已经是新代码——「旧页面读新接口」就会炸出
+ * `Cannot read properties of undefined (reading 'slice')` 这种事故（真实踩过：
+ * 令牌接口不再回明文 key，旧页面还在读 t.key.slice()，还往剪贴板写了 sk-undefined）。
+ * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
+ * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
+ */
+const SPA_BUILD = '2026-11-01.2';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -125,9 +140,63 @@ async function api(path, opts = {}) {
 
 // ---------------------------------------------------------------- shell
 
+/**
+ * 构建号对账：拿到服务端的 spa_build（拿不到就返回 null，当作"未知"放过）。
+ * `cache: 'no-store'` + 时间戳参数，避免被浏览器或边缘缓存糊弄过去。
+ */
+async function remoteBuild() {
+  try {
+    const res = await fetch('/api/status?_=' + Date.now(), { cache: 'no-store', headers: { Accept: 'application/json' } });
+    const json = await res.json();
+    return json?.data?.spa_build || null;
+  } catch {
+    return null;
+  }
+}
+
+/** 重载过一次仍旧过期时的兜底横幅（防止无限重载）。 */
+function buildBanner(remote) {
+  if (document.getElementById('buildBanner')) return;
+  const el = $(`<div class="build-banner" id="buildBanner">
+    页面已过期：服务端 <code>${esc(remote)}</code>，本页 <code>${esc(SPA_BUILD)}</code>
+    <button class="primary">立即刷新</button></div>`);
+  el.querySelector('button').onclick = () => { sessionStorage.removeItem('spa-build:' + remote); location.reload(); };
+  document.body.append(el);
+}
+
+/**
+ * 返回 true 表示"页面是旧的"：要么正在重载，要么已经挂上横幅。
+ * 调用方拿到 true 就别继续渲染业务逻辑了。
+ */
+async function guardBuild(remote) {
+  const theirs = remote ?? (await remoteBuild());
+  if (!theirs || theirs === SPA_BUILD) {
+    document.getElementById('buildBanner')?.remove();
+    if (theirs) sessionStorage.removeItem('spa-build:' + SPA_BUILD);
+    return false;
+  }
+  const flag = 'spa-build:' + theirs;
+  if (sessionStorage.getItem(flag)) { buildBanner(theirs); return true; }
+  sessionStorage.setItem(flag, '1');
+  location.reload();
+  return true;
+}
+
+let buildWatched = false;
+function watchBuild() {
+  if (buildWatched) return;
+  buildWatched = true;
+  const check = () => { if (!document.hidden) guardBuild(); };
+  setInterval(check, 5 * 60 * 1000);          // 挂着不动也会查
+  document.addEventListener('visibilitychange', check); // 切回标签页立刻查
+  window.addEventListener('focus', check);
+}
+
 async function boot() {
   state.status = await api('/status').catch(() => null);
   if (!state.status) { app.innerHTML = '<div class="center"><p>无法连接到服务</p></div>'; return; }
+  if (await guardBuild(state.status.spa_build)) return; // 页面过期：重载中/已提示，别拿旧逻辑跑
+  watchBuild();
   if (!localStorage.getItem(KEY_STORAGE)) return showUnlock();
   try { state.owner = await api('/owner'); } catch (err) { toast(err.message, 'err'); return; }
   const h = parseHash();
@@ -335,7 +404,12 @@ async function copyTokenKey(id, btn, onFail) {
   if (btn) btn.disabled = true;
   try {
     const r = await api('/tokens/' + id + '/key');
-    await navigator.clipboard.writeText(r.key);
+    // 形状校验：宁可报错也不要把 sk-undefined 写进剪贴板（旧页面 + 新接口就是这么坏掉的）。
+    const key = r && r.key;
+    if (typeof key !== 'string' || !/^sk-[0-9a-z]{16,}$/i.test(key)) {
+      throw new Error('接口没有返回完整密钥（页面可能已过期，请刷新后重试）');
+    }
+    await navigator.clipboard.writeText(key);
     toast('密钥已复制到剪贴板（明文不显示）', 'ok');
     return true;
   } catch (e) {
@@ -349,6 +423,11 @@ async function copyTokenKey(id, btn, onFail) {
 }
 
 async function pageTokens(view) {
+  autoRefresh(() => loadTokens(view)); // 30 秒重拉一次列表（标签页切后台时停表）
+  await loadTokens(view);
+}
+
+async function loadTokens(view) {
   const rows = await api('/tokens');
   const STATUS = { 1: ['启用', 'ok'], 2: ['已禁用', 'err'], 3: ['已过期', 'warn'], 4: ['额度耗尽', 'warn'] };
 
@@ -391,26 +470,27 @@ async function pageTokens(view) {
 
   document.getElementById('new').onclick = () => dialog('新建令牌', form(), async (dlg) => {
     const t = await api('/tokens', { method: 'POST', body: collect(dlg) });
+    if (!t || typeof t.id !== 'number') throw new Error('接口没有返回令牌编号（页面可能已过期，请刷新后重试）');
     // 明文只在「取回 → 剪贴板」这一跳里存在，绝不进 DOM/toast：否则 AI 自动化截图、
     // 读页面都能把新 Key 带走。剪贴板不可用（无焦点/非安全上下文）时降级到该行「复制」。
     await copyTokenKey(t.id, null, (why) => {
       toast(`令牌 #${t.id}「${t.name}」已创建；剪贴板不可用（${why}），请点该行「复制」按钮`, 'err');
     });
-    pageTokens(view);
+    await loadTokens(view);
   });
 
   view.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => {
     const t = rows.find((r) => r.id === Number(b.dataset.edit));
     dialog('编辑令牌', form(t), async (dlg) => {
       await api('/tokens/' + t.id, { method: 'PUT', body: collect(dlg) });
-      toast('已保存', 'ok'); pageTokens(view);
+      toast('已保存', 'ok'); await loadTokens(view);
     });
   }));
 
   view.querySelectorAll('[data-del]').forEach((b) => (b.onclick = async () => {
     if (!confirm('确定删除该令牌？')) return;
     await api('/tokens/' + b.dataset.del, { method: 'DELETE' });
-    toast('已删除', 'ok'); pageTokens(view);
+    toast('已删除', 'ok'); await loadTokens(view);
   }));
 }
 
@@ -1227,6 +1307,10 @@ async function pageSettings(view) {
     <div class="card"><h2>自检</h2>
       <div class="row"><button id="runWd">运行自检</button><span class="muted">执行一次 watchdog 检查，结果显示在下方（原始 JSON）。</span></div>
       <pre id="wdOut" class="mono" style="white-space:pre-wrap;margin:10px 0 0"></pre>
+    </div>
+    <div class="card"><h2>版本</h2>
+      <p class="muted" style="margin:0">前端构建 <code>${esc(SPA_BUILD)}</code> · 服务端构建 <code>${esc(state.status?.spa_build || '未知')}</code> · 协议版本 <code>${esc(state.status?.version || '—')}</code></p>
+      <p class="muted" style="margin:6px 0 0">两边不一致 = 本页是旧 JS（标签页挂久了没重载），正常会自动重载一次；没重载就 <b>Ctrl+Shift+R</b> 硬刷新。</p>
     </div>
   </div>`));
 

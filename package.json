@@ -9,7 +9,7 @@
     "db:init": "wrangler d1 execute oneapi --remote --file=./migrations/0001_init.sql",
     "db:init:local": "wrangler d1 execute oneapi --local --file=./migrations/0001_init.sql",
     "typecheck": "tsc --noEmit",
-    "test": "esbuild test/stream.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test.mjs --log-level=error && node node_modules/.cache/test.mjs && npm run test:expr && npm run test:pricing && npm run test:billing-identity && npm run test:responses && npm run test:gemini && npm run test:cli && npm run test:channel-test && npm run test:fetch-models && npm run test:model-billing && npm run test:cooldown && npm run test:health && npm run test:decisions && npm run test:decisions-translate && npm run test:auto-disable && npm run test:403-fallback && npm run test:route-alert && npm run test:models && npm run test:audit-billing && npm run test:query-plan && npm run test:token-secret",
+    "test": "esbuild test/stream.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test.mjs --log-level=error && node node_modules/.cache/test.mjs && npm run test:expr && npm run test:pricing && npm run test:billing-identity && npm run test:responses && npm run test:gemini && npm run test:cli && npm run test:channel-test && npm run test:fetch-models && npm run test:model-billing && npm run test:cooldown && npm run test:health && npm run test:decisions && npm run test:decisions-translate && npm run test:auto-disable && npm run test:403-fallback && npm run test:route-alert && npm run test:models && npm run test:audit-billing && npm run test:query-plan && npm run test:token-secret && npm run test:spa-build",
     "test:d1": "bash test/d1-guard.sh",
     "db:migrate": "for f in migrations/*.sql; do wrangler d1 execute oneapi --remote -y --file=$f; done",
     "audit:llm-billing": "esbuild scripts/audit-llm-billing.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/audit.mjs --log-level=error && node node_modules/.cache/audit.mjs",
@@ -32,7 +32,8 @@
     "test:403-fallback": "esbuild test/403-fallback.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/403-fallback.mjs --log-level=error && node node_modules/.cache/403-fallback.mjs",
     "test:route-alert": "esbuild test/route-alert.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/route-alert.mjs --log-level=error && node node_modules/.cache/route-alert.mjs",
     "test:query-plan": "esbuild test/query-plan.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/query-plan.mjs --log-level=error && node --no-warnings node_modules/.cache/query-plan.mjs",
-    "test:token-secret": "esbuild test/token-secret.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/token-secret.mjs --log-level=error && node node_modules/.cache/token-secret.mjs"
+    "test:token-secret": "esbuild test/token-secret.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/token-secret.mjs --log-level=error && node node_modules/.cache/token-secret.mjs",
+    "test:spa-build": "esbuild test/spa-build.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/spa-build.mjs --log-level=error && node node_modules/.cache/spa-build.mjs"
   },
   "dependencies": {
     "hono": "^4.6.14"

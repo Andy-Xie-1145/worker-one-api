@@ -17,6 +17,7 @@ import { listCooling, deriveState, percentiles, engineOf } from '../lib/health';
 import { ADAPTORS, OPENAI_COMPATIBLE_PRESETS } from '../relay';
 import { PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, QUOTA_PER_USD, quotaToUSD, validatePriceSpec, type Price, type PriceSpec } from '../lib/pricing';
 import { runCli } from '../lib/cli';
+import { SPA_BUILD } from '../lib/version';
 import type { AdaptorContext } from '../relay/adaptor';
 
 const api = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -76,6 +77,7 @@ api.get('/status', async (c) => {
     ok({
       system_name: options.SystemName,
       version: '0.2.0',
+      spa_build: SPA_BUILD,
       quota_per_usd: QUOTA_PER_USD,
     }),
   );

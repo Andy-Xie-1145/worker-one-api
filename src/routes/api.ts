@@ -522,9 +522,10 @@ api.post('/channels/:id/test', requireAdmin, async (c) => {
     const elapsed = Date.now() - started;
     const text = await resp.text();
     await c.env.DB.prepare('UPDATE channels SET test_time = ?, response_time = ? WHERE id = ?').bind(now(), elapsed, id).run();
-    if (!resp.ok) return c.json(fail(`测试失败 (${resp.status}): ${text.slice(0, 500)}`), 200);
-    return c.json(ok({ elapsed_ms: elapsed, model }, `测试成功，耗时 ${elapsed}ms`));
+    if (!resp.ok) return c.json(fail(`测试失败 (${resp.status}，耗时 ${elapsed}ms): ${text.slice(0, 500)}`), 200);
+    return c.json(ok({ elapsed_ms: elapsed, model }, `测试成功（${model}），耗时 ${elapsed}ms`));
   } catch (e: any) {
+    // 网络/构建失败没有可用的上游耗时，如实说，不要编一个数字。
     return c.json(fail(`测试失败: ${e?.message ?? e}`), 200);
   }
 });

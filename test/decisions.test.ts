@@ -568,7 +568,7 @@ function makeDecisionWorld(over: { config?: string; type?: string; base?: string
     channels: [
       {
         id: 8, type, key: 'dec-secret', status: 1, name: 'my-decisions',
-        weight: 1, priority: 0, base_url: over.base ?? 'https://dec.example.com', models: DMODEL,
+        weight: 1, priority: 0, base_url: over.base ?? 'https://dec.example.com/v1', models: DMODEL,
         group: 'default', model_mapping: '', config: over.config ?? '', system_prompt: '',
       },
     ],
@@ -619,13 +619,13 @@ test('decisions 类型：config.decisions_path 改路径（各家 Decision API �
   }
 });
 
-test('decisionsSupport 单元：双类型默认路径（v1/decisions、v1/systemone），自定义优先，剥开头斜杠', async () => {
+test('decisionsSupport 单元：双类型默认路径只有端点名（decisions/systemone），自定义优先，剥开头斜杠', async () => {
   const { decisionsSupport } = await import('../src/relay/decisions');
   const dec = { type: 'decisions', base_url: 'https://x.test', key: 'k', models: '', config: '' } as never;
-  assert.deepEqual(decisionsSupport(dec, {}), { ok: true, path: 'v1/decisions' });
+  assert.deepEqual(decisionsSupport(dec, {}), { ok: true, path: 'decisions' }, '路径不含版本段');
   assert.deepEqual(decisionsSupport(dec, { decisions_path: '/custom/decide/' }), { ok: true, path: 'custom/decide/' });
   const so = { type: 'systemone', base_url: 'https://x.test', key: 'k', models: '', config: '' } as never;
-  assert.deepEqual(decisionsSupport(so, {}), { ok: true, path: 'v1/systemone' });
+  assert.deepEqual(decisionsSupport(so, {}), { ok: true, path: 'systemone' }, '路径不含版本段');
   assert.deepEqual(decisionsSupport(so, { decisions_path: 'so2' }), { ok: true, path: 'so2' });
   // chat 渠道（openai 类型）不受影响：无声明 + 非白名单主机仍拒绝
   const openaiCh = { type: 'openai', base_url: 'https://api.deepseek.com', key: 'k', models: '', config: '' } as never;
@@ -635,7 +635,7 @@ test('decisionsSupport 单元：双类型默认路径（v1/decisions、v1/system
 /* ------------------------------------------------ 跨方言翻译端到端 */
 
 test('跨方言：OpenAI 客户端调 systemone 渠道——请求译成 state/对象，answers 译回数组', async () => {
-  const w = makeDecisionWorld({ type: 'systemone', base: 'https://so.example.com' });
+  const w = makeDecisionWorld({ type: 'systemone', base: 'https://so.example.com/v1' });
   const script = scriptFetch([{ status: 200, body: { id: 'so1', answers: { q0: { choice: 'billing' }, q1: { p: 0.9 } }, usage: { input_tokens: 7 } } }]);
   let res: Response;
   try {
@@ -693,6 +693,39 @@ test('跨方言：TypeSafe 客户端调 decisions 渠道——请求译成 input
   // 客户端拿回 TypeSafe 方言：answers 按原问题名键控
   const out = await (res as any).clone().json();
   assert.deepEqual(out.answers, { dept: { choice: 'tech' }, urgent: { p: 0.2 } });
+});
+
+test('版本段随 base_url：纯拼接不注入不剥除；留空回落到类型自己的官方默认地址', async () => {
+  // ① base 带 /v1 → 出站 /v1/systemone（版本来自 base，网关只拼端点名）
+  const w1 = makeDecisionWorld({ type: 'systemone', base: 'https://so.example.com/v1' });
+  const s1 = scriptFetch([{ status: 200, body: { answers: {} } }]);
+  try {
+    const r = await call(w1, '/v1/decisions', { model: DMODEL, state: 's', questions: { a: { type: 'noul' } } });
+    assert.equal(r.status, 200);
+    assert.match(s1.calls[0].url, /so\.example\.com\/v1\/systemone$/, `应带 base 的 /v1：${s1.calls[0].url}`);
+  } finally {
+    s1.restore();
+  }
+  // ② base 不带版本段 → 出站 /systemone（**不注入 v1**，版本是运维的事）
+  const w2 = makeDecisionWorld({ type: 'systemone', base: 'https://so.example.com' });
+  const s2 = scriptFetch([{ status: 200, body: { answers: {} } }]);
+  try {
+    const r = await call(w2, '/v1/decisions', { model: DMODEL, state: 's', questions: { a: { type: 'noul' } } });
+    assert.equal(r.status, 200);
+    assert.match(s2.calls[0].url, /so\.example\.com\/systemone$/, `不应注入 v1：${s2.calls[0].url}`);
+  } finally {
+    s2.restore();
+  }
+  // ③ base 留空 → systemone 回落自己的官方默认（api.typesafe.ai/v1，不是 openai 的！）
+  const w3 = makeDecisionWorld({ type: 'systemone', base: '' });
+  const s3 = scriptFetch([{ status: 200, body: { answers: {} } }]);
+  try {
+    const r = await call(w3, '/v1/decisions', { model: DMODEL, state: 's', questions: { a: { type: 'noul' } } });
+    assert.equal(r.status, 200);
+    assert.match(s3.calls[0].url, /api\.typesafe\.ai\/v1\/systemone$/, `默认地址：${s3.calls[0].url}`);
+  } finally {
+    s3.restore();
+  }
 });
 
 let failed = 0;

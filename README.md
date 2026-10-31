@@ -42,8 +42,8 @@ LLM API 中转网关，完整运行在 Cloudflare Workers 上，**不依赖任�
 | type | 说明 |
 |---|---|
 | `openai` | **OpenAI Chat Completion**：通用 OpenAI 兼容接口，配 base_url 即可接入 DeepSeek、Moonshot、Groq、智谱、DashScope、SiliconFlow、OpenRouter、xAI 等 |
-| `decisions` | **Decision API**（OpenAI 方言）：出站 `/v1/decisions`，请求 `{model, input, questions:[]}`，题型 predicate/choice/score；渠道里的模型**自动**全部视为决策模型 |
-| `systemone` | **System One**（TypeSafe 方言）：出站 `/v1/systemone`，请求 `{model, state, questions:{}}`，题型 noul/choice/score；模型同样自动视为决策模型。网关在两种方言间**自动翻译**（state↔input、questions 对象↔数组、noul↔predicate、criteria↔options），`config.decisions_path` 可改任一类的出站路径 |
+| `decisions` | **Decision API**（OpenAI 方言）：出站 `{base_url}/decisions`，请求 `{model, input, questions:[]}`，题型 predicate/choice/score；渠道里的模型**自动**全部视为决策模型 |
+| `systemone` | **System One**（TypeSafe 方言）：出站 `{base_url}/systemone`，请求 `{model, state, questions:{}}`，题型 noul/choice/score；模型同样自动视为决策模型。网关在两种方言间**自动翻译**（state↔input、questions 对象↔数组、noul↔predicate、criteria↔options），`config.decisions_path` 可改任一类的出站路径 |
 | `openai-responses` | **OpenAI Responses**：打上游的 `/v1/responses`；中枢 chat 形状会自动翻译过去（system→instructions、tool_calls→function_call item、max_tokens→max_output_tokens） |
 | `anthropic` | **Anthropic Messages**：Anthropic 原生 Messages API，双向转换（含 tool_use / 图片 / system） |
 | `gemini` | **Google Gemini**：generateContent，双向转换（含 functionCall / inlineData） |
@@ -347,17 +347,23 @@ Decisions 不是流式接口，带 `stream: true` 会在预扣之前直接 400�
 ### 接入一个决策渠道
 
 决策接口有**两种方言**（不是同一家，2026-11 官方文档核对）：OpenAI Decisions
-（`/v1/decisions`，`{model, input, questions:[]}`，题型 predicate/choice/score，
-模型 gpt-6-luna）与 TypeSafe System One（`/v1/systemone`，`{model, state, questions:{}}`，
-题型 noul/choice/score，模型 jev-latest）。对应**两个专用类型**，渠道里的模型
-**自动全部视为决策模型**，无需任何声明：
+（`{model, input, questions:[]}`，题型 predicate/choice/score，模型 gpt-6-luna）与
+TypeSafe System One（`{model, state, questions:{}}`，题型 noul/choice/score，
+模型 jev-latest）。对应**两个专用类型**，渠道里的模型**自动全部视为决策模型**，
+无需任何声明：
 
 ```bash
-channel add decisions oai-dec https://api.openai.com sk-xxx --models gpt-6-luna
-channel add systemone jev https://api.typesafe.ai sk-xxx --models jev-latest
-# 出站路径不统一的上游用 config.decisions_path 改（直接拼 base_url，无自动 /v1）
+# base_url 写到版本段；网关只往后拼端点名 decisions / systemone
+channel add decisions oai-dec https://api.openai.com/v1 sk-xxx --models gpt-6-luna
+channel add systemone jev https://api.typesafe.ai/v1 sk-xxx --models jev-latest
+# 路径不统一的上游用 config.decisions_path 改（同样是纯拼接，不注入 /vN）
 channel set <id> config='{"decisions_path":"custom/decide"}'
 ```
+
+**URL 拼接规则**（与 chat/completions、responses 完全同待遇）：`{base_url}/{端点名}`。
+版本段（`/v1`、`/v2`…）属于 base_url，由运维填——网关**不注入、也不剥除**任何
+`/vN`，因为版本不一定是 1。上游是 `https://host/v1/systemone` 就把 base 写成
+`https://host/v1`；`config.decisions_path` 只替换端点路径本身。
 
 **方言自动翻译**（与 chat 翻译器同一哲学）：入站按 `state`/`input` 自动识别客户端
 方言，跨方言时翻译到上游方言并把 `answers` 双向翻回——OpenAI SDK 可以直接调

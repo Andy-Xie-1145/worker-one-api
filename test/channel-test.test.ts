@@ -46,6 +46,8 @@ const TOKEN_KEY = 'a'.repeat(48);
 
 function makeEnv(channelRow: any) {
   const kv = new Map<string, string>();
+  /** 捕获渠道测试回写的 UPDATE（test_time / response_time）——失败也要写。 */
+  const updates: Array<{ test_time: number; response_time: number; id: number }> = [];
   const db = {
     prepare: (sql: string) => {
       const stmt: any = {
@@ -63,13 +65,20 @@ function makeEnv(channelRow: any) {
           return null;
         },
         all: async () => ({ results: [] }),
-        run: async () => ({ meta: { changes: 1 } }),
+        run: async () => {
+          const one = sql.replace(/\s+/g, ' ').trim();
+          if (/^UPDATE channels SET test_time = \?, response_time = \? WHERE id = \?$/.test(one)) {
+            const [test_time, response_time, id] = stmt._binds ?? [];
+            updates.push({ test_time, response_time, id });
+          }
+          return { meta: { changes: 1 } };
+        },
       };
       return stmt;
     },
     batch: async (stmts: any[]) => { for (const s of stmts) await s.run(); },
   };
-  return { DB: db, CACHE: kv, ASSETS: { fetch: async () => new Response('spa') }, ADMIN_KEY: ADMIN } as never;
+  return { DB: db, CACHE: kv, ASSETS: { fetch: async () => new Response('spa') }, ADMIN_KEY: ADMIN, _updates: updates } as never;
 }
 
 async function call(env: never, id: number, init: { body?: unknown; query?: string; admin?: string | null }) {
@@ -142,6 +151,41 @@ test('端点：渠道不存在 404；未配置模型 400；管理令牌错误 40
     assert.equal(noModels.status, 400);
     const badAdmin = await call(makeEnv(CHANNEL), 6, { admin: 'wrong' });
     assert.equal(badAdmin.status, 401);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('端点：即使上游失败也回写 response_time（前端「响应」列要能更新），消息带耗时', async () => {
+  const env: any = makeEnv(CHANNEL);
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ error: { message: 'bad key' } }), { status: 401 })) as any;
+  try {
+    const res = await call(env, 6, { body: { model: 'gpt-a' } });
+    assert.equal(res.status, 200, '测试失败也是 200（success:false）——这是既有契约');
+    const body = await res.json() as any;
+    assert.equal(body.success, false);
+    assert.match(body.message, /测试失败 \(401/, body.message);
+    assert.match(body.message, /耗时 \d+ms/, '失败信息带耗时');
+    assert.equal(env._updates.length, 1, '失败也要写 test_time/response_time');
+    assert.equal(env._updates[0].id, 6);
+    assert.ok(env._updates[0].response_time >= 0);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('端点：成功消息带耗时，并回写 response_time', async () => {
+  const env: any = makeEnv(CHANNEL);
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })) as any;
+  try {
+    const res = await call(env, 6, { body: { model: 'gpt-a' } });
+    const body = await res.json() as any;
+    assert.equal(body.success, true);
+    assert.match(body.message, /测试成功（gpt-a），耗时 \d+ms/);
+    assert.equal(env._updates.length, 1);
+    assert.equal(typeof env._updates[0].test_time, 'number');
   } finally {
     globalThis.fetch = original;
   }

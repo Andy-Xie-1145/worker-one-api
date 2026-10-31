@@ -18,16 +18,14 @@ import { translateDecisionsRequest, translateDecisionsResponse } from './decisio
 export const DECISIONS_PATH = 'alpha/decisions';
 
 /**
- * `decisions`（OpenAI 方言）与 `systemone`（TypeSafe 方言）类型的默认出站路径。
- *
- * Decision API 的路径各家并不统一，默认值来自两家的官方文档（2026-11-01 核对）：
- * OpenAI Decisions = /v1/decisions，TypeSafe System One = /v1/systemone；
- * 不一样的上游用 `config.decisions_path` 改。路径**直接拼在 base_url 后**
- * （buildDecisionsRequest 不走 apiPrefix，无自动 /v1）：上游是
- * https://host/custom/decide 就把 base_url 或路径写全。
+ * `decisions`（OpenAI 方言）与 `systemone`（TypeSafe 方言）类型的默认出站路径
+ * ——**只有端点名，不含版本段**。版本属于 base URL（可能是 v1/v2/v3，由配置决定），
+ * 拼接是纯 joinURL：`{base_url}/{路径}`，与 chat/completions 一个待遇——
+ * **网关从不注入、也从不剥除任何 /vN**。base 写 `https://api.typesafe.ai/v1`，
+ * 出站就是 `/v1/systemone`。路径不统一的上游用 `config.decisions_path` 改。
  */
-export const OPENAI_DECISIONS_PATH = 'v1/decisions';
-export const SYSTEMONE_PATH = 'v1/systemone';
+export const OPENAI_DECISIONS_PATH = 'decisions';
+export const SYSTEMONE_PATH = 'systemone';
 
 /**
  * 默认认得 Decisions 的上游主机。
@@ -142,6 +140,8 @@ export function buildDecisionsRequest(
   const translated = translateDecisionsRequest(rest, from, to);
   ctx.decisionsKeys = translated.keys;
   const body = { ...translated.body, model: ctx.upstreamModel };
+  // 纯拼接：{base_url}/{路径}。版本段属于 base URL（v1/v2/v3 由运维填），
+  // 网关**不注入、不剥除**任何 /vN——与 chat/completions、responses 完全同待遇。
   return { url: joinURL(base, ctx.path), headers, body: JSON.stringify(body) };
 }
 

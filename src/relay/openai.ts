@@ -18,7 +18,9 @@ export const openaiAdaptor: Adaptor = {
   supportsDecisions: true,
 
   buildRequest(req: ChatRequest, ctx: AdaptorContext) {
-    const base = ctx.channel.base_url || ctx.config.base_url || openaiAdaptor.defaultBaseURL;
+    // 兜底用 this（= 实际的 adaptor）而不是写死 openaiAdaptor：decisions / systemone
+    // 复用这个方法，留空 base_url 时应各自回落到自己的官方默认地址。
+    const base = ctx.channel.base_url || ctx.config.base_url || this.defaultBaseURL || openaiAdaptor.defaultBaseURL;
     const body: ChatRequest = { ...req, model: ctx.upstreamModel };
     if (body.stream && ctx.config.no_stream_options !== true) {
       body.stream_options = { ...(body.stream_options ?? {}), include_usage: true };

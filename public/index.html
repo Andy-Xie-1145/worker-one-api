@@ -432,7 +432,7 @@ async function pageChannels(view) {
     <label>渠道额外配置 JSON（可选，如 {"api_version":"2024-10-21"}）</label><textarea id="config">${esc(ch.config || '')}</textarea>
     <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input type="checkbox" id="decisions" style="width:auto"> 此渠道承载决策接口（客户端 <code>POST /v1/decisions</code>）</label>
     <input id="decisions_path" placeholder="出站路径，默认 alpha/decisions（如 decide、systemone）">
-    <p class="muted" style="margin:4px 0 0">最省事的做法：类型直接选 <b>Decision API</b>（OpenAI 方言，默认 /v1/decisions）或 <b>System One</b>（TypeSafe 方言，默认 /v1/systemone）——<b>该渠道的模型全部自动视为决策模型</b>，无需声明；网关在两种方言间自动翻译。OpenAI 形状渠道也可承载（OpenRouter 自动启用；勾选写入 <code>{"decisions":true}</code>，取消勾选移除），但模型需在「设置 → 仅决策接口的模型」声明。路径不需要 /v1 前缀时，在 config 里加 <code>"no_version_prefix":true</code>。</p>
+    <p class="muted" style="margin:4px 0 0">最省事的做法：类型直接选 <b>Decision API</b>（OpenAI 方言，出站 <code>{base_url}/decisions</code>）或 <b>System One</b>（TypeSafe 方言，出站 <code>{base_url}/systemone</code>）——<b>base_url 写到版本段</b>（如 <code>https://api.typesafe.ai/v1</code>），网关只往后拼端点名、不注入也不剥除 /vN（与 chat/completions 同待遇）；<b>该渠道的模型全部自动视为决策模型</b>，无需声明，且网关在两种方言间自动翻译。OpenAI 形状渠道也可承载（OpenRouter 自动启用；勾选写入 <code>{"decisions":true}</code>，取消勾选移除），但模型需在「设置 → 仅决策接口的模型」声明。</p>
     <label>系统提示词（可选，注入到每个请求）</label><textarea id="system_prompt">${esc(ch.system_prompt || '')}</textarea>`;
 
   // 从上游拉取模型列表：POST /api/channels/fetch-models。新建渠道用表单现输入的
@@ -507,10 +507,15 @@ async function pageChannels(view) {
       try { host = ch.base_url ? new URL(ch.base_url).hostname.toLowerCase() : ''; } catch { host = ''; }
       const whitelisted = host === 'openrouter.ai' || host.endsWith('.openrouter.ai');
       const sync = () => {
+        // base_url 占位符随类型给官方默认地址（含版本段 /v1——版本属于 base_url，
+        // 网关只往后拼端点名 decisions / systemone）。
+        const defBase = (meta.adaptors || []).find((a) => a.name === typeSel.value)?.default_base_url;
+        const baseInput = dlg.querySelector('#base_url');
+        if (baseInput && !baseInput.value) baseInput.placeholder = defBase || 'https://api.example.com';
         if (typeSel.value === 'decisions' || typeSel.value === 'systemone') {
           dec.checked = true; dec.disabled = true;
           decPath.disabled = false;
-          decPath.placeholder = typeSel.value === 'decisions' ? '出站路径，默认 v1/decisions' : '出站路径，默认 v1/systemone';
+          decPath.placeholder = typeSel.value === 'decisions' ? '出站路径，默认 decisions（版本段写在 base_url）' : '出站路径，默认 systemone（版本段写在 base_url）';
         } else if (whitelisted) {
           dec.checked = true; dec.disabled = true; decPath.disabled = true;
           decPath.placeholder = 'openrouter.ai 白名单自动启用（alpha/decisions）';
@@ -591,12 +596,30 @@ async function pageChannels(view) {
     wire(dlg, ch);
   }));
 
-  // 行内「测试」→ 弹窗选模型；双击选项 = 直接确认。
+  // 测试渠道：抽成一个函数，单模型渠道直接测、多模型弹窗选。
+  // 要点：**无论成功失败都重拉渠道表**——测试会回写 test_time/response_time，
+  // 失败时后端返回的是 HTTP 200 + success:false，而 api() 会抛异常；不用
+  // try/finally 兜住的话「响应」列就永远不刷新（线上踩过）。
+  const runChannelTest = async (ch, model, btn) => {
+    if (btn) { btn.disabled = true; btn.textContent = '测试中…'; }
+    try {
+      await api('/channels/' + ch.id + '/test', { method: 'POST', body: { model } });
+      toast(`测试通过（${model}）`, 'ok');
+    } catch (e) {
+      toast(e.message || '测试失败', 'err');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '测试'; }
+      pageChannels(view); // 成功/失败都重拉：响应毫秒与测试时间都要更新
+    }
+  };
+
+  // 行内「测试」：只有 1 个模型时直接测；多个模型才弹窗选（双击选项 = 直接确认）。
   view.querySelectorAll('[data-test]').forEach((b) => (b.onclick = () => {
     const ch = rows.find((r) => r.id === Number(b.dataset.test));
     if (!ch) return;
     const models = [...new Set((ch.models || '').split(/[,\n]/).map((s) => s.trim()).filter(Boolean))];
     if (!models.length) return toast('渠道未配置模型', 'err');
+    if (models.length === 1) return runChannelTest(ch, models[0], b); // 单模型：不弹窗
     dialog(`测试渠道 #${ch.id} ${ch.name}`, `
       <label style="margin-top:0">模型（共 ${models.length} 个）</label>
       ${models.length > 8 ? '<input id="testFilter" placeholder="按模型名过滤…" style="margin-bottom:8px">' : ''}
@@ -606,14 +629,7 @@ async function pageChannels(view) {
       async (dlg) => {
         const model = dlg.querySelector('#testModel').value;
         if (!model) throw new Error('请先选择一个模型');
-        b.disabled = true; b.textContent = '测试中…';
-        try {
-          await api('/channels/' + ch.id + '/test', { method: 'POST', body: { model } });
-          toast(`测试通过（${model}）`, 'ok');
-        } finally {
-          b.disabled = false; b.textContent = '测试';
-        }
-        pageChannels(view);
+        await runChannelTest(ch, model, null);
       }, '测试');
     const sel = document.getElementById('testModel');
     const flt = document.getElementById('testFilter');

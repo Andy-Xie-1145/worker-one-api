@@ -89,6 +89,9 @@ test('help：列出命令分组，正文详实（通用规则 + 每命令说明 
   const ch = await run(envOf(), 'help channel');
   assert.match(ch.output, /channel price/);
   assert.match(ch.output, /仅此渠道生效/);
+  assert.match(ch.output, /渠道额外配置/);
+  assert.match(ch.output, /decisions_path/);
+  assert.match(ch.output, /extra_headers/);
 });
 
 test('status：owner 自动开户并预存 $10,000', async () => {

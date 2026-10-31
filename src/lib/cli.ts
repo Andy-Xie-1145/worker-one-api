@@ -772,6 +772,12 @@ function helpText(command?: string): string {
     '',
     'channel on <id> / channel off <id> / channel del <id>',
     '  启用 / 停用 / 删除渠道（off 是手工停用；自动禁用是 status=3）。',
+    '',
+    '  ※ 决策模型（Jev / Decisions API）不是独立渠道类型——它跑在 openai 形状的',
+    '    渠道上，由 decisionsSupport 判定该渠道是否承载：base_url 主机为 openrouter.ai',
+    '    自动启用；其他上游在 config 里显式声明：{"decisions":true}（默认路径',
+    '    alpha/decisions）或 {"decisions_path":"自定义/路径"}。客户端走 POST /v1/decisions。',
+    '    例：channel add openai jev https://openrouter.ai/api sk-or-xxx --models ~typesafe/jev-latest',
   ].join('\n');
 
   const token = [

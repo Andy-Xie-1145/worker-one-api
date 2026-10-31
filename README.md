@@ -342,6 +342,22 @@ Decisions 不是流式接口，带 `stream: true` 会在预扣之前直接 400�
 结算/退款、`relay_events` 全部复用 `handleRelay`。计价上 Jev 是 $0.042/1M 输入、
 输出免费（内置表 `jev` 行）；预扣/结算按 `state`/`questions` 估算 token，不会按 0 结算。
 
+### 接入一个决策渠道
+
+**Decisions 不是独立的渠道类型**——它是 `openai` 形状渠道上的一条路径能力
+（`alpha/decisions`，不在 /v1 下）。能不能承载由 `decisionsSupport()` 判定，
+而不是看渠道类型：`openai` 类型同时承载 DeepSeek、Groq 等无数厂商，若按类型放行，
+一个配错的渠道会把 key 发给根本不存在的路径且不重试。
+
+```bash
+# OpenRouter：主机命中白名单，自动启用
+channel add openai jev https://openrouter.ai/api sk-or-xxx --models '~typesafe/jev-latest,typesafe/jev-1.13'
+
+# 其他 OpenAI 兼容上游：config 里显式声明
+channel set <id> config='{"decisions":true}'              # 默认路径 alpha/decisions
+channel set <id> config='{"decisions_path":"my/decisions"}' # 自定义路径
+```
+
 ### 能力分诊
 
 规则集中在 `src/lib/capability.ts` 一处：`GET /v1/models` 默认只列 chat 模型

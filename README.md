@@ -105,7 +105,11 @@ curl -X POST https://你的站点/api/cli \
 
 命令与 REST 完全等价（同一套库函数，不存在两套行为）。规则：命令 = 子命令空格分隔，
 参数用 `key=value`，开关用 `--flag value`；带空格的值用引号包裹（`in="4 * (context > 272k ? 2 : 1)"`）；
-JSON 参数原样内联（`channel price 1 '{"m":{"in":1,"out":2}}'`）。终端里输入 `help` / `help <分组>` 看同款说明。
+JSON 参数原样内联（`channel price 1 '{"m":{"in":1,"out":2}}'`）。
+
+终端里输入 **`help`** 输出全部命令的详实说明（通用规则 + 每条命令的参数、行为与示例），
+**`help <分组>`** 只看该组（`general` / `channel` / `token` / `price` / `billing` / `opt`）。
+下面的总览只是速查，参数与示例以 `help` 为准。
 
 ### 命令总览
 

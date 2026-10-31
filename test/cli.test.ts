@@ -73,11 +73,22 @@ const kv = () => {
 const envOf = () => ({ DB: asD1(freshDB()), CACHE: kv() }) as any;
 const run = async (env: any, cmd: string) => runCli(env, cmd);
 
-test('help：列出命令分组', async () => {
+test('help：列出命令分组，正文详实（通用规则 + 每命令说明 + 示例）', async () => {
   const r = await run(envOf(), 'help');
   assert.ok(r.ok);
   assert.match(r.output, /命令分组/);
   assert.match(r.output, /channel add/);
+  assert.match(r.output, /通用规则/);
+  assert.match(r.output, /例：/);
+  // help <分组> 出该组详述
+  const g = await run(envOf(), 'help price');
+  assert.ok(g.ok);
+  assert.match(g.output, /price default --clear/);
+  assert.match(g.output, /费率表达式速查/);
+  assert.ok(!g.output.includes('channel add'), '分组帮助只出该组');
+  const ch = await run(envOf(), 'help channel');
+  assert.match(ch.output, /channel price/);
+  assert.match(ch.output, /仅此渠道生效/);
 });
 
 test('status：owner 自动开户并预存 $10,000', async () => {

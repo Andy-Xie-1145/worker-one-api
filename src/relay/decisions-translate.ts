@@ -36,12 +36,56 @@ export function decisionsDialectOf(channel: Pick<ChannelRow, 'type'>): Decisions
 const TO_OPENAI: Record<string, string> = { noul: 'predicate' };
 const TO_SYSTEMONE: Record<string, string> = { predicate: 'noul' };
 
-function mapQuestionToOpenAI(q: unknown): unknown {
+/**
+ * choice 题的选项有三套写法，方向不同、形状也不同：
+ *
+ *   OpenAI Decisions 入站（Simple Work Agent 这类客户端）：`choices: [{value, description}]`
+ *   OpenAI Decisions 文档写法：                            `options: [{value, description}]`
+ *   System One（上游，也是 docs.typesafe.ai 的定义）：      `criteria: { 选项名: 描述 }`
+ *
+ * 上游对 criteria 的形状是**硬校验**的，实测报错原文：
+ *   `question 'q0': choice needs a non-empty "criteria" object (option name -> description)`
+ * ——所以「把数组原样改名成 criteria」是不行的（曾经就是这么错的，全部 choice 请求 400）。
+ */
+
+/** 任意写法 → System One 的 criteria 对象（值 → 描述）。拿不准返回 null。 */
+function toCriteria(value: unknown): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  const put = (name: unknown, description: unknown) => {
+    if (typeof name !== 'string' || !name) return;
+    out[name] = typeof description === 'string' && description ? description : name;
+  };
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === 'string') put(item, item);
+      else if (item && typeof item === 'object') {
+        const it = item as Record<string, unknown>;
+        put(it.value ?? it.name ?? it.key ?? it.id, it.description ?? it.desc ?? it.label ?? it.criteria);
+      }
+    }
+  } else if (value && typeof value === 'object') {
+    for (const [name, description] of Object.entries(value as Record<string, unknown>)) put(name, description);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** 任意写法 → OpenAI Decisions 的选项数组（[{value, description}]）。拿不准返回 null。 */
+function toOptionList(value: unknown): Array<{ value: string; description: string }> | null {
+  const criteria = toCriteria(value);
+  if (!criteria) return null;
+  return Object.entries(criteria).map(([value, description]) => ({ value, description }));
+}
+
+function mapQuestionToOpenAI(q: unknown, name: string): unknown {
   if (!q || typeof q !== 'object') return q;
   const out: Record<string, unknown> = { ...(q as Record<string, unknown>) };
   if (typeof out.type === 'string' && TO_OPENAI[out.type]) out.type = TO_OPENAI[out.type];
-  if (out.criteria !== undefined && out.options === undefined) {
-    out.options = out.criteria;
+  // System One 用 questions 的键承载题名，OpenAI Decisions 的数组项要显式 name。
+  if (out.name === undefined) out.name = name;
+  // criteria 对象 → options 数组（客户端若本来就用 choices，就不动它）。
+  if (out.criteria !== undefined && out.options === undefined && out.choices === undefined) {
+    const list = toOptionList(out.criteria);
+    if (list) out.options = list;
     delete out.criteria;
   }
   return out;
@@ -51,10 +95,13 @@ function mapQuestionToSystemOne(q: unknown): unknown {
   if (!q || typeof q !== 'object') return q;
   const out: Record<string, unknown> = { ...(q as Record<string, unknown>) };
   if (typeof out.type === 'string' && TO_SYSTEMONE[out.type]) out.type = TO_SYSTEMONE[out.type];
-  if (out.options !== undefined && out.criteria === undefined) {
-    out.criteria = out.options;
-    delete out.options;
-  }
+  // choices / options / 数组版 criteria → criteria 对象；name 由 questions 的键承载。
+  const src = out.choices ?? out.options ?? out.criteria;
+  const criteria = toCriteria(src);
+  delete out.choices;
+  delete out.options;
+  delete out.name;
+  if (criteria) out.criteria = criteria;
   return out;
 }
 
@@ -75,17 +122,77 @@ export function translateDecisionsRequest(body: Record<string, unknown>, from: D
     const { state: state, questions: questions, ...rest } = body;
     const qObj = (questions && typeof questions === 'object' && !Array.isArray(questions) ? questions : {}) as Record<string, unknown>;
     const keys = Object.keys(qObj);
-    return { body: { ...rest, input: state, questions: keys.map((k) => mapQuestionToOpenAI(qObj[k])) }, keys };
+    return { body: { ...rest, input: state, questions: keys.map((k) => mapQuestionToOpenAI(qObj[k], k)) }, keys };
   }
   // openai → systemone
   const { input: input, questions: questionsArr, ...rest } = body;
   const arr = Array.isArray(questionsArr) ? questionsArr : [];
   const qObj: Record<string, unknown> = {};
-  arr.forEach((q, i) => (qObj[`q${i}`] = mapQuestionToSystemOne(q)));
-  return { body: { ...rest, state: input, questions: qObj }, keys: arr.map((_, i) => `q${i}`) };
+  // 键优先用题目自带的 name（客户端会用它认答案），没有才合成 q0/q1…
+  const keys = arr.map((q, i) => {
+    const name = q && typeof q === 'object' ? (q as Record<string, unknown>).name : undefined;
+    return typeof name === 'string' && name ? name : `q${i}`;
+  });
+  keys.forEach((k, i) => (qObj[k] = mapQuestionToSystemOne(arr[i])));
+  return { body: { ...rest, state: stateFromInput(input), questions: qObj }, keys };
 }
 
-/** 响应体翻译：answers 数组↔对象（按请求翻译记录的键序）；usage 与其余字段原样。 */
+/**
+ * OpenAI 方言的 `input` 通常是一段 JSON 文本，而 System One 的 `state` 是结构化对象。
+ * 能解析成对象就给出对象（分类器看到的是结构，不是被转义的字符串）；解析不了保持原样
+ * ——**绝不猜**，纯文本照样能过。
+ */
+function stateFromInput(input: unknown): unknown {
+  if (typeof input !== 'string') return input;
+  const text = input.trim();
+  if (!text.startsWith('{') && !text.startsWith('[')) return input;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' ? parsed : input;
+  } catch {
+    return input;
+  }
+}
+
+/** OpenAI Decisions 的答案字段（choice 型）：多一个少一个客户端都会判为非法响应。 */
+const OPENAI_CHOICE_ANSWER_KEYS = ['type', 'name', 'choice', 'confidence', 'probabilities'];
+
+function answerToOpenAI(value: unknown, name: string): unknown {
+  if (!value || typeof value !== 'object') return value;
+  const a: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+  if (a.type === 'noul') a.type = 'predicate';
+  // System One 的 probabilities 是 {选项: 概率}，OpenAI 是 [{value, probability}]
+  if (a.probabilities && typeof a.probabilities === 'object' && !Array.isArray(a.probabilities)) {
+    a.probabilities = Object.entries(a.probabilities as Record<string, unknown>).map(([v, p]) => ({ value: v, probability: p }));
+  }
+  if (a.type === 'choice') {
+    const out: Record<string, unknown> = { name };
+    for (const k of OPENAI_CHOICE_ANSWER_KEYS) if (a[k] !== undefined) out[k] = a[k];
+    out.type = 'choice';
+    return out;
+  }
+  // 非 choice 题型：字段集各家不同，只改名/加 name，其余透传。
+  if (a.name === undefined) a.name = name;
+  return a;
+}
+
+function answerToSystemOne(value: unknown, name: string): unknown {
+  if (!value || typeof value !== 'object') return value;
+  const a: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+  if (a.type === 'predicate') a.type = 'noul';
+  if (Array.isArray(a.probabilities)) {
+    const obj: Record<string, unknown> = {};
+    for (const p of a.probabilities as any[]) {
+      if (p && typeof p === 'object' && typeof p.value === 'string') obj[p.value] = p.probability;
+    }
+    a.probabilities = obj;
+  }
+  delete a.name;
+  void name;
+  return a;
+}
+
+/** 响应体翻译：answers 数组↔对象（按请求翻译记录的键序），答案形状按方言改写；usage 与其余字段原样。 */
 export function translateDecisionsResponse(
   json: unknown,
   from: DecisionsDialect,
@@ -98,14 +205,14 @@ export function translateDecisionsResponse(
   if (from === 'systemone' && to === 'openai') {
     const obj = (answers && typeof answers === 'object' && !Array.isArray(answers) ? answers : {}) as Record<string, unknown>;
     const order = keys ?? Object.keys(obj);
-    return { ...rest, answers: order.map((k) => obj[k]) };
+    return { ...rest, answers: order.map((k) => answerToOpenAI(obj[k], k)) };
   }
   // openai → systemone
   const arr = Array.isArray(answers) ? answers : [];
   const order = keys ?? arr.map((_, i) => `q${i}`);
   const obj: Record<string, unknown> = {};
   order.forEach((k, i) => {
-    if (arr[i] !== undefined) obj[k] = arr[i];
+    if (arr[i] !== undefined) obj[k] = answerToSystemOne(arr[i], k);
   });
   return { ...rest, answers: obj };
 }

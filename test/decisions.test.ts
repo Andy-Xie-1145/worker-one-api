@@ -634,9 +634,17 @@ test('decisionsSupport 单元：双类型默认路径只有端点名（decisions
 
 /* ------------------------------------------------ 跨方言翻译端到端 */
 
-test('跨方言：OpenAI 客户端调 systemone 渠道——请求译成 state/对象，answers 译回数组', async () => {
+test('跨方言：OpenAI 客户端调 systemone 渠道——请求译成 state/对象，answers 译回数组（真实上游形状）', async () => {
   const w = makeDecisionWorld({ type: 'systemone', base: 'https://so.example.com/v1' });
-  const script = scriptFetch([{ status: 200, body: { id: 'so1', answers: { q0: { choice: 'billing' }, q1: { p: 0.9 } }, usage: { input_tokens: 7 } } }]);
+  // 上游形状照抄 channel 8 实测响应：choice 的 probabilities 是 {选项: 概率} 对象。
+  const script = scriptFetch([{ status: 200, body: {
+    model: DMODEL,
+    answers: {
+      q0: { type: 'choice', choice: 'billing', probabilities: { billing: 0.8, tech: 0.2 }, confidence: 0.8 },
+      q1: { type: 'noul', noul: 0.9 },
+    },
+    usage: { input_tokens: 7, output_tokens: 1 },
+  } }]);
   let res: Response;
   try {
     res = await call(w, '/v1/decisions', {
@@ -657,16 +665,22 @@ test('跨方言：OpenAI 客户端调 systemone 渠道——请求译成 state/�
   assert.equal(up.state, '重复扣费了');
   assert.equal(up.input, undefined);
   assert.equal(up.questions.q0.type, 'choice');
-  assert.deepEqual(up.questions.q0.criteria, { billing: '支付' }, 'options→criteria');
+  assert.deepEqual(up.questions.q0.criteria, { billing: '支付' }, 'options→criteria 对象');
   assert.equal(up.questions.q1.type, 'noul', 'predicate→noul');
-  // 客户端拿回 OpenAI 方言：answers 数组按序
+  // 客户端拿回 OpenAI 方言：answers 数组 + probabilities 数组（choice 型只留契约字段）
   const out = await (res as any).clone().json();
-  assert.deepEqual(out.answers, [{ choice: 'billing' }, { p: 0.9 }]);
+  assert.deepEqual(out.answers, [
+    { type: 'choice', name: 'q0', choice: 'billing', confidence: 0.8, probabilities: [{ value: 'billing', probability: 0.8 }, { value: 'tech', probability: 0.2 }] },
+    { type: 'predicate', noul: 0.9, name: 'q1' },
+  ]);
 });
 
 test('跨方言：TypeSafe 客户端调 decisions 渠道——请求译成 input/数组，answers 译回对象', async () => {
   const w = makeDecisionWorld();
-  const script = scriptFetch([{ status: 200, body: { id: 'oai1', answers: [{ choice: 'tech' }, { p: 0.2 }], usage: { input_tokens: 3 } } }]);
+  const script = scriptFetch([{ status: 200, body: { model: DMODEL, answers: [
+    { type: 'choice', name: 'dept', choice: 'tech', confidence: 0.7, probabilities: [{ value: 'tech', probability: 0.7 }] },
+    { type: 'predicate', name: 'urgent' },
+  ], usage: { input_tokens: 3 } } }]);
   let res: Response;
   try {
     res = await call(w, '/v1/decisions', {
@@ -688,11 +702,73 @@ test('跨方言：TypeSafe 客户端调 decisions 渠道——请求译成 input
   assert.equal(up.state, undefined);
   assert.equal(up.questions.length, 2);
   assert.equal(up.questions[0].type, 'choice');
-  assert.deepEqual(up.questions[0].options, { tech: '故障' }, 'criteria→options');
+  assert.deepEqual(up.questions[0].options, [{ value: 'tech', description: '故障' }], 'criteria 对象→options 数组');
   assert.equal(up.questions[1].type, 'predicate', 'noul→predicate');
-  // 客户端拿回 TypeSafe 方言：answers 按原问题名键控
+  // 客户端拿回 TypeSafe 方言：answers 按原问题名键控，probabilities 转回对象
   const out = await (res as any).clone().json();
-  assert.deepEqual(out.answers, { dept: { choice: 'tech' }, urgent: { p: 0.2 } });
+  assert.deepEqual(out.answers, {
+    dept: { type: 'choice', choice: 'tech', confidence: 0.7, probabilities: { tech: 0.7 } },
+    urgent: { type: 'noul' },
+  });
+});
+
+/*
+ * 真实事故回归（Simple Work Agent 2026-11-01）：
+ *   System One 客户端把请求发到 /v1/systemone —— 网关当时根本没有这个入站路由，
+ *   客户端只拿到 404。两个公开协议必须都能进门。
+ */
+test('/v1/systemone：System One 原生入站，同方言透传（上游收到原样的 state/questions）', async () => {
+  const w = makeDecisionWorld({ type: 'systemone', base: 'https://so.example.com/v1' });
+  const upstreamAnswer = {
+    model: DMODEL,
+    answers: { intent: { type: 'choice', choice: 'question', probabilities: { question: 0.97, newtask: 0.03 }, confidence: 0.95 } },
+    usage: { input_tokens: 156, output_tokens: 1 },
+  };
+  const script = scriptFetch([{ status: 200, body: upstreamAnswer }]);
+  const body = {
+    model: DMODEL,
+    state: { text: '你好！请解释什么是会议纪要', context: { goal: '制作会议准备清单', stage: 'running' } },
+    questions: { intent: { type: 'choice', instructions: '分类意图', criteria: { question: '询问解释', newtask: '要求开始新任务' } } },
+  };
+  let res: Response;
+  try {
+    res = await call(w, '/v1/systemone', body);
+  } finally {
+    script.restore();
+  }
+  assert.equal(res.status, 200, '入站路由必须存在（不再 404）');
+  assert.match(script.calls[0].url, /so\.example\.com\/v1\/systemone$/, script.calls[0].url);
+  assert.deepEqual(script.calls[0].body.state, body.state, 'state 原样透传');
+  assert.deepEqual(script.calls[0].body.questions, body.questions, 'questions 对象原样透传');
+  // 响应也原样回给 System One 客户端（answers 对象 + usage.input_tokens/output_tokens）
+  const out = await (res as any).clone().json();
+  assert.deepEqual(out, upstreamAnswer);
+  await drain();
+  assert.ok(net(w) < 0, '决策请求照常计费');
+});
+
+test('/v1/systemone：System One 客户端调 decisions 渠道——请求译成 input/数组', async () => {
+  const w = makeDecisionWorld(); // 渠道类型 decisions（OpenAI 方言）
+  const script = scriptFetch([{ status: 200, body: { model: DMODEL, answers: [{ type: 'choice', name: 'intent', choice: 'question', confidence: 0.9, probabilities: [{ value: 'question', probability: 0.9 }] }], usage: { input_tokens: 5 } } }]);
+  let res: Response;
+  try {
+    res = await call(w, '/v1/systemone', {
+      model: DMODEL,
+      state: { text: 'hi' },
+      questions: { intent: { type: 'choice', instructions: 'x', criteria: { question: 'a', newtask: 'b' } } },
+    });
+  } finally {
+    script.restore();
+  }
+  assert.equal(res.status, 200);
+  assert.match(script.calls[0].url, /dec\.example\.com\/v1\/decisions$/, script.calls[0].url);
+  const up = script.calls[0].body;
+  assert.deepEqual(up.input, { text: 'hi' }, 'state → input');
+  assert.equal(up.questions.length, 1);
+  assert.equal(up.questions[0].name, 'intent');
+  assert.deepEqual(up.questions[0].options, [{ value: 'question', description: 'a' }, { value: 'newtask', description: 'b' }]);
+  const out = await (res as any).clone().json();
+  assert.deepEqual(out.answers, { intent: { type: 'choice', choice: 'question', confidence: 0.9, probabilities: { question: 0.9 } } });
 });
 
 test('版本段随 base_url：纯拼接不注入不剥除；留空回落到类型自己的官方默认地址', async () => {

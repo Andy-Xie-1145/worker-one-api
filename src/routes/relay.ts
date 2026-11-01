@@ -20,7 +20,7 @@ import { getAdaptor } from '../relay';
 import { type AdaptorContext, type ChatRequest, type RelayMode, newStreamState } from '../relay/adaptor';
 import { readSSE, sseChunk, SSE_DONE, SSE_HEADERS } from '../relay/sse';
 import { estimateUsage } from '../relay/openai';
-import { DECISIONS_PATH, decisionsPromptPayload, decisionsSupport, estimateDecisionsUsage } from '../relay/decisions';
+import { DECISIONS_PATH, SYSTEMONE_PATH, decisionsPromptPayload, decisionsSupport, estimateDecisionsUsage } from '../relay/decisions';
 import {
   ResponsesInboundError, responsesToChatRequest, chatResponseToResponses,
   newResponsesEncoder, encodeResponsesChunk, finishResponsesStream, responsesErrorEvent,
@@ -172,6 +172,19 @@ relay.post('/embeddings', (c) => handleRelay(c, 'embeddings', 'embeddings'));
 relay.post('/decisions', (c) => handleRelay(c, 'decisions', DECISIONS_PATH));
 
 /**
+ * POST /v1/systemone — TypeSafe System One 原生入口。
+ *
+ * 决策 API 有两个公开协议，客户端只认其中一个：OpenAI Decisions 说
+ * `{input, questions:[]}`（走 /v1/decisions），System One 说 `{state, questions:{}}`
+ * （走 /v1/systemone）。**两个入口网关都要接**，否则用 System One 协议的客户端
+ * 只会拿到 404——真实事故：Simple Work Agent 的 11 次决策请求里有 1 次是这种 404。
+ *
+ * 端点本身声明了方言，所以不用猜（force dialect）；上游说什么方言由渠道决定，
+ * 翻译器负责两个方向，其余（选路/计费/重试/退款/事件）与 /v1/decisions 同一套。
+ */
+relay.post('/systemone', (c) => handleRelay(c, 'decisions', SYSTEMONE_PATH, 'openai', { dialect: 'systemone' }));
+
+/**
  * Native Anthropic Messages API.
  *
  * 个人客户端把 Claude Code / OpenClaw 指到这里（ANTHROPIC_BASE_URL），所以
@@ -224,7 +237,7 @@ async function handleRelay(
   mode: RelayMode,
   path: string,
   protocol: Protocol = 'openai',
-  via?: { urlModel?: string; forceStream?: boolean },
+  via?: { urlModel?: string; forceStream?: boolean; dialect?: 'systemone' | 'openai' },
 ): Promise<Response> {
   const started = Date.now();
   const fail = (message: string, type: string, status: number) => {
@@ -292,13 +305,13 @@ async function handleRelay(
     return fail(`模型 ${requestedModel} 不是决策模型，请改用 /v1/chat/completions`, 'invalid_request_error', 400);
   }
   if (mode !== 'decisions' && decisionOnly) {
-    return fail(`模型 ${requestedModel} 只支持决策接口，请改用 POST /v1/decisions`, 'invalid_request_error', 400);
+    return fail(`模型 ${requestedModel} 只支持决策接口，请改用 POST /v1/decisions 或 POST /v1/systemone`, 'invalid_request_error', 400);
   }
   /*
    * 入站决策方言：state = TypeSafe（System One），input = OpenAI（Decisions）。
    * 识别不了（两种主字段都没有）按不翻译透传——attemptUpstream 里 from=to。
    */
-  const decisionsDialect = mode === 'decisions' ? detectDecisionsDialect(body) : undefined;
+  const decisionsDialect = mode === 'decisions' ? (via?.dialect ?? detectDecisionsDialect(body)) : undefined;
   /*
    * Decisions 不是流式接口，`stream: true` 就是调用错误，明说。
    *
@@ -707,7 +720,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
      * 就已按决策模型拦下 chat；这条守卫是给「模型同时挂在 chat 渠道」的边角：
      * 500 = 跳过此渠道继续换下一个，而不是把整条路径打死。
      */
-    const message = `渠道 ${channel.name} 是决策专用渠道（${channel.type}），只承接 POST /v1/decisions`;
+    const message = `渠道 ${channel.name} 是决策专用渠道（${channel.type}），只承接 POST /v1/decisions 或 POST /v1/systemone`;
     return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
   }
 

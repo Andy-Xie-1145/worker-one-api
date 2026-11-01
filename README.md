@@ -30,7 +30,7 @@ LLM API 中转网关，完整运行在 Cloudflare Workers 上，**不依赖任�
 - **OpenAI 兼容中转**：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`，支持流式
 - **Anthropic 原生端点**：`/api/anthropic/v1/messages`，真流式，可由任意渠道（含 OpenAI 形状的）承载
 - **价格外显**：`/v1/pricing` 按 Key 返回生效价格，`/api/pricing` 给管理端全量视图
-- **决策接口**：`/v1/decisions`（OpenRouter Decisions API / Jev），复用同一套选路与计费
+- **决策接口**：`/v1/decisions`（OpenAI Decisions）与 `/v1/systemone`（TypeSafe System One）双入站，方言自动互译，复用同一套选路与计费
 - **用量查询**：`/v1/usage`，金额口径
 - **多渠道路由**：按 `(分组, 模型)` 索引选路，优先级分层 + 层内加权随机，失败自动重试下一个渠道
 - **额度计费**：请求前按 prompt 体量预扣，结束后按真实 usage 结算（含流式中断/客户端断开）
@@ -359,14 +359,22 @@ OpenAI 兼容的推理模型把思维链放在 `delta.reasoning_content`，会�
 
 ## 决策接口：Jev / OpenRouter Decisions
 
-Typesafe 的 Jev 走的不是 chat/completions，而是 Decisions API。本网关开在
-`POST /v1/decisions`：请求体 `{model, state, questions}`，响应原样返回上游 JSON。
-网关不做 schema 校验，`state` / `questions` 一律原样透传；唯一的例外是 `stream`：
-Decisions 不是流式接口，带 `stream: true` 会在预扣之前直接 400。
+Typesafe 的 Jev 走的不是 chat/completions，而是 Decisions API。决策接口有两个公开
+协议，网关**两个入站入口都开**（客户端只认其中一个，缺哪个都是 404）：
 
-鉴权、令牌模型权限、预扣、`selectChannel` 选路、429 冷却、`RetryTimes` 重试、
-结算/退款、`relay_events` 全部复用 `handleRelay`。计价上 Jev 是 $0.042/1M 输入、
-输出免费（内置表 `jev` 行）；预扣/结算按 `state`/`questions` 估算 token，不会按 0 结算。
+| 入站端点 | 方言 | 请求体 |
+|---|---|---|
+| `POST /v1/decisions` | OpenAI Decisions | `{model, input, questions:[]}`，题型 predicate/choice/score |
+| `POST /v1/systemone` | TypeSafe System One | `{model, state, questions:{}}`，题型 noul/choice/score |
+
+两个入口的入站方言是**自动识别**的（有 `state` = System One，有 `input` = OpenAI），
+`/v1/systemone` 还会把方言定死成 System One。其余（鉴权、令牌模型权限、预扣、
+`selectChannel` 选路、429 冷却、`RetryTimes` 重试、结算/退款、`relay_events`）
+全部复用 `handleRelay`。网关不做 schema 校验，`state` / `questions` 一律原样透传；
+唯一的例外是 `stream`：Decisions 不是流式接口，带 `stream: true` 会在预扣之前直接 400。
+
+计价上 Jev 是 $0.042/1M 输入、输出免费（内置表 `jev` 行）；预扣/结算按
+`state`/`questions` 估算 token，不会按 0 结算。
 
 ### 接入一个决策渠道
 
@@ -392,8 +400,19 @@ channel set <id> config='{"decisions_path":"custom/decide"}'
 **方言自动翻译**（与 chat 翻译器同一哲学）：入站按 `state`/`input` 自动识别客户端
 方言，跨方言时翻译到上游方言并把 `answers` 双向翻回——OpenAI SDK 可以直接调
 systemone 渠道上的 jev，TypeSafe SDK 可以直接调 decisions 渠道上的 gpt-6-luna。
-翻译规则：`state↔input`、questions 对象↔数组（按键序）、`noul↔predicate`、
-`criteria↔options`；未知字段一律透传。
+翻译规则：`state↔input`（`input` 是 JSON 文本时解析成结构化 `state`）、
+questions 对象↔数组（对象键就是题名，数组项用 `name`）、`noul↔predicate`、
+choice 选项三套写法互转、`answers` 双向按键序回翻，未知字段一律透传。
+
+choice 题的选项有三套写法，**形状是硬约束**：OpenAI 侧是数组
+（`choices` / `options: [{value, description}]`），System One 侧是对象
+（`criteria: {选项名: 描述}`）。上游对 `criteria` 校验很硬，实测报错：
+`choice needs a non-empty "criteria" object (option name -> description)`
+——只把数组改名成 `criteria` 会被 400 拒（曾经就是这个 bug，所有 choice 请求全挂）。
+
+响应侧同理：System One 的答案是 `{"answers":{"题名":{"type":"choice","choice":…,"probabilities":{选项:概率},"confidence":…}}}`
+而 OpenAI Decisions 是 `{"answers":[{"type":"choice","name":…,"probabilities":[{"value":…,"probability":…}]}]}`
+——网关两个方向都翻，choice 型答案只保留协议契约字段，方便严格校验的客户端。
 
 **计价提示**：gpt-6-luna 走决策接口是 $0.10/M 输入、缓存 $0.01、**输出免费**，
 与 chat 行（$0.1/$0.5）不同价——在决策渠道上配渠道价：

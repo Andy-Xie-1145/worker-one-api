@@ -190,9 +190,19 @@ relay.post('/systemone', (c) => handleRelay(c, 'decisions', SYSTEMONE_PATH, 'ope
  * 个人客户端把 Claude Code / OpenClaw 指到这里（ANTHROPIC_BASE_URL），所以
  * 请求和响应都必须是 Anthropic 形状——但选路、计费、重试与 /v1 是同一套机器，
  * 只在边缘换协议。
+ *
+ * **路径带版本**：官方文档与官方 SDK 都是 `POST /v1/messages`——SDK 的 base 只填
+ * origin（默认 `https://api.anthropic.com`），版本段由 SDK 拼在资源路径里
+ * （anthropic-sdk-typescript: `this._client.post('/v1/messages', …)`）。所以两个
+ * base 写法都得软着陆：
+ *
+ *   ANTHROPIC_BASE_URL=https://站点                → SDK 打 /v1/messages          ← 主流写法
+ *   ANTHROPIC_BASE_URL=https://站点/api/anthropic   → SDK 打 /api/anthropic/v1/messages
  */
 export const anthropicRoute = new Hono<{ Bindings: Env; Variables: Vars }>();
 anthropicRoute.post('/v1/messages', (c) => handleRelay(c, 'chat', 'chat/completions', 'anthropic'));
+/** 根路径的 `/v1/messages`：与上面同一个 handler，只是换了个挂载点。 */
+relay.post('/messages', (c) => handleRelay(c, 'chat', 'chat/completions', 'anthropic'));
 
 /**
  * 入站 OpenAI Responses API（协议翻译器）。

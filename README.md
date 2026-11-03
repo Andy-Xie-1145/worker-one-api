@@ -28,7 +28,7 @@ LLM API 中转网关，完整运行在 Cloudflare Workers 上，**不依赖任�
 ## 能力
 
 - **OpenAI 兼容中转**：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`，支持流式
-- **Anthropic 原生端点**：`/api/anthropic/v1/messages`，真流式，可由任意渠道（含 OpenAI 形状的）承载
+- **Anthropic 原生端点**：`/v1/messages`（标准路径）与 `/api/anthropic/v1/messages`，真流式，可由任意渠道（含 OpenAI 形状的）承载
 - **价格外显**：`/v1/pricing` 按 Key 返回生效价格，`/api/pricing` 给管理端全量视图
 - **决策接口**：`/v1/decisions`（OpenAI Decisions）与 `/v1/systemone`（TypeSafe System One）双入站，方言自动互译，复用同一套选路与计费
 - **用量查询**：`/v1/usage`，金额口径
@@ -55,8 +55,18 @@ LLM API 中转网关，完整运行在 Cloudflare Workers 上，**不依赖任�
 |---|---|---|
 | `/v1/chat/completions` 等 | OpenAI Chat | `Authorization: Bearer` |
 | `/v1/responses` | OpenAI Responses | `Authorization: Bearer` |
-| `/api/anthropic/v1/messages` | Anthropic Messages | `x-api-key` |
+| `/v1/messages` 或 `/api/anthropic/v1/messages` | Anthropic Messages | `x-api-key`（也接受 `Authorization`） |
 | `/gemini/v1beta/models/{model}:generateContent`（及 `:streamGenerateContent?alt=sse`） | Google Gemini | `x-goog-api-key` |
+
+Anthropic Messages 的**路径自带版本段**（官方文档与 SDK 都是 `POST /v1/messages`，
+SDK 的 base 只填 origin），所以两种 `ANTHROPIC_BASE_URL` 写法都支持：
+
+```bash
+# 主流写法：base 填站点根，SDK 自己拼 /v1/messages
+export ANTHROPIC_BASE_URL=https://你的站点
+# 老写法：base 带前缀（客户端会拼成 /api/anthropic/v1/messages）
+export ANTHROPIC_BASE_URL=https://你的站点/api/anthropic
+```
 
 所有方言都翻译成中枢 chat 形状去选路、计费、重试，再把响应翻回客户端的方言——
 **用任何一种 API 都能调用站内所有模型，无论上游是什么 API**。工具调用跨方言无损搬运
@@ -350,7 +360,7 @@ npx wrangler secret put WECOM_HEALTH_WEBHOOK_URL   # 群机器人完整 URL（�
 | 入口 | 协议 | 鉴权头 |
 |---|---|---|
 | `/v1/*` | OpenAI | `Authorization: Bearer` |
-| `/api/anthropic/v1/messages` | Anthropic Messages | `x-api-key`（也接受 `Authorization`） |
+| `/v1/messages`、`/api/anthropic/v1/messages` | Anthropic Messages | `x-api-key`（也接受 `Authorization`） |
 
 Anthropic 请求进来先转成内部的 OpenAI 形状用于选路和计费，响应再转回去。
 OpenAI 兼容的推理模型把思维链放在 `delta.reasoning_content`，会映射成 Anthropic 的

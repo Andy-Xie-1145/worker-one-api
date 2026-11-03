@@ -54,6 +54,26 @@ export const openaiResponsesAdaptor: Adaptor = {
     if (Array.isArray(req.tools) && req.tools.length) body.tools = req.tools.map(flattenTool);
     if (req.tool_choice !== undefined) body.tool_choice = flattenToolChoice(req.tool_choice);
     if (req.stream) body.stream = true;
+    // 结构化输出：chat 的 response_format → Responses 的 text.format。
+    // 不映射的话，同一份请求走 chat 渠道有 JSON schema、走 Responses 渠道就没有了。
+    const rf = (req as any).response_format;
+    if (rf && typeof rf === 'object') {
+      if (rf.type === 'json_object') body.text = { format: { type: 'json_object' } };
+      else if (rf.type === 'json_schema') {
+        const spec = rf.json_schema ?? {};
+        body.text = {
+          format: {
+            type: 'json_schema',
+            name: String(spec.name ?? 'response'),
+            schema: spec.schema ?? rf.schema,
+            ...(spec.strict !== undefined ? { strict: !!spec.strict } : {}),
+          },
+        };
+      }
+    }
+    // reasoning_effort → reasoning.effort（推理模型在 Responses 侧叫这个）。
+    const effort = (req as any).reasoning_effort;
+    if (typeof effort === 'string' && effort) body.reasoning = { effort };
     // `stop` 与 `stream_options` 在 Responses 里没有对应物，丢弃而不是报错——
     // 绝大多数调用方只是把 Chat 形状的参数原样带来了，语义上没有也成立。
 

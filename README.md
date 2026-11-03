@@ -7,8 +7,7 @@ LLM API 中转网关，完整运行在 Cloudflare Workers 上，**不依赖任�
 所有客户端（Claude Code / ChatBox / 任意 OpenAI、Anthropic、Gemini SDK）走同一个入口，
 按渠道精细定价、按 Key 限额，用量与健康度一目了然。
 
-设计取向：
-删去了全部倍率、注册登录、多用户体系和平台对接面，改为一把管理员令牌管理的
+设计取向：删去了全部倍率、注册登录、多用户体系和平台对接面，改为一把管理员令牌管理的
 **个人 API 聚合**，并把内置价格表外显成可配置的「渠道 × 模型」价格矩阵
 （路由到哪个渠道就按哪个渠道的价），支持按字段的费率表达式动态计费。
 
@@ -19,44 +18,53 @@ LLM API 中转网关，完整运行在 Cloudflare Workers 上，**不依赖任�
 | 倍率 | **全部删除**：分组倍率、时段折扣（DeepSeek 峰谷）等一律不存在。计费 = 用量 × 价格表，没有第二个因子 |
 | 注册登录 | **删除**：`/api/setup`、`/api/auth/*`、用户管理、兑换码全部移除。唯一的管理凭据是 `ADMIN_KEY`（见下） |
 | 账户 | 唯一的 `owner` 账户在第一次使用时自动创建，预存 $10,000 预算（只是刻度尺，可随时调整） |
-| 价格 | 内置价格表外显（`GET /api/pricing`、`GET /v1/pricing`）；全局覆盖可配；**每个 Key 的每个模型**还可以再单独覆盖；支持表达式动态计费 |
+| 分组 | **删除**：只有个人使用，没有分组维度；模型可见性由令牌的 `models` 白名单控制 |
+| 价格 | 内置价格表外显（`GET /api/pricing`、`GET /v1/pricing`）；**渠道级覆盖**优先于全局覆盖；支持按字段的费率表达式动态计费。**没有 Key 级价格**（令牌混用渠道 + 故障转移，在 Key 上定价没有意义） |
 | 平台生态 | **删除**：`/internal/*`（外部平台开户/发额度/订阅赠额）、`/internal/billing`（语音授权窗口）、平台 JWT 登录路径、多币种钱包全部移除 |
 
 保留完整：多渠道路由与重试、403 软熔断、429 冷却、流式计费、账本（`credits`）与对账、
-悬空预扣回收、路由缺口告警、OpenAI/Anthropic 双协议、Decisions API。
+悬空预扣回收、路由缺口告警、四种入站方言（Chat / Responses / Anthropic / Gemini）、
+两种决策协议（Decisions / System One）。
 
 ## 能力
 
-- **OpenAI 兼容中转**：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`，支持流式
-- **Anthropic 原生端点**：`/v1/messages`（标准路径）与 `/api/anthropic/v1/messages`，真流式，可由任意渠道（含 OpenAI 形状的）承载
+- **OpenAI 兼容中转**：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`
+- **OpenAI Responses 入站**：`/v1/responses`，流式事件序列完整（含**推理过程**与 reasoning tokens）
+- **Anthropic Messages 原生**：`/v1/messages`（标准路径）与 `/api/anthropic/v1/messages`，真流式
+- **Google Gemini 入站**：`/gemini/v1beta/models/{model}:generateContent`（`?alt=sse` 流式）
+- **决策接口**：`/v1/decisions`（OpenAI Decisions）与 `/v1/systemone`（TypeSafe System One）双入站，方言自动互译
 - **价格外显**：`/v1/pricing` 按 Key 返回生效价格，`/api/pricing` 给管理端全量视图
-- **决策接口**：`/v1/decisions`（OpenAI Decisions）与 `/v1/systemone`（TypeSafe System One）双入站，方言自动互译，复用同一套选路与计费
 - **用量查询**：`/v1/usage`，金额口径
-- **多渠道路由**：按 `(分组, 模型)` 索引选路，优先级分层 + 层内加权随机，失败自动重试下一个渠道
+- **多渠道路由**：按 `(模型, 渠道)` 索引选路，优先级分层 + 层内加权随机，失败自动重试下一个渠道
 - **额度计费**：请求前按 prompt 体量预扣，结束后按真实 usage 结算（含流式中断/客户端断开）
 - **账本**：余额的每一次变动都是一条 `credits` 记录，`users.quota` 只是 `SUM(delta)` 的物化值，可随时对账
-- **管理后台**：单页应用（令牌 / 渠道 / 价格 / 健康 / 日志 / 设置），解锁式输入管理员令牌
+- **管理后台**：单页应用（总览 / 令牌 / 渠道 / 价格 / 模型计费 / 健康 / 日志 / 终端 / 设置），解锁式输入管理员令牌
 
-### 渠道类型
+### 渠道类型（7 种，覆盖 5 类上游协议）
 
 | type | 说明 |
 |---|---|
-| `openai` | **OpenAI Chat Completion**：通用 OpenAI 兼容接口，配 base_url 即可接入 DeepSeek、Moonshot、Groq、智谱、DashScope、SiliconFlow、OpenRouter、xAI 等 |
-| `decisions` | **Decision API**（OpenAI 方言）：出站 `{base_url}/decisions`，请求 `{model, input, questions:[]}`，题型 predicate/choice/score；渠道里的模型**自动**全部视为决策模型 |
-| `systemone` | **System One**（TypeSafe 方言）：出站 `{base_url}/systemone`，请求 `{model, state, questions:{}}`，题型 noul/choice/score；模型同样自动视为决策模型。网关在两种方言间**自动翻译**（state↔input、questions 对象↔数组、noul↔predicate、criteria↔options），`config.decisions_path` 可改任一类的出站路径 |
-| `openai-responses` | **OpenAI Responses**：打上游的 `/v1/responses`；中枢 chat 形状会自动翻译过去（system→instructions、tool_calls→function_call item、max_tokens→max_output_tokens） |
-| `anthropic` | **Anthropic Messages**：Anthropic 原生 Messages API，双向转换（含 tool_use / 图片 / system） |
-| `gemini` | **Google Gemini**：generateContent，双向转换（含 functionCall / inlineData） |
+| `openai` | **OpenAI Chat Completion**：通用 OpenAI 兼容接口，配 base_url 即可接入 DeepSeek、Moonshot、Groq、智谱、DashScope、SiliconFlow、OpenRouter、xAI、NVIDIA NIM 等 |
+| `openai-responses` | **OpenAI Responses**：打上游的 `/v1/responses`；中枢 chat 形状自动翻译过去（system→instructions、tool_calls→function_call item、max_tokens→max_output_tokens） |
+| `anthropic` | **Anthropic Messages**：Anthropic 原生 Messages API，双向转换（含 tool_use / 图片 / system / thinking） |
+| `gemini` | **Google Gemini**：generateContent，双向转换（含 functionCall / inlineData）；`response_format` 会映射成 `responseMimeType`/`responseSchema`，`tool_choice` 映射成 `toolConfig` |
 | `azure` | **Azure OpenAI**：deployment URL + `api-key` 头 |
+| `decisions` | **Decision API**（OpenAI 方言）：出站 `{base_url}/decisions`，请求 `{model, input, questions:[]}`，题型 predicate/choice/score；渠道里的模型**自动**全部视为决策模型 |
+| `systemone` | **System One**（TypeSafe 方言）：出站 `{base_url}/systemone`，请求 `{model, state, questions:{}}`，题型 noul/choice/score；模型同样自动视为决策模型，两种方言间自动翻译 |
 
-**协议翻译器**：四种入站方言 × 五种上游方言自由组合——
+**协议翻译器**：四种入站方言 × 七种渠道，任意组合——
 
 | 入站端点 | 客户端方言 | 鉴权头 |
 |---|---|---|
 | `/v1/chat/completions` 等 | OpenAI Chat | `Authorization: Bearer` |
 | `/v1/responses` | OpenAI Responses | `Authorization: Bearer` |
 | `/v1/messages` 或 `/api/anthropic/v1/messages` | Anthropic Messages | `x-api-key`（也接受 `Authorization`） |
-| `/gemini/v1beta/models/{model}:generateContent`（及 `:streamGenerateContent?alt=sse`） | Google Gemini | `x-goog-api-key` |
+| `/gemini/v1beta/models/{model}:generateContent`（及 `:streamGenerateContent?alt=sse`） | Google Gemini | `x-goog-api-key`（也接受 `Authorization`） |
+| `/v1/decisions`、`/v1/systemone` | Decisions / System One | `Authorization: Bearer` |
+
+所有方言都翻译成中枢 chat 形状去选路、计费、重试，再把响应翻回客户端的方言——
+**用任何一种 API 都能调用站内所有模型，无论上游是什么 API**。工具调用跨方言无损搬运
+（`tool_calls`/`function_call`/`tool_use` 互译，流式参数增量逐块翻译）。
 
 Anthropic Messages 的**路径自带版本段**（官方文档与 SDK 都是 `POST /v1/messages`，
 SDK 的 base 只填 origin），所以两种 `ANTHROPIC_BASE_URL` 写法都支持：
@@ -68,14 +76,65 @@ export ANTHROPIC_BASE_URL=https://你的站点
 export ANTHROPIC_BASE_URL=https://你的站点/api/anthropic
 ```
 
-所有方言都翻译成中枢 chat 形状去选路、计费、重试，再把响应翻回客户端的方言——
-**用任何一种 API 都能调用站内所有模型，无论上游是什么 API**。工具调用跨方言无损搬运
-（`tool_calls`/`function_call`/`tool_use` 互译，流式参数增量逐块翻译）。两个边界：
-Responses 的 `previous_response_id` 无法被无状态网关服务，直接 400（`store` 只控制留档，
-网关从不留档，忽略之）；Gemini 流式仅支持 `alt=sse`（官方 SDK 默认走法）。
-
 **Z.AI / GLM**：用 `openai` 类型 + base_url `https://api.z.ai/api/coding/paas/v4`。
 价格表会自动剥掉 `zai/`、`zai-coding-plan/` 等前缀匹配到裸名。
+
+## Responses API 入站（`POST /v1/responses`）
+
+无状态翻译器：Responses 形状 ⇄ 中枢 chat。**推理过程会返回**，不是只算 token。
+
+**请求字段映射**
+
+| Responses | 中枢 chat |
+|---|---|
+| `instructions` | `system` 消息（`developer` 角色同样归到 system） |
+| `input`（字符串 / item 数组） | `messages`（`role` 消息、`function_call`、`function_call_output`；`reasoning` item 跳过） |
+| `max_output_tokens` | `max_tokens` |
+| `temperature` / `top_p` | 同名 |
+| `tools` / `tool_choice` | 扁平函数 → `{type:'function',function:{…}}`；`tool_choice` 同名转换 |
+| `reasoning.effort` | `reasoning_effort`（仅客户端显式给出时透传） |
+| `text.format` | `response_format`（支持 `json_object`、`json_schema`；其它形状不猜、不下发） |
+| `stream` | 同名 |
+
+**响应（非流式）**：`status`（`completed` / `incomplete` + `incomplete_details`）、`output` 数组
+（`reasoning` / `message` / `function_call` 三类项，每项都带 `id` 与 `status`）、`usage`
+（`input_tokens_details.cached_tokens` 与 **`output_tokens_details.reasoning_tokens`** 如实回传）。
+
+**流式事件序列**（官方形状）：
+
+```text
+response.created → response.in_progress
+  ├─ response.output_item.added (reasoning) → response.reasoning_summary_part.added
+  │    → response.reasoning_summary_text.delta … → *.text.done → *.part.done → output_item.done
+  ├─ response.output_item.added (message) → response.content_part.added
+  │    → response.output_text.delta … → response.output_text.done → content_part.done → output_item.done
+  └─ response.output_item.added (function_call) → response.function_call_arguments.delta …
+       → response.function_call_arguments.done → output_item.done
+response.completed / response.incomplete / response.failed
+```
+
+`finish_reason=length` 一律表达成 `response.incomplete`（流式）或 `status:"incomplete"`
+（非流式）——**截断不是成功**，客户端不会把半截答案当成完整回复。
+
+**跨方言的几处归一**（翻译器是通用的，组合越自由越要在这里收口）：
+
+- `input_image.image_url` 的**字符串**写法（官方规范）与 `{url, detail}` **对象**写法都收编成
+  chat 的 `image_url`，不会变成 `[object Object]`（这个 bug 曾让三个上游全部 400）；
+- agent 历史里「assistant 文本 item」与「function_call item」分开给的写法，会合并成
+  **同一条** assistant 消息（`content` + `tool_calls`），否则翻译到 Anthropic/Gemini 会出现
+  连续两条 assistant 的畸形历史；
+- `text.format` 在出站侧会翻回去：chat 渠道走 `response_format`、`openai-responses` 渠道走
+  `text.format`、`gemini` 渠道走 `responseMimeType`/`responseSchema`（Anthropic 无原生等价物，
+  只能忽略——需要严格 JSON 的客户端请别把该模型挂在 anthropic 渠道上）；
+- `reasoning.effort` 出站到 chat 是 `reasoning_effort`、到 Responses 是 `reasoning.effort`；
+  Anthropic/Gemini 没有同名参数，忽略。
+
+**已知限制**（刻意的语义选择，不是能力缺失的遮掩）：
+
+- `previous_response_id`：无状态网关不存对话树，直接 400，客户端请携带完整上下文；
+- `store` / `metadata` / `truncation` / `include`：一律忽略（网关从不留档；没有可加密回传的
+  `reasoning.encrypted_content`，推理文本以 `reasoning` 项的 `summary` 给出）；
+- 图片输入：`input_image` 会翻译成 chat 的 `image_url`，但图片**生成**接口未实现。
 
 ## 架构
 
@@ -83,23 +142,23 @@ Responses 的 `previous_response_id` 无法被无状态网关服务，直接 400
 客户端 ──sk-xxx──> Worker
                     │
                     ├─ /v1/*              relay：鉴权 → 选路 → 适配器 → 流式透传 → 计费
-                    │                     （入站方言：Chat / Responses / Anthropic / Gemini）
+                    │                     （入站方言：Chat / Responses / Anthropic / Gemini / Decisions / System One）
                     ├─ /api/*             管理 API（Authorization: Bearer ADMIN_KEY）+ 内置 CLI
                     ├─ /api/status/*      公开状态页（免鉴权，只有引擎名与状态枚举）
                     └─ /*                 Workers Assets 托管的管理后台 SPA
                     │
-                    ├─ D1  users(仅 owner) / tokens / channels / abilities(model→channel) / logs / credits / options
+                    ├─ D1  users(仅 owner) / tokens / channels / abilities(model→channel) / logs / credits / options / relay_events
                     └─ KV  令牌鉴权缓存、系统配置缓存（TTL 60s）
 ```
 
 `abilities` 是 `model -> channel` 的反范式索引，选路只需一次带索引的查询。
-没有分组：个人网关只有一个 owner，模型可见性由令牌的 models 白名单控制。
+没有分组：个人网关只有一个 owner，模型可见性由令牌的 `models` 白名单控制。
 
 ## 管理面：一个令牌，没有账号
 
 - 凭据 = `wrangler.jsonc` 里 `vars.ADMIN_KEY` 的长随机令牌（**硬编码**，个人仓库自用；
-  泄露就换一个再部署）。除 `GET /api/status`（公开）外，所有 `/api/*` 都要求
-  `Authorization: Bearer <ADMIN_KEY>`，比较走 constant-time。
+  泄露就换一个再部署）。除 `GET /api/status`、`GET /api/status/public` 外，所有 `/api/*`
+  都要求 `Authorization: Bearer <ADMIN_KEY>`，比较走 constant-time。
 - 浏览器打开站点 → 输入一次令牌（存 `localStorage`）→ 之后每个请求自动带上；
   任意 401 会清掉存储回到解锁页。
 - 唯一账户 `owner` 在第一次令牌鉴权时懒创建（username `owner`，走账本预存
@@ -117,10 +176,12 @@ AI 会话记录都会把屏幕上出现过的东西留存下来，而密钥轮�
   输出单行，方便 `KEY=$(... | jq -r .data.output)` 捕获；
 - 每次取回明文都会写一条管理日志（`取回令牌 #N 明文密钥`），密钥万一外泄能回溯。
 
-> 后台是单文件 SPA + hash 路由：标签页挂久了浏览器里跑的还是旧 JS，而 Worker 已经是新代码。
-> `/api/status` 会带 `spa_build`，前端启动时/切回标签页/每 5 分钟对一次构建号，不一致就自动
-> 重载一次（用 `sessionStorage` 防重载循环，仍不一致就挂横幅提示硬刷新），
-> 避免「旧页面调新接口」炸出 `undefined`（后台「设置 → 版本」能看到前后端构建号）。
+### 前后端构建号握手
+
+后台是单文件 SPA + hash 路由：标签页挂久了浏览器里跑的还是旧 JS，而 Worker 已经是新代码。
+`/api/status` 带 `spa_build`，前端启动时 / 切回标签页 / 每 5 分钟对一次构建号，不一致就自动
+重载一次（`sessionStorage` 防重载循环，仍不一致就挂横幅提示硬刷新）。
+后台「设置 → 版本」能看到前端与服务端构建号，肉眼可核对。
 
 ## 内置命令行
 
@@ -131,6 +192,9 @@ curl -X POST https://你的站点/api/cli \
   -H "Authorization: Bearer <管理令牌>" -H "Content-Type: application/json" \
   -d '{"command":"channel list"}'
 ```
+
+返回 `{"success":true,"message":"","data":{"output":"<文本>","ok":true}}`；HTTP 层只在请求本身
+出错时非 200（缺 command / 令牌错 / 未配 ADMIN_KEY），命令执行失败用 `data.ok` 表示。
 
 命令与 REST 完全等价（同一套库函数，不存在两套行为）。规则：命令 = 子命令空格分隔，
 参数用 `key=value`，开关用 `--flag value`；带空格的值用引号包裹（`in="4 * (context > 272k ? 2 : 1)"`）；
@@ -152,13 +216,13 @@ health                    近 1 小时各渠道成败
 reconcile                 账本对账（有无绕过账本的写入）
 watchdog [run]            查看自检心跳 / 立即跑一次自检
 
-# 渠道（类型：openai | openai-responses | anthropic | gemini | azure）
+# 渠道（类型：openai | openai-responses | anthropic | gemini | azure | decisions | systemone）
 channel list                                        渠道列表
 channel add <类型> <名称> <base_url> <key> --models m1,m2 [--priority N] [--weight N]
 channel set <id> name=... type=... base_url=... key=... models=a,b priority=N weight=N status=1
                                                     按字段修改（改 models 自动重建路由索引）
 channel show <id>                                   详情（密钥打码）
-channel test <id> [模型]                            直连上游测一个模型（不传 = 第一个；必须属于该渠道）
+channel test <id> [模型]                            走该类型的原生协议直连上游测一个模型
 channel pull <id> [--add]                           用渠道 key 拉上游 /models；--add 合并进 models（去重）
 channel price <id> [JSON | --clear]                 该渠道的价格覆盖（{"请求名":{...}}，仅此渠道生效）
 channel on <id> / off <id> / del <id>               启用 / 停用 / 删除
@@ -173,7 +237,7 @@ token key <id>                                      取回完整密钥（唯一�
 token on <id> / off <id> / del <id>                 启用 / 停用 / 删除
 （没有 Key 级价格：令牌混用渠道且有故障转移，价格跟着渠道走——见 channel price）
 
-# 价格（美元 / 1M tokens；渠道覆盖 > 全局覆盖 > 内置表 > 默认价）
+# 价格（美元 / 1M tokens；渠道覆盖 > 全局覆盖 > 内置表 > 兜底价）
 price list [过滤]                价格表（标注来源与缓存写 5m/1h 价；基础价，不含渠道覆盖）
 price get <模型>                 查一个模型的生效价（表达式截断显示）
 price set <模型> in=X out=Y [cached=Z] [cw5=A] [cw1=B]   常量覆盖；字段也可写费率表达式
@@ -224,8 +288,8 @@ fresh = prompt − 缓存命中 − 写缓存5m − 写缓存1h
   计价；只报总数时归入 5m 桶；未配置的模型按输入价计。OpenAI/Gemini 无写缓存概念。
 - **严格计费开关 = 兜底价**：价格页清空默认价（存 `null`）即启用——查不到价的请求
   直接 503 `model_price_not_configured`（不调上游、不预扣）；设置兜底价则按它记账
-  （默认 $1/$3）。后台新增「模型计费」页：每个模型按哪个价计、近 7 天用量、
-  缓存命中率、有没有漏配价，一眼看完；总览与健康页有未定价警告横幅。
+  （默认 $1/$3）。后台「模型计费」页：每个模型按哪个价计、近 7 天用量、缓存命中率、
+  有没有漏配价，一眼看完；总览与健康页有未定价警告横幅。
 
 ### 价格的优先级：渠道 > 全局 > 内置表 > 兜底
 
@@ -233,13 +297,13 @@ fresh = prompt − 缓存命中 − 写缓存5m − 写缓存1h
 
 1. **渠道覆盖** —— `channels.price_config`（JSON：`{ "请求名": PriceSpec }`，键是渠道
    models 里写的名字），后台「渠道」编辑弹窗或 CLI `channel price <id> '...'` 配置；
-   **路由到这个渠道就按它的价**——折扣渠道/免费 NIM 各配各的。同一模型在不同渠道
+   **路由到这个渠道就按它的价**——折扣渠道/免费自部署模型各配各的。同一模型在不同渠道
    可以不同价（换渠道时预扣自动退旧开新，不会串账）
 2. **全局覆盖** —— `options.ModelPriceOverride`，后台「价格」页编辑
    （`PUT /api/pricing/overrides`，整包替换，逐条校验）
 3. **内置价格表** —— `src/lib/pricing/llm.ts` 的 `PRICE_TABLE`，**精确命中**
    （为什么不是前缀匹配，见下面「名字解析」）
-4. **默认价** —— $1 / $3（严格计费下不生效；价格页可改/可清除）
+4. **兜底价** —— $1 / $3（严格计费下不生效；价格页可改/可清除）
 
 > **没有 Key 级价格**（曾有，已删）：令牌混用各个渠道、渠道间还会故障转移，
 > 在令牌上定价既不合理也没意义——价格跟着**渠道**走。
@@ -317,7 +381,7 @@ Azure 部署名 `gpt-35-turbo`、聚合器的 `openai/gpt-4o`）。解析规则�
   `decisions` → `{base}/decisions`、`systemone` → `{base}/systemone`。请求由对应
   adaptor 构造，所以测的就是中继真正会走的那条路；成功/失败消息都带协议标签、
   真实出站 URL 与耗时。
-- **从上游拉取模型**：新增/编辑渠道时用 key 请求上游 `/models`（5 种渠道类型各自的
+- **从上游拉取模型**：新增/编辑渠道时用 key 请求上游 `/models`（各渠道类型自己的
   端点与鉴权头，Gemini 分页取全并剥 `models/` 前缀，Azure 取 deployment 名），
   复选后追加合并进模型列表；编辑已有渠道可走库存 key，key 不回传前端。
 - **模型计费页**：`GET /api/model-billing`，见上。
@@ -326,7 +390,7 @@ Azure 部署名 `gpt-35-turbo`、聚合器的 `openai/gpt-4o`）。解析规则�
 
 - `GET /api/pricing`（管理员）：内置表全文、默认价、全局覆盖现状、别名前缀表。
 - `GET /v1/pricing`（任意 sk- Key）：**这把 Key** 调用时的生效价格，每条带 `source`
-  （`key` / `global` / `builtin` / `default`）。客户端可以在调用前算出成本。
+  （`channel` / `global` / `builtin` / `default`）。客户端可以在调用前算出成本。
 - `GET /api/model-billing`（管理员）：模型计费页数据（声明模型全集 × 价格解析 × 近 7 天用量）。
 - `npm run audit:llm-billing`：部署前的只读审计——列出启用渠道上未定价的 (渠道, 模型)
   组合；严格计费下不为空则以非零退出。`python scripts/d1_guard.py check`：部署前核对
@@ -343,23 +407,22 @@ Azure 部署名 `gpt-35-turbo`、聚合器的 `openai/gpt-4o`）。解析规则�
 
 ### 路由缺口告警：企业微信群机器人
 
-请求指向当前分组下没有可用渠道的模型（客户端收到 503）时，`src/lib/route-alert.ts`
-把告警推到企业微信群机器人：挂在 `waitUntil` 上不拖慢请求；同一 model + group 默认
+请求指向没有可用渠道的模型（客户端收到 503）时，`src/lib/route-alert.ts`
+把告警推到企业微信群机器人：挂在 `waitUntil` 上不拖慢请求；同一 model 默认
 30 分钟冷却；恢复由 `*/5` 清扫 cron 检查并发「已修复」。配置：
 
 ```bash
-npx wrangler secret put WECOM_HEALTH_WEBHOOK_URL   # 群机器人完整 URL（含 ?key=）
+wrangler secret put WECOM_HEALTH_WEBHOOK_URL   # 群机器人完整 URL（含 ?key=）
 ```
 
 不配时整个功能静默关闭。
 
-## 双协议
+## Anthropic 入站细节
 
-同一套路由、计费、重试机制同时对外提供两种协议，只在边缘做转换：
+同一套路由、计费、重试机制对外提供 Anthropic Messages 协议，只在边缘做转换：
 
 | 入口 | 协议 | 鉴权头 |
 |---|---|---|
-| `/v1/*` | OpenAI | `Authorization: Bearer` |
 | `/v1/messages`、`/api/anthropic/v1/messages` | Anthropic Messages | `x-api-key`（也接受 `Authorization`） |
 
 Anthropic 请求进来先转成内部的 OpenAI 形状用于选路和计费，响应再转回去。
@@ -367,10 +430,9 @@ OpenAI 兼容的推理模型把思维链放在 `delta.reasoning_content`，会�
 `thinking` 块；OpenAI 形状的上游只在流末给 usage，所以 `message_start` 里的
 `input_tokens` 只能是 0，真实值在 `message_delta` 的 usage 里给出。
 
-## 决策接口：Jev / OpenRouter Decisions
+## 决策接口：Decisions / System One
 
-Typesafe 的 Jev 走的不是 chat/completions，而是 Decisions API。决策接口有两个公开
-协议，网关**两个入站入口都开**（客户端只认其中一个，缺哪个都是 404）：
+决策接口有两个公开协议，网关**两个入站入口都开**（客户端只认其中一个，缺哪个都是 404）：
 
 | 入站端点 | 方言 | 请求体 |
 |---|---|---|
@@ -388,7 +450,7 @@ Typesafe 的 Jev 走的不是 chat/completions，而是 Decisions API。决策�
 
 ### 接入一个决策渠道
 
-决策接口有**两种方言**（不是同一家，2026-11 官方文档核对）：OpenAI Decisions
+决策接口有**两种方言**（2026-11 官方文档核对）：OpenAI Decisions
 （`{model, input, questions:[]}`，题型 predicate/choice/score，模型 gpt-6-luna）与
 TypeSafe System One（`{model, state, questions:{}}`，题型 noul/choice/score，
 模型 jev-latest）。对应**两个专用类型**，渠道里的模型**自动全部视为决策模型**，
@@ -463,7 +525,7 @@ chat/completions（自定义决策上游多半 404），而 `/v1/decisions` 会�
 
 规则集中在 `src/lib/capability.ts` 一处：`GET /v1/models` 默认只列 chat 模型
 （`?capability=decisions` 才返回决策模型）；decision-only 模型走 chat/completions 400、
-普通模型走 `/v1/decisions` 400。分诊发生在预扣之前，走错门不动账。
+普通模型走 `/v1/decisions` / `/v1/systemone` 400。分诊发生在预扣之前，走错门不动账。
 运维可以在「设置」里往 `DecisionOnlyModels` 追加名字（只增不减）。
 
 ## 账本与并发
@@ -490,23 +552,30 @@ UPDATE users SET quota = quota + ?1 WHERE id = ?2 AND quota + ?1 >= 0 RETURNING 
 ```bash
 npm install
 npm run dev          # 本地 wrangler dev
-npm test             # 适配器流式转换 + 表达式引擎 + 查价/计费 + 决策/403/健康等
 npm run typecheck
+npm test             # 23 个测试套件：协议转换 / 计费 / 表达式 / 路由 / 令牌与构建号 / 决策
+npm run test:d1      # 迁移文件与远端 d1_migrations 一致性守卫（需要 bash）
 npm run deploy
 ```
+
+测试套件：`stream` `expr` `pricing` `billing-identity` `responses` `gemini` `cli`
+`channel-test` `fetch-models` `model-billing` `cooldown` `health` `decisions`
+`decisions-translate` `auto-disable` `403-fallback` `route-alert` `models`
+`audit-billing` `query-plan` `token-secret` `spa-build` `anthropic-inbound`。
 
 首次部署到新账号：
 
 ```bash
-npx wrangler d1 create oneapi
-npx wrangler kv namespace create CACHE
+wrangler d1 create oneapi
+wrangler kv namespace create CACHE
 # 把返回的 id 填进 wrangler.jsonc
 npm run db:init            # 建表（migrations/0001）
 # 换掉 wrangler.jsonc vars.ADMIN_KEY 里的示例令牌！
 npm run deploy
 ```
 
-老库升级只需 `npm run db:migrate`（0014 加 `tokens.price_config` 列）。
+老库升级只需 `npm run db:migrate`（脚本遍历 `migrations/*.sql`，当前到 0017：
+0014 加过 `tokens.price_config`、0017 已把它删除并换成 `channels.price_config`）。
 `migrations/0004–0013` 里平台生态的表和列保留原样（对老库友好），代码已不再读写，
 属于惰性结构。
 
@@ -530,6 +599,17 @@ curl https://your-worker.example/v1/chat/completions \
 ```
 
 ```bash
+# Responses 入站（推理过程会以 reasoning 项返回）
+curl https://your-worker.example/v1/responses \
+  -H "Authorization: Bearer sk-xxxxx" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-flash","input":"用一句话说明什么是会议纪要","stream":true}'
+
+# Anthropic Messages 入站（base 填站点根时 SDK 打的就是这个路径）
+curl https://your-worker.example/v1/messages \
+  -H "x-api-key: sk-xxxxx" -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+
 # 看这把 Key 的生效价格
 curl https://your-worker.example/v1/pricing -H "Authorization: Bearer sk-xxxxx"
 ```
@@ -543,9 +623,10 @@ curl https://your-worker.example/v1/pricing -H "Authorization: Bearer sk-xxxxx"
 
 ## 与上游（one-api）的差异
 
-- 38 个适配器压缩为 5 种渠道类型（openai / openai-responses / anthropic / gemini / azure）
-- 移除：注册/登录/多用户/兑换码、分组体系、分组倍率/时段折扣、`/internal/*` 平台对接、
-  语音授权窗口计费、多币种钱包、邮箱验证、第三方登录
+- 38 个适配器压缩为 **7 种渠道类型**（openai / openai-responses / anthropic / gemini / azure / decisions / systemone）
+- 移除：注册/登录/多用户/兑换码、分组体系、分组倍率/时段折扣、Key 级价格、
+  `/internal/*` 平台对接、语音授权窗口计费、多币种钱包、邮箱验证、第三方登录
 - 新增：ADMIN_KEY 单管理员、渠道 × 模型价格矩阵（价格跟着渠道走）、表达式计费语言、
-  价格外显与可视化改表、协议翻译器（任一入站方言 × 任一上游方言）、内置命令行（终端页 + `/api/cli`）
+  价格外显与可视化改表、协议翻译器（四种入站方言 × 七种渠道）、Responses 入站与推理过程回传、
+  内置命令行（终端页 + `/api/cli`）、前后端构建号握手、密钥不回显策略
 - 日志写在 D1，量大时需要定期归档（D1 单库写入吞吐有限）

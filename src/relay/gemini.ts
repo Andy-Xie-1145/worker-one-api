@@ -43,12 +43,31 @@ export const geminiAdaptor: Adaptor = {
 
     const body: Record<string, any> = { contents };
     if (systemInstruction) body.systemInstruction = { parts: [{ text: systemInstruction }] };
+    // 结构化输出：chat 的 response_format → Gemini 的 responseMimeType/responseSchema。
+    // 不映射的话，客户端要的 JSON 输出会被上游静默降级成自由文本。
+    const rf = (req as any).response_format;
+    if (rf && typeof rf === 'object') {
+      if (rf.type === 'json_object') generationConfig.responseMimeType = 'application/json';
+      else if (rf.type === 'json_schema') {
+        generationConfig.responseMimeType = 'application/json';
+        const schema = rf.json_schema?.schema ?? rf.schema;
+        if (schema) generationConfig.responseSchema = cleanSchema(schema);
+      }
+    }
     if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
     if (req.tools?.length) {
       const decls = req.tools
         .filter((t: any) => t.type === 'function' && t.function)
         .map((t: any) => ({ name: t.function.name, description: t.function.description ?? '', parameters: cleanSchema(t.function.parameters) }));
       if (decls.length) body.tools = [{ functionDeclarations: decls }];
+      // tool_choice 也有等价物：强制任一/禁用/指定函数（否则客户端要求必须调用时，
+      // Gemini 可能只回一段文本，客户端拿不到 function_call 就会一直空转）。
+      const choice: any = req.tool_choice;
+      if (choice === 'required') body.toolConfig = { functionCallingConfig: { mode: 'ANY' } };
+      else if (choice === 'none') body.toolConfig = { functionCallingConfig: { mode: 'NONE' } };
+      else if (choice && typeof choice === 'object' && choice.function?.name) {
+        body.toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [choice.function.name] } };
+      }
     }
     // Gemini blocks a lot by default; relay traffic should pass through untouched.
     body.safetySettings = ['HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'HARM_CATEGORY_DANGEROUS_CONTENT'].map(

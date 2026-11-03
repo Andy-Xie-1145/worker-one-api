@@ -261,6 +261,161 @@ test('入站：并行工具调用——function_call 在最终 output 里完整�
   assert.match(tail, /\\"city\\":\\"SZ\\"/);
 });
 
+// ---------------------------------------------------------------- 推理过程回归
+
+test('入站非流式：reasoning 输出项带 id/status，reasoning_tokens 如实回传', () => {
+  const resp = chatResponseToResponses(
+    {
+      id: 'chatcmpl_r', created: 1700000000,
+      choices: [{ message: { role: 'assistant', content: 'ok', reasoning_content: '先想一下，再回答。' }, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 11, completion_tokens: 9, total_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 3 },
+        completion_tokens_details: { reasoning_tokens: 7 },
+      },
+    },
+    'm',
+  );
+  assert.equal(resp.status, 'completed');
+  const reasoning = resp.output.find((o: any) => o.type === 'reasoning');
+  assert.ok(reasoning, '必须返回推理过程');
+  assert.match(reasoning.id, /^rs_/, 'reasoning 项要有 id');
+  assert.equal(reasoning.status, 'completed');
+  assert.equal(reasoning.summary[0].text, '先想一下，再回答。');
+  const msg = resp.output.find((o: any) => o.type === 'message');
+  assert.match(msg.id, /^msg_/);
+  assert.equal(msg.status, 'completed');
+  assert.equal(resp.usage.output_tokens_details.reasoning_tokens, 7, 'reasoning_tokens 不能硬编码 0');
+  assert.equal(resp.usage.input_tokens_details.cached_tokens, 3);
+});
+
+test('入站非流式：finish_reason=length → status=incomplete（以前硬编码 completed）', () => {
+  const resp = chatResponseToResponses(
+    {
+      id: 'chatcmpl_2',
+      choices: [{ message: { role: 'assistant', content: '', reasoning_content: '想到一半被截断' }, finish_reason: 'length' }],
+      usage: { prompt_tokens: 5, completion_tokens: 200, total_tokens: 205 },
+    },
+    'm',
+  );
+  assert.equal(resp.status, 'incomplete');
+  assert.equal(resp.incomplete_details.reason, 'max_output_tokens');
+});
+
+test('入站流式：推理过程有完整事件序列（item.added / delta / done），reasoning_tokens 回传', () => {
+  const enc = newResponsesEncoder();
+  const a = encodeResponsesChunk(enc, { id: 'ch_r', created: 1700000000, choices: [{ delta: { reasoning_content: '先想' } }] }, 'm');
+  assert.match(a, /event: response\.output_item\.added/);
+  assert.match(a, /"type":"reasoning"/);
+  assert.match(a, /event: response\.reasoning_summary_part\.added/);
+  assert.match(a, /event: response\.reasoning_summary_text\.delta/);
+  assert.match(a, /"delta":"先想"/);
+  const b = encodeResponsesChunk(enc, { id: 'ch_r', choices: [{ delta: { reasoning_content: '一下' }, }] }, 'm');
+  assert.match(b, /"delta":"一下"/, '第二个推理增量沿用同一个 reasoning 项');
+  // 文本项在推理项之后（output_index 递增）
+  const c = encodeResponsesChunk(enc, { id: 'ch_r', choices: [{ delta: { content: '答案' } }] }, 'm');
+  assert.match(c, /"output_index":1/);
+  // 上游在最后一个 chunk 给 usage 明细
+  encodeResponsesChunk(enc, { id: 'ch_r', choices: [], usage: { prompt_tokens: 11, completion_tokens: 9, total_tokens: 20, completion_tokens_details: { reasoning_tokens: 7 }, prompt_tokens_details: { cached_tokens: 3 } } }, 'm');
+  const tail = finishResponsesStream(enc, 'm', { prompt_tokens: 11, completion_tokens: 9, total_tokens: 20 });
+  assert.match(tail, /event: response\.reasoning_summary_text\.done/);
+  assert.match(tail, /event: response\.reasoning_summary_part\.done/);
+  assert.match(tail, /event: response\.output_text\.done/);
+  assert.match(tail, /event: response\.content_part\.done/);
+  assert.equal((tail.match(/event: response\.output_item\.done/g) ?? []).length, 2, 'reasoning 与 message 各有一次 done');
+  assert.match(tail, /event: response\.completed/);
+  const completed = JSON.parse(/data: (\{"type":"response\.completed".*)/.exec(tail)![1]);
+  assert.equal(completed.response.output.length, 2);
+  assert.equal(completed.response.output[0].type, 'reasoning');
+  assert.equal(completed.response.output[0].summary[0].text, '先想一下');
+  assert.equal(completed.response.output[1].content[0].text, '答案');
+  assert.equal(completed.response.usage.output_tokens_details.reasoning_tokens, 7, '流式也要回传 reasoning_tokens');
+  assert.equal(completed.response.usage.input_tokens_details.cached_tokens, 3);
+});
+
+test('入站流式：工具调用有 output_item.added / arguments.delta / arguments.done', () => {
+  const enc = newResponsesEncoder();
+  encodeResponsesChunk(enc, { id: 'ch_t', choices: [{ delta: { role: 'assistant' } }] }, 'm');
+  const a = encodeResponsesChunk(enc, { id: 'ch_t', choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'weather', arguments: '' } }] } }] }, 'm');
+  assert.match(a, /event: response\.output_item\.added/);
+  assert.match(a, /"type":"function_call"/);
+  assert.match(a, /"call_id":"c1"/);
+  const b = encodeResponsesChunk(enc, { id: 'ch_t', choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"city":"SZ"}' } }] } }] }, 'm');
+  assert.match(b, /event: response\.function_call_arguments\.delta/);
+  const tail = finishResponsesStream(enc, 'm', { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+  assert.match(tail, /event: response\.function_call_arguments\.done/);
+  assert.match(tail, /"arguments":"\{\\"city\\":\\"SZ\\"\}"/);
+});
+
+test('入站请求：reasoning.effort 与 text.format 映射到 chat 字段', () => {
+  const chat: any = responsesToChatRequest({
+    model: 'm',
+    input: 'hi',
+    reasoning: { effort: 'high' },
+    text: { format: { type: 'json_schema', name: 'out', schema: { type: 'object' }, strict: true } },
+  });
+  assert.equal(chat.reasoning_effort, 'high');
+  assert.deepEqual(chat.response_format, { type: 'json_schema', json_schema: { name: 'out', schema: { type: 'object' }, strict: true } });
+  const json = responsesToChatRequest({ model: 'm', input: 'hi', text: { format: { type: 'json_object' } } }) as any;
+  assert.deepEqual(json.response_format, { type: 'json_object' });
+  // 不认识的 format 不猜、不下发
+  const unknown = responsesToChatRequest({ model: 'm', input: 'hi', text: { format: { type: 'weird' } } }) as any;
+  assert.equal(unknown.response_format, undefined);
+});
+
+test('入站请求：input_image 的字符串/对象两种写法都归一成 chat image_url', () => {
+  const png = 'data:image/png;base64,QUJD';
+  const withString = responsesToChatRequest({
+    model: 'm',
+    input: [{ role: 'user', content: [{ type: 'input_image', image_url: png }, { type: 'input_text', text: '看这张图' }] }],
+  }) as any;
+  assert.deepEqual(withString.messages[0].content, [
+    { type: 'image_url', image_url: { url: png } },
+    { type: 'text', text: '看这张图' },
+  ]);
+  const withObject = responsesToChatRequest({
+    model: 'm',
+    input: [{ role: 'user', content: [{ type: 'input_image', image_url: { url: png, detail: 'low' } }] }],
+  }) as any;
+  assert.deepEqual(withObject.messages[0].content, [{ type: 'image_url', image_url: { url: png, detail: 'low' } }], '对象写法不能变成 [object Object]');
+});
+
+test('入站请求：agent 历史里 assistant 文本 + function_call 合并成同一条 assistant 消息', () => {
+  const chat = responsesToChatRequest({
+    model: 'm',
+    input: [
+      { role: 'user', content: '查天气' },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '我先查一下。' }] },
+      { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"深圳"}' },
+      { type: 'function_call_output', call_id: 'call_1', output: '{"temp":26}' },
+      { role: 'user', content: '那穿什么？' },
+    ],
+  }) as any;
+  assert.equal(chat.messages.length, 4, '不该出现连续两条 assistant 消息');
+  assert.equal(chat.messages[1].role, 'assistant');
+  assert.equal(chat.messages[1].content, '我先查一下。');
+  assert.deepEqual(chat.messages[1].tool_calls, [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"深圳"}' } }]);
+  assert.equal(chat.messages[2].role, 'tool');
+  assert.equal(chat.messages[3].role, 'user');
+});
+
+test('出站：chat 的 response_format/reasoning_effort → Responses 的 text.format/reasoning.effort', () => {
+  const built = openaiResponsesAdaptor.buildRequest(
+    {
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      response_format: { type: 'json_schema', json_schema: { name: 'out', schema: { type: 'object' }, strict: true } },
+      reasoning_effort: 'high',
+    } as any,
+    ctx(),
+  );
+  const body = JSON.parse(built.body);
+  assert.deepEqual(body.text, { format: { type: 'json_schema', name: 'out', schema: { type: 'object' }, strict: true } });
+  assert.deepEqual(body.reasoning, { effort: 'high' });
+  const json = JSON.parse(openaiResponsesAdaptor.buildRequest({ model: 'm', messages: [{ role: 'user', content: 'hi' }], response_format: { type: 'json_object' } } as any, ctx()).body);
+  assert.deepEqual(json.text, { format: { type: 'json_object' } });
+});
+
 // ---------------------------------------------------------------- runner
 
 let failed = 0;

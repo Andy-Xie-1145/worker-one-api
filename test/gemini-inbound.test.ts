@@ -114,6 +114,35 @@ test('出站：tool 结果按 call_id 从历史 tool_calls 找回函数名', () 
   assert.equal(last.parts[0].functionResponse.name, 'weather', 'tool_call_id 要映射回函数名');
 });
 
+test('出站：response_format → responseMimeType/responseSchema，tool_choice → toolConfig', () => {
+  const ctx = {
+    channel: { id: 1, type: 'gemini', key: 'k', status: 1, name: 'g', weight: 1, priority: 0, created_time: 0, test_time: 0, response_time: 0, base_url: 'https://g.test', balance: 0, models: '', used_quota: 0, model_mapping: '', config: '', system_prompt: '' } as any,
+    upstreamModel: 'm', requestedModel: 'm', mode: 'chat' as const, path: 'chat/completions', config: {},
+  };
+  // json_schema → 结构化输出（否则客户端要的 JSON 会被静默降级成自由文本）
+  const schemaBody = JSON.parse(geminiAdaptor.buildRequest({
+    model: 'm',
+    messages: [{ role: 'user', content: 'hi' }],
+    response_format: { type: 'json_schema', json_schema: { name: 'out', schema: { type: 'object', properties: { ok: { type: 'boolean' } } }, strict: true } },
+  } as any, ctx).body);
+  assert.equal(schemaBody.generationConfig.responseMimeType, 'application/json');
+  assert.deepEqual(schemaBody.generationConfig.responseSchema, { type: 'object', properties: { ok: { type: 'boolean' } } });
+
+  const jsonBody = JSON.parse(geminiAdaptor.buildRequest({
+    model: 'm', messages: [{ role: 'user', content: 'hi' }], response_format: { type: 'json_object' },
+  } as any, ctx).body);
+  assert.equal(jsonBody.generationConfig.responseMimeType, 'application/json');
+
+  // tool_choice：required / 指定函数 / none
+  const tools = [{ type: 'function', function: { name: 'get', description: 'd', parameters: { type: 'object', properties: {} } } }];
+  const required = JSON.parse(geminiAdaptor.buildRequest({ model: 'm', messages: [{ role: 'user', content: 'hi' }], tools, tool_choice: 'required' } as any, ctx).body);
+  assert.deepEqual(required.toolConfig, { functionCallingConfig: { mode: 'ANY' } });
+  const named = JSON.parse(geminiAdaptor.buildRequest({ model: 'm', messages: [{ role: 'user', content: 'hi' }], tools, tool_choice: { type: 'function', function: { name: 'get' } } } as any, ctx).body);
+  assert.deepEqual(named.toolConfig, { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get'] } });
+  const none = JSON.parse(geminiAdaptor.buildRequest({ model: 'm', messages: [{ role: 'user', content: 'hi' }], tools, tool_choice: 'none' } as any, ctx).body);
+  assert.deepEqual(none.toolConfig, { functionCallingConfig: { mode: 'NONE' } });
+});
+
 // ---------------------------------------------------------------- runner
 
 let failed = 0;

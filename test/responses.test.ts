@@ -399,6 +399,26 @@ test('入站请求：agent 历史里 assistant 文本 + function_call 合并成�
   assert.equal(chat.messages[3].role, 'user');
 });
 
+test('入站流式：上游零事件（非 SSE 的 200 / 空响应体）也要补齐 created + 终结事件', () => {
+  const enc = newResponsesEncoder();
+  const tail = finishResponsesStream(enc, 'm', { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+  assert.match(tail, /event: response\.created/, '只有终结事件没有 created 的流会被 SDK 判成格式损坏');
+  assert.match(tail, /event: response\.in_progress/);
+  assert.match(tail, /event: response\.completed/);
+  assert.ok(tail.indexOf('response.created') < tail.indexOf('response.completed'), 'created 必须在终结之前');
+  const completed = JSON.parse(/data: (\{"type":"response\.completed".*)/.exec(tail)![1]);
+  assert.deepEqual(completed.response.output, []);
+  assert.equal(completed.response.status, 'completed');
+});
+
+test('入站流式：终结事件只出现一次（error chunk 之后 catch 不再补发）', () => {
+  const enc = newResponsesEncoder();
+  const first = encodeResponsesChunk(enc, { id: 'ch_1', error: { message: 'boom' } }, 'm');
+  assert.match(first, /event: response\.failed/);
+  assert.equal(enc.finished, true, '终结事件已发出，后续不得重复');
+  assert.equal(finishResponsesStream(enc, 'm', { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 }), '');
+});
+
 test('出站：chat 的 response_format/reasoning_effort → Responses 的 text.format/reasoning.effort', () => {
   const built = openaiResponsesAdaptor.buildRequest(
     {

@@ -483,15 +483,29 @@ export function finishResponsesStream(enc: ResponsesEncoder, model: string, usag
   if (enc.finished) return '';
   enc.finished = true;
   const u = usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+
+  /*
+   * 上游一个可解析 chunk 都没给（非 SSE 的 200、空响应体、立刻 [DONE]）时，
+   * response.created / in_progress 还没发过。补上：客户端 SDK 普遍靠 created
+   * 初始化响应对象，只有终结事件没有 created 的流会被判成格式损坏。
+   */
+  let opening = '';
+  if (!enc.responseId) {
+    enc.responseId = `resp_${Date.now()}`;
+    opening =
+      sse('response.created', { type: 'response.created', response: baseResponse(enc.responseId, model, 'in_progress') }) +
+      sse('response.in_progress', { type: 'response.in_progress', response: baseResponse(enc.responseId, model, 'in_progress') });
+  }
+
   if (enc.errorMsg) {
-    return sse('response.failed', {
+    return opening + sse('response.failed', {
       type: 'response.failed',
-      response: { ...baseResponse(enc.responseId || `resp_${Date.now()}`, model, 'failed'), error: { code: 'upstream_error', message: enc.errorMsg } },
+      response: { ...baseResponse(enc.responseId, model, 'failed'), error: { code: 'upstream_error', message: enc.errorMsg } },
     });
   }
   const incomplete = enc.finishReason === 'length';
   const response: any = {
-    ...baseResponse(enc.responseId || `resp_${Date.now()}`, model, incomplete ? 'incomplete' : 'completed'),
+    ...baseResponse(enc.responseId, model, incomplete ? 'incomplete' : 'completed'),
     output: encoderOutput(enc),
     usage: {
       input_tokens: Number(u.prompt_tokens ?? 0),
@@ -503,6 +517,7 @@ export function finishResponsesStream(enc: ResponsesEncoder, model: string, usag
   };
   if (incomplete) response.incomplete_details = { reason: 'max_output_tokens' };
   return (
+    opening +
     encoderDoneEvents(enc) +
     sse(incomplete ? 'response.incomplete' : 'response.completed', {
       type: incomplete ? 'response.incomplete' : 'response.completed',

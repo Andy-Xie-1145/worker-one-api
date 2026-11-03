@@ -907,7 +907,9 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
           controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify(anthropicError(message))}\n\n`));
           controller.enqueue(encoder.encode(finishAnthropicStream(anthropic, usage)));
         } else if (responsesEnc) {
-          controller.enqueue(encoder.encode(responsesErrorEvent(requestedModel, message)));
+          // 编码器已经发过终结事件（例如上游错误 chunk 已经产出 response.failed）时
+          // 不再补发第二个，避免客户端见到「终结事件之后还有事件」。
+          if (!responsesEnc.finished) controller.enqueue(encoder.encode(responsesErrorEvent(requestedModel, message)));
         } else if (geminiEnc) {
           controller.enqueue(encoder.encode(geminiErrorEvent(message)));
         } else {

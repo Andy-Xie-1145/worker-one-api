@@ -90,10 +90,17 @@ export async function markRateLimited(
  *
  * 不清的话，一个偶尔限流的渠道会一直踩着上次的退避档位，下次 429 直接跳到更长的
  * 冷却，最终被无限期边缘化。
+ *
+ * **先读再删**：KV 的 delete 即使目标 key 不存在也计入操作次数，而免费额度里
+ * delete 只有 1000/天、read 有 10 万/天。这个函数在**每个成功请求**上都会跑，
+ * 无条件 delete 等于把整天的 delete 配额按请求量烧掉；先 get 一次，绝大多数
+ * 请求（渠道没被限流过）根本不产生 delete。
  */
 export async function clearRateLimit(env: Env, channelId: number): Promise<void> {
   try {
-    await env.CACHE.delete(`${STRIKE_PREFIX}${channelId}`);
+    const key = `${STRIKE_PREFIX}${channelId}`;
+    if ((await env.CACHE.get(key)) === null) return;
+    await env.CACHE.delete(key);
   } catch {
     // 清不掉最多让下次退避长一档，不值得因此让请求失败
   }

@@ -99,10 +99,18 @@ export async function markDenied403(
   }
 }
 
-/** 清除软熔断：该组合上游重新可用（探测成功或正常成功）时调用。 */
+/**
+ * 清除软熔断：该组合上游重新可用（探测成功或正常成功）时调用。
+ *
+ * **先读再删**：这个函数在每个成功请求上都会跑，而绝大多数请求并不处在 403 熔断里。
+ * KV 的 delete 不存在的 key 也算一次操作（免费额度 delete 1000/天 vs read 10 万/天），
+ * 无条件 delete 会把 delete 配额按请求量烧光。
+ */
 export async function clearDenied403(env: Env, channelId: number, model: string, colo: string): Promise<void> {
   try {
-    await env.CACHE.delete(deny403Key(channelId, model, colo));
+    const key = deny403Key(channelId, model, colo);
+    if ((await env.CACHE.get(key)) === null) return;
+    await env.CACHE.delete(key);
   } catch {
     // 同上：清除失败只会让渠道多被绕开一阵，TTL 到期自然恢复
   }

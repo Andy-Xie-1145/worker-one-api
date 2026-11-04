@@ -1,5 +1,4 @@
 import { type Env, type TokenRow, type UserRow, LogTypeConsume, TokenStatusExhausted } from '../types';
-import { invalidateTokenCache } from './auth';
 import { calcQuotaDetailed, quotaFromRates, quotaToUSD, LLM_PRICING_VERSION } from './pricing';
 import type { RateSet, PriceSource } from './pricing/llm';
 import type { ExprTrace } from './pricing/expr';
@@ -84,7 +83,6 @@ export async function preConsume(
       },
     ],
   });
-  await invalidateTokenCache(env, token.key);
 
   if (!result.applied) {
     if (result.duplicate) return { ok: true }; // uuid ref 不可能重复；防御性放行
@@ -184,7 +182,15 @@ export async function postConsume(
   const settled = await applyCredit(env, { userId: user.id, delta: -delta, reason: 'consume', guard: false, also, ref: args.settleRef });
   // 回收器已经把这笔预留退掉了（迟到的结算）。钱和日志都不再写，否则会双重记账。
   if ('duplicate' in settled && settled.duplicate) return 0;
-  await invalidateTokenCache(env, token.key);
+  /*
+   * 这里**不**主动失效令牌缓存。
+   *
+   * 配额是否够用的权威判断在 D1 的守卫 SQL（preConsume 的 guardSql），KV 里的
+   * token 行只是加速层；让它按 60s TTL 自然过期即可。早期实现每个请求都
+   * delete 一次 token 缓存，免费额度下 delete 只有 1000/天，直接被请求量打爆
+   * （2026-11-03 实测 2983 次/天）。管理端改令牌（token set/on/off/del）仍会显式
+   * 失效，所以不存在「改了配置一小时不生效」的问题。
+   */
 
   if (!token.unlimited_quota) {
     await env.DB.prepare('UPDATE tokens SET status = ? WHERE id = ? AND remain_quota <= 0').bind(TokenStatusExhausted, token.id).run();
@@ -200,5 +206,5 @@ export async function refund(env: Env, token: TokenRow, user: UserRow, amount: n
     : [env.DB.prepare('UPDATE tokens SET remain_quota = remain_quota + ? WHERE id = ?').bind(amount, token.id)];
   // 用结算 ref 退款：和 postConsume 抢同一个唯一键，退过就扣不成、扣过就退不了。
   await applyCredit(env, { userId: user.id, delta: amount, reason: 'refund', also, ref });
-  await invalidateTokenCache(env, token.key);
+  // 同上：不失效令牌缓存（配额守卫在 D1，缓存按 TTL 自然过期）。
 }

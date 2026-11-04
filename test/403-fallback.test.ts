@@ -94,14 +94,15 @@ function makeKV(clock: { forwardMs: number }) {
   const store = new Map<string, { value: string; ttl: number; putAt: number }>();
   const now = () => Date.now() + clock.forwardMs;
   const kv = {
-    get: async (k: string) => {
+    get: async (k: string, type?: string) => {
       const entry = store.get(k);
       if (!entry) return null;
       if (now() >= entry.putAt + entry.ttl * 1000) {
         store.delete(k);
         return null;
       }
-      return entry.value;
+      // 真 KV 在 type='json' 时会替调用方 JSON.parse；令牌缓存依赖这个语义。
+      return type === 'json' ? JSON.parse(entry.value) : entry.value;
     },
     put: async (k: string, v: string, opts?: any) => store.set(k, { value: v, ttl: opts?.expirationTtl ?? 60, putAt: now() }),
     delete: async (k: string) => store.delete(k),

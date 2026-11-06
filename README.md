@@ -300,5 +300,3 @@ npm run deploy
 
 - 语义灵感来自 [songquanpeng/one-api](https://github.com/songquanpeng/one-api)（MIT），
   本项目是独立的 TypeScript 重实现，不含其代码
-- 表达式计费语言的设计参考 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)
-  （AGPL-3.0），解释器为自主实现

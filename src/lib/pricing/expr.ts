@@ -18,11 +18,8 @@
  * 变量只有 `context`（别名 `len`，完整输入 token 数）与 `n`（请求级数量，默认 1）；
  * 请求探针 `param(path)` / `header(key)` 读取本次请求，缺失时为 null
  * （`==` 比较为 false、`has(null, ·)` 为 false，算术作用于 null 才报错）。
- *
- * 设计参考 new-api（QuantumNous/new-api）`pkg/billingexpr/` 的函数面
- * （param/header/has/hour/minute/weekday/day/month/tier/min/max/abs/ceil/floor），
- * 但**语义不同**：new-api 是「一条表达式算总价」，v2 是「每字段一条费率表达式」——
- * 所以没有 p/c/cr 这类 token 数变量，也没有 `fixed()` 按次计费
+ * 语义要点：每字段一条独立的费率表达式，表达式里没有 token 数变量——
+ * token 数由计费引擎按字段套用；也没有 `fixed()` 按次计费
  * （按次计费将来以独立字段形式支持，见图像轮设计）。
  *
  * 其余从 v1 沿用的性质：
@@ -506,7 +503,7 @@ function formatter(tz: string | undefined): Intl.DateTimeFormat {
   if (hit) return hit;
   let fmt: Intl.DateTimeFormat;
   try {
-    // tz 非法时这里抛 RangeError，回退 UTC（与 new-api 的 timeInZone 行为一致）。
+    // tz 非法时这里抛 RangeError，回退 UTC。
     fmt = new Intl.DateTimeFormat('en-US', {
       timeZone: key, hourCycle: 'h23', weekday: 'short',
       year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',

@@ -20,6 +20,14 @@ export interface Env {
   WECOM_HEALTH_WEBHOOK_URL?: string;
   /** 同一 model 的路由缺口告警冷却（分钟），默认 30。 */
   WECOM_HEALTH_ALERT_COOLDOWN_MIN?: string;
+  /**
+   * 维护栅栏（迁移窗口用，见 index.ts 的 maintenanceGate 与 devlog 迁移计划 §3-B）。
+   * 部署期环境变量：字符串 "on" 时 /v1/*、/api/*（除 /api/status）、/gemini/* 一律
+   * 503 + Retry-After；不设或其他值 = 正常服务。唯一翻转方式 = redeploy（留审计）。
+   * KV/D1 不能当这个开关：KV 值不迁移且最终一致，D1 options 行会被快照导入覆盖。
+   * scheduled（回收 cron）不受影响——冻结期它正是结算写入者。
+   */
+  MAINTENANCE?: string;
 }
 
 export interface UserRow {

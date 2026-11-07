@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import type { MiddlewareHandler } from 'hono';
 import { cors } from 'hono/cors';
 import type { Env, Vars } from './types';
 import relay, { anthropicRoute, geminiRoute } from './routes/relay';
@@ -6,6 +7,38 @@ import api from './routes/api';
 import { runWatchdog, runSweeper, SWEEP_CRON } from './lib/watchdog';
 
 const app = new Hono<{ Bindings: Env; Variables: Vars }>();
+
+/*
+ * 维护栅栏（迁移窗口设计见 devlog/migration-plan-2026-11-08.md §3-B）。
+ *
+ * MAINTENANCE 是**部署期**环境变量："on" + redeploy = 冻结，移除 + redeploy = 恢复。
+ * 特意不用 KV/D1 当开关：KV 值不随数据迁移且最终一致（漏挡窗口），D1 options 行会被
+ * 快照导入覆盖；env 随版本原子生效、无缓存层，翻转必留部署审计记录。
+ *
+ * 挡住全部**写入口**：/v1/*（OpenAI/Anthropic/Gemini 兼容中继）、/api/*（管理面 +
+ * CLI + /api/anthropic，含唯一有隐式写的鉴权 GET /api/tokens/:id/key）、独立挂载的
+ * /gemini/*。放行 /api/status（免鉴权状态）与 /health（零 D1 依赖的观测口）；SPA
+ * 静态资源只读，不挡。
+ *
+ * 注册在 CORS 之前：维护期连预检一起挡，行为确定，不依赖中间件顺序。
+ *
+ * scheduled 入口**不受此门控**：回收 cron（每 5 分钟）冻结期必须继续跑——排空断言依赖
+ * 它补 fin: 结算行；新端则不部署 cron（配置层移除），无 scheduled 入口。
+ */
+const maintenanceGate: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+  if (c.env.MAINTENANCE !== 'on') return next();
+  const path = c.req.path;
+  if (path === '/api/status' || path.startsWith('/api/status/')) return next();
+  const message = '服务维护中（迁移窗口），请稍后重试';
+  return c.json(
+    { success: false, message, error: { message, type: 'maintenance' } },
+    503,
+    { 'Retry-After': '30', 'Cache-Control': 'no-store' },
+  );
+};
+app.use('/v1/*', maintenanceGate);
+app.use('/api/*', maintenanceGate);
+app.use('/gemini/*', maintenanceGate);
 
 // The relay is an API surface for third-party clients, so it is open CORS.
 // The admin API is cookie-authenticated and therefore same-origin only.

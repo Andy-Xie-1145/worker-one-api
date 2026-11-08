@@ -11,6 +11,12 @@ node_modules/.cache/
 # 本地 secret，绝不入库
 .dev.vars
 .dev.vars.*
+.cf-old-token
+
+# 迁移快照（含渠道/令牌密钥明文，绝不入库）
+snap-old.sql
+snap-new.sql
+drain-result.txt
 
 # AI Studio 本地运行状态
 .ai-studio/

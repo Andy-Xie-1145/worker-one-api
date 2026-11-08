@@ -88,12 +88,21 @@ export function apiPrefix(base: string, ctx: AdaptorContext): string {
 export function normalizeUsage(u: any): Usage {
   const prompt = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0) || 0;
   const completion = Number(u?.completion_tokens ?? u?.output_tokens ?? 0) || 0;
-  // DeepSeek reports prompt_cache_hit_tokens; OpenAI nests it under
-  // prompt_tokens_details.cached_tokens. Both are a subset of prompt_tokens.
-  const cached = Number(u?.prompt_cache_hit_tokens ?? u?.prompt_tokens_details?.cached_tokens ?? 0) || 0;
-  // OpenRouter / OpenAI 报的缓存**写入**，同样是 prompt_tokens 的子集。只进 billing_meta
-  // 供审计，按普通输入价计——绝不当成缓存命中，也不影响金额。
-  const cacheWrite = Number(u?.prompt_tokens_details?.cache_write_tokens ?? 0) || 0;
+  // 缓存计数的别名族：DeepSeek 报 prompt_cache_hit_tokens，OpenAI 嵌在
+  // prompt_tokens_details.cached_tokens，HPD 这类聚合站还会补 anthropic 式的
+  // cache_read_input_tokens——三者是同一计数器的不同名字，取最大值兜住各家拼写。
+  // 缓存写入同理（cache_creation_input_tokens / prompt_cache_write_tokens 是别名）；
+  // 写入只进 cache_write_tokens 供审计（billing_meta），计费分量走 cw5/cw1 两桶。
+  const cached = Math.max(
+    Number(u?.prompt_cache_hit_tokens ?? 0) || 0,
+    Number(u?.cache_read_input_tokens ?? 0) || 0,
+    Number(u?.prompt_tokens_details?.cached_tokens ?? 0) || 0,
+  );
+  const cacheWrite = Math.max(
+    Number(u?.prompt_tokens_details?.cache_write_tokens ?? 0) || 0,
+    Number(u?.cache_creation_input_tokens ?? 0) || 0,
+    Number(u?.prompt_cache_write_tokens ?? 0) || 0,
+  );
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,

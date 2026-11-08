@@ -114,10 +114,26 @@ export function chatResponseToAnthropic(json: any, model: string): any {
     content,
     stop_reason: mapFinishReason(choice?.finish_reason),
     stop_sequence: null,
-    usage: {
-      input_tokens: json?.usage?.prompt_tokens ?? 0,
-      output_tokens: json?.usage?.completion_tokens ?? 0,
-    },
+    usage: anthropicClientUsage(json?.usage),
+  };
+}
+
+/**
+ * 客户端面的 Anthropic usage：官方协议自带缓存三字段（读 / 写总数 / 写 TTL 明细），
+ * 内部 Usage 里有就如实带出去——上游（HPD 这类）报了缓存计数而客户端看不到，
+ * 排障与成本核算都会缺一半信息。全零时不加键，保持无缓存请求的响应形状不变。
+ */
+function anthropicClientUsage(u: any): Record<string, unknown> {
+  const cached = Number(u?.cached_tokens ?? 0) || 0;
+  const cw5 = Number(u?.cache_write_5m_tokens ?? 0) || 0;
+  const cw1 = Number(u?.cache_write_1h_tokens ?? 0) || 0;
+  const base = { input_tokens: Number(u?.prompt_tokens ?? 0) || 0, output_tokens: Number(u?.completion_tokens ?? 0) || 0 };
+  if (cached === 0 && cw5 === 0 && cw1 === 0) return base;
+  return {
+    ...base,
+    cache_read_input_tokens: cached,
+    cache_creation_input_tokens: cw5 + cw1,
+    cache_creation: { ephemeral_5m_input_tokens: cw5, ephemeral_1h_input_tokens: cw1 },
   };
 }
 
@@ -281,10 +297,13 @@ export function finishAnthropicStream(state: AnthropicEncoderState, usage?: Usag
   out += event('message_delta', {
     type: 'message_delta',
     delta: { stop_reason: state.stopReason, stop_sequence: null },
-    usage: {
-      input_tokens: usage?.prompt_tokens ?? state.inputTokens,
-      output_tokens: usage?.completion_tokens ?? state.outputTokens,
-    },
+    usage: anthropicClientUsage({
+      prompt_tokens: usage?.prompt_tokens ?? state.inputTokens,
+      completion_tokens: usage?.completion_tokens ?? state.outputTokens,
+      cached_tokens: usage?.cached_tokens ?? 0,
+      cache_write_5m_tokens: usage?.cache_write_5m_tokens ?? 0,
+      cache_write_1h_tokens: usage?.cache_write_1h_tokens ?? 0,
+    }),
   });
   out += event('message_stop', { type: 'message_stop' });
   return out;

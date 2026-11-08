@@ -242,7 +242,12 @@ export function chatResponseToResponses(chat: any, model: string): any {
       input_tokens: Number(u.prompt_tokens ?? u.input_tokens ?? 0),
       output_tokens: Number(u.completion_tokens ?? u.output_tokens ?? 0),
       total_tokens: Number(u.total_tokens ?? (Number(u.prompt_tokens ?? 0) + Number(u.completion_tokens ?? 0))),
-      input_tokens_details: { cached_tokens: Number(u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? 0) },
+      input_tokens_details: {
+        cached_tokens: Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.prompt_cache_hit_tokens ?? 0),
+        ...(Number(u.prompt_tokens_details?.cache_write_tokens ?? u.cache_write_tokens ?? 0) > 0
+          ? { cache_write_tokens: Number(u.prompt_tokens_details?.cache_write_tokens ?? u.cache_write_tokens ?? 0) }
+          : {}),
+      },
       output_tokens_details: {
         reasoning_tokens: Number(u.completion_tokens_details?.reasoning_tokens ?? u.output_tokens_details?.reasoning_tokens ?? 0),
       },
@@ -511,7 +516,10 @@ export function finishResponsesStream(enc: ResponsesEncoder, model: string, usag
       input_tokens: Number(u.prompt_tokens ?? 0),
       output_tokens: Number(u.completion_tokens ?? 0),
       total_tokens: Number(u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0)),
-      input_tokens_details: { cached_tokens: enc.cachedTokens || Number(u.cached_tokens ?? 0) },
+      input_tokens_details: {
+        cached_tokens: enc.cachedTokens || Number(u.cached_tokens ?? 0),
+        ...(Number(u.cache_write_tokens ?? 0) > 0 ? { cache_write_tokens: Number(u.cache_write_tokens ?? 0) } : {}),
+      },
       output_tokens_details: { reasoning_tokens: enc.reasoningTokens },
     },
   };

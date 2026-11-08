@@ -291,10 +291,13 @@ function flattenToolChoice(tc: any): unknown {
 function responsesUsage(u: any): any {
   const input = Number(u?.input_tokens ?? 0) || 0;
   const output = Number(u?.output_tokens ?? 0) || 0;
+  const details = u?.input_tokens_details && typeof u.input_tokens_details === 'object'
+    ? Object.fromEntries(Object.entries(u.input_tokens_details).map(([k, v]) => [k, Number(v) || 0]))
+    : undefined;
   return {
     prompt_tokens: input,
     completion_tokens: output,
     total_tokens: Number(u?.total_tokens ?? input + output) || input + output,
-    ...(u?.input_tokens_details?.cached_tokens ? { prompt_tokens_details: { cached_tokens: Number(u.input_tokens_details.cached_tokens) } } : {}),
+    ...(details && Object.keys(details).length ? { prompt_tokens_details: details } : {}),
   };
 }

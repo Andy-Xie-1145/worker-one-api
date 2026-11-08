@@ -103,7 +103,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-09.2';
+const SPA_BUILD = '2026-11-09.4';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -428,57 +428,79 @@ async function pageTokens(view) {
 }
 
 async function loadTokens(view) {
-  const rows = await api('/tokens');
+  const [rows, chans] = await Promise.all([api('/tokens'), api('/channels')]);
   const STATUS = { 1: ['启用', 'ok'], 2: ['已禁用', 'err'], 3: ['已过期', 'warn'], 4: ['额度耗尽', 'warn'] };
 
   view.replaceChildren($(`<div class="card">
     <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">令牌</h2><button class="primary" id="new">新建令牌</button></div>
-    ${table(['ID', '名称', '密钥', '状态', '剩余额度', '已用', '过期时间', '模型限制', '操作'], rows, (t) => {
+    ${table(['ID', '名称', '密钥', '状态', '剩余额度', '已用', '过期时间', '模型限制', '渠道ACL', '操作'], rows, (t) => {
+      const aclTag = t.channel_acl ? `<span class="tag" title="渠道 ACL">${t.channel_acl.mode === 'whitelist' ? '白' : '黑'}[${esc(t.channel_acl.channels.join(',') || '空')}]</span>` : '<span class="muted">不限</span>';
       return `<tr>
       <td>${t.id}</td><td>${esc(t.name)}</td>
       <td><code>${esc(t.key_masked || (t.key ? 'sk-' + String(t.key).slice(0, 6) + '…' : 'sk-…'))}</code> <button data-copy="${t.id}">复制</button></td>
       <td><span class="tag ${STATUS[t.status]?.[1] || ''}">${STATUS[t.status]?.[0] || t.status}</span></td>
       <td>${t.unlimited_quota ? '<span class="tag">无限</span>' : usd(t.remain_quota)}</td>
       <td>${usd(t.used_quota)}</td><td>${t.expired_time < 0 ? '永不' : ts(t.expired_time)}</td>
-      <td class="mono">${esc(t.models || '全部')}${t.channel_acl ? ` <span class="tag" title="渠道 ACL">${t.channel_acl.mode === 'whitelist' ? '白' : '黑'}[${esc(t.channel_acl.channels.join(',') || '空')}]</span>` : ''}</td>
+      <td class="mono">${esc(t.models || '全部')}</td>
+      <td>${aclTag}</td>
       <td><button data-edit="${t.id}">编辑</button> <button class="danger" data-del="${t.id}">删除</button></td></tr>`;
     })}
   </div>`));
 
   view.querySelectorAll('[data-copy]').forEach((b) => (b.onclick = () => copyTokenKey(Number(b.dataset.copy), b)));
 
-  const form = (t = {}) => `
+  const form = (t = {}, chans = []) => `
     <label>名称</label><input id="name" value="${esc(t.name || '')}">
     <label>额度（美元，留空或勾选无限则不限）</label><input id="quota" type="number" step="0.01" value="${t.remain_quota ? (t.remain_quota / QUOTA_PER_USD).toFixed(4) : ''}">
     <label><input type="checkbox" id="unl" style="width:auto" ${t.unlimited_quota ? 'checked' : ''}> 无限额度</label>
     <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
     <label>可用模型（逗号分隔，留空表示全部）</label><input id="models" value="${esc(t.models || '')}">
-    <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道。条目 = 渠道 ID 或 <b>分组名</b>，逗号分隔可混用）</label>
+    <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道。选白名单/黑名单后，在下方勾选渠道或分组）</label>
     <select id="aclmode" style="margin-bottom:6px">
       <option value=""${!t.channel_acl ? ' selected' : ''}>不限制（所有启用渠道按优先级参与）</option>
-      <option value="whitelist"${t.channel_acl?.mode === 'whitelist' ? ' selected' : ''}>白名单——只允许匹配条目的渠道（条目留空 = 全禁，等价禁用）</option>
-      <option value="blacklist"${t.channel_acl?.mode === 'blacklist' ? ' selected' : ''}>黑名单——禁止匹配条目的渠道（条目留空 = 全放）</option>
+      <option value="whitelist"${t.channel_acl?.mode === 'whitelist' ? ' selected' : ''}>白名单——只允许勾选的渠道/分组（全不勾 = 全禁，等价禁用）</option>
+      <option value="blacklist"${t.channel_acl?.mode === 'blacklist' ? ' selected' : ''}>黑名单——禁止勾选的渠道/分组（全不勾 = 全放）</option>
     </select>
-    <input id="aclch" class="mono" placeholder="渠道 ID 或 分组名，逗号分隔，例：3, cn" value="${esc((t.channel_acl?.channels || []).join(','))}" style="margin-bottom:6px">
+    <div id="aclBoxes" style="display:none;border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:6px">
+      <div style="font-weight:600;margin-bottom:4px">按渠道勾选（条目 = 渠道 ID）</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px 14px;margin-bottom:8px">
+        ${(chans || []).map((c) => `<label style="margin:0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-aclc="${c.id}" style="width:auto"${(t.channel_acl?.channels || []).some((e) => String(e) === String(c.id)) ? ' checked' : ''}> <span class="mono">#${c.id} ${esc(c.name)}</span><span class="muted">（${esc(c.group || 'default')}）</span></label>`).join('') || '<span class="muted">（暂无渠道）</span>'}
+      </div>
+      <div style="font-weight:600;margin-bottom:4px">按分组勾选（条目 = 组名；组内渠道增减自动跟随）</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px 14px">
+        ${[...new Set((chans || []).map((c) => c.group || 'default'))].sort().map((g) => `<label style="margin:0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-aclg="${esc(g)}" style="width:auto"${(t.channel_acl?.channels || []).some((e) => String(e) === g) ? ' checked' : ''}> <span class="mono">${esc(g)}</span></label>`).join('') || '<span class="muted">（暂无分组）</span>'}
+      </div>
+      <p class="muted" style="margin:6px 0 0">白名单：勾选 = 允许；全不勾 = 全禁（等价禁用）。黑名单：勾选 = 禁止；全不勾 = 全放。</p>
+    </div>
     <p class="muted" style="margin:4px 0 0">价格按<b>渠道</b>配置（渠道页「价格覆盖」）——令牌混用渠道且有故障转移，在令牌上定价没有意义。</p>
     ${t.id ? '' : '<p class="muted" style="margin:4px 0 0">密钥创建后<b>自动进剪贴板</b>，页面不回显明文；要再复制，点列表里该行的「复制」。</p>'}
     ${t.id ? `<label>状态</label><select id="status"><option value="1"${t.status === 1 ? ' selected' : ''}>启用</option><option value="2"${t.status === 2 ? ' selected' : ''}>禁用</option></select>` : ''}`;
 
   const collect = (dlg) => {
     const aclmode = val(dlg, 'aclmode');
-    const aclch = (val(dlg, 'aclch') || '').split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0);
+    const ids = [...dlg.querySelectorAll('[data-aclc]:checked')].map((x) => Number(x.dataset.aclc));
+    const groups = [...dlg.querySelectorAll('[data-aclg]:checked')].map((x) => x.dataset.aclg);
     return {
       name: val(dlg, 'name') || '默认令牌',
       remain_quota: Math.round((parseFloat(val(dlg, 'quota')) || 0) * QUOTA_PER_USD),
       unlimited_quota: dlg.querySelector('#unl').checked,
       expired_time: val(dlg, 'exp') ? Math.floor(new Date(val(dlg, 'exp')).getTime() / 1000) : -1,
       models: val(dlg, 'models').trim(),
-      channel_acl: aclmode ? { mode: aclmode, channels: aclch } : null,
+      channel_acl: aclmode ? { mode: aclmode, channels: [...ids, ...groups] } : null,
       ...(dlg.querySelector('#status') ? { status: Number(val(dlg, 'status')) } : {}),
     };
   };
 
-  document.getElementById('new').onclick = () => dialog('新建令牌', form(), async (dlg) => {
+  // ACL 勾选区随模式显隐（不限制时收起）。
+  const wireAcl = (dlg) => {
+    const sel = dlg.querySelector('#aclmode'), area = dlg.querySelector('#aclBoxes');
+    if (!sel || !area) return;
+    const sync = () => { area.style.display = sel.value ? '' : 'none'; };
+    sel.onchange = sync; sync();
+  };
+
+  document.getElementById('new').onclick = () => dialog('新建令牌', form({}, chans), async (dlg) => {
+    wireAcl(dlg);
     const t = await api('/tokens', { method: 'POST', body: collect(dlg) });
     if (!t || typeof t.id !== 'number') throw new Error('接口没有返回令牌编号（页面可能已过期，请刷新后重试）');
     // 明文只在「取回 → 剪贴板」这一跳里存在，绝不进 DOM/toast：否则 AI 自动化截图、
@@ -491,7 +513,8 @@ async function loadTokens(view) {
 
   view.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => {
     const t = rows.find((r) => r.id === Number(b.dataset.edit));
-    dialog('编辑令牌', form(t), async (dlg) => {
+    dialog('编辑令牌', form(t, chans), async (dlg) => {
+      wireAcl(dlg);
       await api('/tokens/' + t.id, { method: 'PUT', body: collect(dlg) });
       toast('已保存', 'ok'); await loadTokens(view);
     });
@@ -527,20 +550,24 @@ function pairsToModelMapping(text) {
   return JSON.stringify(out);
 }
 
-// 价格覆盖：JSON ↔ 行格式「模型 | 输入 | 输出 | 读 | 写30m | 写12h」的双向换算。
-// 行后三列可省略（省略的字段不进 PriceSpec = 按其默认规则计）。
-function priceConfigToLines(jsonText) {
-  if (!jsonText) return '';
-  try {
-    const o = JSON.parse(jsonText);
-    return Object.entries(o).map(([m, s]) => {
-      const cols = [m, s.in ?? '', s.out ?? ''];
-      if (s.cached_in !== undefined || s.cache_write_5m !== undefined || s.cache_write_1h !== undefined) cols.push(s.cached_in ?? '');
-      if (s.cache_write_5m !== undefined || s.cache_write_1h !== undefined) cols.push(s.cache_write_5m ?? '');
-      if (s.cache_write_1h !== undefined) cols.push(s.cache_write_1h ?? '');
-      return cols.join(' | ');
-    }).join('\n');
-  } catch { return jsonText; }
+// 价格覆盖：对象/JSON 字符串 ↔ 行格式「模型 | 输入 | 输出 | 读 | 写30m | 写12h」的双向换算。
+// （GET /api/channels 返回的 price_config 是已解析对象——这就是之前 [object Object] 的根因。）
+function priceConfigToLines(pc) {
+  if (!pc) return '';
+  let o = pc;
+  if (typeof pc === 'string') {
+    const t = pc.trim();
+    if (!t) return '';
+    try { o = JSON.parse(t); } catch { return pc; }
+  }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return '';
+  return Object.entries(o).map(([m, s]) => {
+    const cols = [m, s.in ?? '', s.out ?? ''];
+    if (s.cached_in !== undefined || s.cache_write_5m !== undefined || s.cache_write_1h !== undefined) cols.push(s.cached_in ?? '');
+    if (s.cache_write_5m !== undefined || s.cache_write_1h !== undefined) cols.push(s.cache_write_5m ?? '');
+    if (s.cache_write_1h !== undefined) cols.push(s.cache_write_1h ?? '');
+    return cols.join(' | ');
+  }).join('\n');
 }
 function linesToPriceConfig(text) {
   const t = (text || '').trim();
@@ -562,6 +589,25 @@ function linesToPriceConfig(text) {
   return JSON.stringify(out);
 }
 
+// 价格覆盖：逐模型勾选行的渲染数据（GUI 表格，不再手写 JSON/行格式）。
+function priceRowsHtml(ch) {
+  let pc = {};
+  try { pc = ch.price_config && typeof ch.price_config === 'object' ? ch.price_config : {}; } catch { pc = {}; }
+  const models = [...new Set([...String(ch.models || '').split(',').map((s) => s.trim()).filter(Boolean), ...Object.keys(pc)])];
+  if (!models.length) return '<p class="muted" style="margin:0">先在上方填「模型列表」，这里会出现逐模型的价格行。</p>';
+  return models.map((m) => {
+    const s = pc[m] || {};
+    return `<div data-pcm="${esc(m)}" style="display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center;margin:2px 0">
+      <label style="margin:0;display:flex;align-items:center;gap:4px;min-width:200px"><input type="checkbox" data-pcc style="width:auto"${pc[m] ? ' checked' : ''}> <span class="mono">${esc(m)}</span></label>
+      <input data-pcf="in" placeholder="输入价" value="${esc(s.in ?? '')}" style="width:110px"${pc[m] ? '' : ' disabled'}>
+      <input data-pcf="out" placeholder="输出价" value="${esc(s.out ?? '')}" style="width:110px"${pc[m] ? '' : ' disabled'}>
+      <input data-pcf="cached_in" placeholder="读(可省)" value="${esc(s.cached_in ?? '')}" style="width:100px"${pc[m] ? '' : ' disabled'}>
+      <input data-pcf="cache_write_5m" placeholder="写30m(可省)" value="${esc(s.cache_write_5m ?? '')}" style="width:100px"${pc[m] ? '' : ' disabled'}>
+      <input data-pcf="cache_write_1h" placeholder="写12h(可省)" value="${esc(s.cache_write_1h ?? '')}" style="width:100px"${pc[m] ? '' : ' disabled'}>
+    </div>`;
+  }).join('');
+}
+
 async function pageChannels(view) {
   const [rows, meta] = await Promise.all([api('/channels'), api('/channels/meta')]);
   const STATUS = { 1: ['启用', 'ok'], 2: ['手动禁用', 'err'], 3: ['自动禁用', 'warn'] };
@@ -578,7 +624,12 @@ async function pageChannels(view) {
       <td style="white-space:nowrap"><button data-test="${ch.id}">测试</button> <button data-edit="${ch.id}">编辑</button> <button class="danger" data-del="${ch.id}">删除</button></td></tr>`)}
   </div>`));
 
-  const form = (ch = {}) => `
+  const form = (ch = {}) => {
+    // 模型重定向下拉选项：内置价表 ∪ 渠道模型 ∪ 既有映射键
+    const mappingKeys = (() => { try { return Object.keys(JSON.parse(ch.model_mapping || '{}')); } catch { return []; } })();
+    const mmModels = [...new Set([...(meta.known_models || []), ...String(ch.models ?? '').split(',').map((s) => s.trim()).filter(Boolean), ...mappingKeys])];
+    const mmOptions = mmModels.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    return `
     <div class="grid">
       <div><label>名称</label><input id="name" value="${esc(ch.name || '')}"></div>
       <div><label>类型</label><select id="type">${meta.adaptors.map((a) => `<option value="${a.name}"${ch.type === a.name ? ' selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
@@ -596,16 +647,25 @@ async function pageChannels(view) {
       <div><label>状态</label><select id="status"><option value="1"${ch.status === 1 ? ' selected' : ''}>启用</option><option value="2"${ch.status === 2 ? ' selected' : ''}>禁用</option></select></div>
       <div><label>分组（轻量标签，供令牌渠道 ACL 按组指定）</label><input id="group" value="${esc(ch.group || 'default')}"></div>
     </div>
-    <label>模型重定向（可选；每对 旧名:新名，逗号分隔，如 gpt-4:gpt-4o, a:b——也可直接粘贴 JSON）</label><textarea id="model_mapping">${modelMappingToPairs(ch.model_mapping)}</textarea>
-    <label>价格覆盖（仅本渠道生效：渠道价 &gt; 全局覆盖 &gt; 内置表）。每行一个模型：<code>模型 | 输入 | 输出 | 读 | 写30m | 写12h</code>（后三列可省略；值可写数字或费率表达式）</label>
-    <textarea id="price_config" placeholder='deepseek-v4.1-flash | (高峰判断?0.3:0.15) | 1.2 | 0.006
-glm-5.3 | 1.4 | 4.4 | 0.26'>${priceConfigToLines(ch.price_config)}</textarea>
-    <p class="muted" style="margin:4px 0 0">键是<b>模型列表里写的名字</b>（请求名）；路由到本渠道就按这里的价。留空 = 不修改（新建时留空 = 无覆盖）。也兼容直接粘贴 JSON 对象（提交 <code>{}</code> = 清空）。</p>
+    <label>模型重定向（可选：把「请求模型」改写成「渠道模型」——两个下拉选好点「添加」；下方文本可直接编辑/删除，也可粘贴 JSON）</label>
+    <div class="row" style="margin-bottom:6px">
+      <select id="mmFrom" style="flex:1"><option value="">请求模型…</option>${mmOptions}</select>
+      <span class="muted">→</span>
+      <select id="mmTo" style="flex:1"><option value="">渠道模型…</option>${mmOptions}</select>
+      <button type="button" id="mmAdd">添加</button>
+    </div>
+    <textarea id="model_mapping" placeholder="gpt-4:gpt-4o, a:b（旧名:新名 对，逗号分隔）">${modelMappingToPairs(ch.model_mapping)}</textarea>
+    <label>价格覆盖（仅本渠道生效：渠道价 &gt; 全局覆盖 &gt; 内置表）。勾选「覆盖」并填价；不勾的模型按全局/内置价计。</label>
+    <div id="pcRows" style="border:1px solid var(--border);border-radius:8px;padding:6px;max-height:300px;overflow:auto">
+      ${priceRowsHtml(ch)}
+    </div>
+    <p class="muted" style="margin:4px 0 0">值可填<b>数字或费率表达式</b>；「读/写」列留空 = 该分量按其默认规则计（读继承输入价、写按输入价或渠道写价）。全部不勾 = 无渠道覆盖。</p>
     <label>渠道额外配置 JSON（可选，如 {"api_version":"2024-10-21"}）</label><textarea id="config">${esc(ch.config || '')}</textarea>
     <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input type="checkbox" id="decisions" style="width:auto"> 此渠道承载决策接口（客户端 <code>POST /v1/decisions</code>）</label>
     <input id="decisions_path" placeholder="出站路径，默认 alpha/decisions（如 decide、systemone）">
     <p class="muted" style="margin:4px 0 0">最省事的做法：类型直接选 <b>Decision API</b>（OpenAI 方言，出站 <code>{base_url}/decisions</code>）或 <b>System One</b>（TypeSafe 方言，出站 <code>{base_url}/systemone</code>）——<b>base_url 写到版本段</b>（如 <code>https://api.typesafe.ai/v1</code>），网关只往后拼端点名、不注入也不剥除 /vN（与 chat/completions 同待遇）；<b>该渠道的模型全部自动视为决策模型</b>，无需声明，且网关在两种方言间自动翻译。OpenAI 形状渠道也可承载（OpenRouter 自动启用；勾选写入 <code>{"decisions":true}</code>，取消勾选移除），但模型需在「设置 → 仅决策接口的模型」声明。</p>
     <label>系统提示词（可选，注入到每个请求）</label><textarea id="system_prompt">${esc(ch.system_prompt || '')}</textarea>`;
+  };
 
   // 从上游拉取模型列表：POST /api/channels/fetch-models。新建渠道用表单现输入的
   // {type, base_url, key, config?}；编辑已有渠道且 key 留空时改用 {channel_id}（后端取已存 Key）。
@@ -666,6 +726,29 @@ glm-5.3 | 1.4 | 4.4 | 0.26'>${priceConfigToLines(ch.price_config)}</textarea>
     dlg.querySelector('#preset').onchange = (e) => { if (e.target.value) dlg.querySelector('#base_url').value = e.target.value; };
     dlg.querySelector('#fill').onclick = () => { dlg.querySelector('#models').value = meta.known_models.join(','); };
     dlg.querySelector('#fetchModels').onclick = () => fetchUpstreamModels(dlg, ch);
+    // 模型重定向双下拉：选项随「模型列表」输入实时刷新；「添加」合并进对文本（同键覆盖）。
+    const mmRebuild = () => {
+      const froms = new Set(meta.known_models || []);
+      String(dlg.querySelector('#models').value).split(',').map((s) => s.trim()).filter(Boolean).forEach((m) => froms.add(m));
+      String(dlg.querySelector('#model_mapping').value).split(',').map((s) => s.trim()).filter(Boolean).forEach((p) => { const i = p.indexOf(':'); if (i > 0) froms.add(p.slice(0, i).trim()); });
+      const mmFrom = dlg.querySelector('#mmFrom'), mmTo = dlg.querySelector('#mmTo');
+      if (!mmFrom || !mmTo) return;
+      const opts = [...froms].map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+      mmFrom.innerHTML = '<option value="">请求模型…</option>' + opts;
+      mmTo.innerHTML = '<option value="">渠道模型…</option>' + opts;
+    };
+    mmRebuild();
+    dlg.querySelector('#models').addEventListener('input', mmRebuild);
+    dlg.querySelector('#mmAdd').onclick = () => {
+      const from = dlg.querySelector('#mmFrom').value, to = dlg.querySelector('#mmTo').value;
+      if (!from || !to) { toast('两个下拉都要选一个模型', 'err'); return; }
+      const ta = dlg.querySelector('#model_mapping');
+      const map = {};
+      ta.value.split(',').map((s) => s.trim()).filter(Boolean).forEach((p) => { const i = p.indexOf(':'); if (i > 0) map[p.slice(0, i).trim()] = p.slice(i + 1).trim(); });
+      map[from] = to;
+      ta.value = Object.entries(map).map(([k, v]) => `${k}:${v}`).join(', ');
+      toast(`已添加重定向 ${from} → ${to}`, 'ok');
+    };
     // 决策接口开关：类型选 decisions 时勾选并锁定（类型本身就是声明，路径输入仍可改）；
     // openai 形状渠道按 openrouter.ai 白名单 / config 反推。
     const dec = dlg.querySelector('#decisions');
@@ -699,10 +782,18 @@ glm-5.3 | 1.4 | 4.4 | 0.26'>${priceConfigToLines(ch.price_config)}</textarea>
       };
       typeSel.onchange = sync;
       sync();
+      // 价格覆盖勾选行：勾选「覆盖」才解锁该模型的价目输入。
+      const pcRowsEl = dlg.querySelector('#pcRows');
+      pcRowsEl?.addEventListener('change', (e) => {
+        const cb = e.target.closest('[data-pcc]');
+        if (!cb) return;
+        const row = cb.closest('[data-pcm]');
+        row.querySelectorAll('[data-pcf]').forEach((inp) => { inp.disabled = !cb.checked; });
+      });
     }
   };
 
-  const collect = (dlg) => {
+  const collect = (dlg, origPc) => {
     for (const f of ['config']) {
       const v = val(dlg, f).trim();
       if (v) { try { JSON.parse(v); } catch { throw new Error(`${f} 不是合法 JSON`); } }
@@ -715,9 +806,25 @@ glm-5.3 | 1.4 | 4.4 | 0.26'>${priceConfigToLines(ch.price_config)}</textarea>
       model_mapping: pairsToModelMapping(val(dlg, 'model_mapping')), config: val(dlg, 'config').trim(),
       system_prompt: val(dlg, 'system_prompt'),
     };
-    // 价格覆盖：行格式（或直接粘贴 JSON）。留空 = 不修改（新建时 = 无覆盖）；{} = 清空。
-    const raw = val(dlg, 'price_config').trim();
-    if (raw) body.price_config = linesToPriceConfig(raw);
+    // 价格覆盖（GUI 勾选行）：有勾选 = 整包提交；全不勾但原本有覆盖 = {}（清空）；
+    // 原本无覆盖且无勾选 = 不带字段（不修改）。
+    const pc = {};
+    let anyChecked = false;
+    for (const row of dlg.querySelectorAll('[data-pcm]')) {
+      if (!row.querySelector('[data-pcc]').checked) continue;
+      anyChecked = true;
+      const m = row.dataset.pcm;
+      const get = (f) => { const v = row.querySelector(`[data-pcf="${f}"]`).value.trim(); return v === '' ? undefined : v; };
+      const i2 = get('in'), o2 = get('out');
+      if (i2 === undefined || o2 === undefined) throw new Error(`模型 ${m} 已勾选覆盖，但输入/输出价必须填写`);
+      const spec = { in: i2, out: o2 };
+      const cr = get('cached_in'); if (cr !== undefined) spec.cached_in = cr;
+      const w5 = get('cache_write_5m'); if (w5 !== undefined) spec.cache_write_5m = w5;
+      const w1 = get('cache_write_1h'); if (w1 !== undefined) spec.cache_write_1h = w1;
+      pc[m] = spec;
+    }
+    const hadPc = !!origPc && Object.keys(origPc).length > 0;
+    if (anyChecked || hadPc) body.price_config = Object.keys(pc).length ? pc : {};
     // 决策接口：decisions 类型只落 decisions_path（类型本身就是声明）；
     // openai 形状渠道按开关写 decisions / decisions_path。
     const dec = dlg.querySelector('#decisions');
@@ -748,7 +855,7 @@ glm-5.3 | 1.4 | 4.4 | 0.26'>${priceConfigToLines(ch.price_config)}</textarea>
 
   document.getElementById('new').onclick = () => {
     const dlg = dialog('新建渠道', form(), async (d) => {
-      await api('/channels', { method: 'POST', body: collect(d) });
+      await api('/channels', { method: 'POST', body: collect(d, null) });
       toast('渠道已创建', 'ok'); pageChannels(view);
     });
     wire(dlg);
@@ -757,7 +864,7 @@ glm-5.3 | 1.4 | 4.4 | 0.26'>${priceConfigToLines(ch.price_config)}</textarea>
   view.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => {
     const ch = rows.find((r) => r.id === Number(b.dataset.edit));
     const dlg = dialog('编辑渠道 #' + ch.id, form(ch), async (d) => {
-      await api('/channels/' + ch.id, { method: 'PUT', body: collect(d) });
+      await api('/channels/' + ch.id, { method: 'PUT', body: collect(d, ch.price_config || null) });
       toast('已保存', 'ok'); pageChannels(view);
     });
     wire(dlg, ch);
@@ -881,7 +988,8 @@ async function loadPricing(view) {
     <div class="card">
       <div class="row" style="margin-bottom:12px">
         <h2 style="margin:0;flex:1">模型价格</h2>
-        <button class="primary" id="addModel">＋ 新增模型</button>
+        <button id="editToggle">✏️ 编辑价格</button>
+        <button class="primary" id="addModel" style="display:none">＋ 新增模型</button>
         <input id="q" placeholder="按模型名过滤…" style="width:200px">
         <label style="margin:0"><input type="checkbox" id="coveredOnly" style="width:auto"> 仅看已覆盖</label>
       </div>
@@ -938,20 +1046,54 @@ async function loadPricing(view) {
   const tbl = document.getElementById('tbl');
   const saveHint = document.getElementById('saveHint');
 
+  /*
+   * 只读为默认态：价格表是「展示+审计」面，点「✏️ 编辑价格」才解锁输入与增删。
+   * 防误触——看价格的人大多数并不想改价。
+   */
+  let editMode = false;
+  const syncEditMode = () => {
+    document.getElementById('editToggle').textContent = editMode ? '✅ 完成编辑' : '✏️ 编辑价格';
+    document.getElementById('addModel').style.display = editMode ? '' : 'none';
+    document.getElementById('saveAll').style.display = editMode ? '' : 'none';
+    for (const id of ['dpIn', 'dpOut']) document.getElementById(id).disabled = !editMode;
+  };
+  syncEditMode();
+
+  document.getElementById('editToggle').onclick = () => {
+    if (editMode) {
+      const dirty = rows.filter(rowDirty).length;
+      if (dirty && !confirm(`有 ${dirty} 行未保存的修改，退出将丢弃，确定？`)) return;
+      editMode = false;
+      loadPricing(view); // 重新拉取，回到只读态并刷新状态 tag
+      return;
+    }
+    editMode = true;
+    syncEditMode();
+    renderRows();
+  };
+
   const rowHtml = (r, i) => {
     const overriding = isOverriding(r);
     const tag = r.isNew ? '<span class="tag" style="color:var(--accent)">新增</span>'
       : overriding ? '<span class="tag warn">已覆盖</span>' : '<span class="tag">内置</span>';
     const dot = rowDirty(r) ? `<span class="dot" style="color:var(--accent)" title="未保存的修改">· </span>` : '';
-    const nameCell = r.isNew
-      ? `<input data-field="name" class="mono" value="${esc(r.name)}" placeholder="新模型名">`
-      : `<span class="mono">${esc(r.name)}</span>`;
-    const priceCell = `<div class="row" style="flex-wrap:nowrap;gap:6px">
-        ${FIELDS.map(([f, ph, tip]) => `<input type="text" class="mono" data-field="${f}" value="${esc(r[f])}" placeholder="${ph}" title="${tip}；数字或费率表达式，留空 = 不设置" style="width:112px">`).join('')}
-      </div>${r.err ? `<div style="color:var(--err);font-size:12px;margin-top:4px">${esc(r.err)}</div>` : ''}`;
-    const act = builtIn[r.name]
-      ? (overriding ? `<button data-act="restore" data-idx="${i}">恢复默认</button>` : '<span class="muted">—</span>')
-      : `<button class="danger" data-act="delrow" data-idx="${i}">删除行</button>`;
+    const nameCell = !editMode
+      ? `<span class="mono">${esc(r.name)}</span>`
+      : r.isNew
+        ? `<input data-field="name" class="mono" value="${esc(r.name)}" placeholder="新模型名">`
+        : `<span class="mono">${esc(r.name)}</span>`;
+    // 只读态：非空字段以「标签 值」串展示（表达式原样），没有输入框就不会误触。
+    const priceView = FIELDS.filter(([f]) => String(r[f] ?? '').trim() !== '')
+      .map(([f, label]) => `${label} <span class="mono">${esc(r[f])}</span>`).join(' · ') || '<span class="muted">未设置</span>';
+    const priceCell = editMode
+      ? `<div class="row" style="flex-wrap:nowrap;gap:6px">
+          ${FIELDS.map(([f, ph, tip]) => `<input type="text" class="mono" data-field="${f}" value="${esc(r[f])}" placeholder="${ph}" title="${tip}；数字或费率表达式，留空 = 不设置" style="width:112px">`).join('')}
+        </div>${r.err ? `<div style="color:var(--err);font-size:12px;margin-top:4px">${esc(r.err)}</div>` : ''}`
+      : `<div style="max-width:620px">${priceView}</div>`;
+    const act = !editMode ? '<span class="muted">—</span>'
+      : builtIn[r.name]
+        ? (overriding ? `<button data-act="restore" data-idx="${i}">恢复默认</button>` : '<span class="muted">—</span>')
+        : `<button class="danger" data-act="delrow" data-idx="${i}">删除行</button>`;
     return `<tr data-idx="${i}">
       <td>${dot}${nameCell}</td>
       <td>${priceCell}</td>
@@ -981,6 +1123,7 @@ async function loadPricing(view) {
   };
 
   tbl.addEventListener('input', (e) => {
+    if (!editMode) return;
     const field = e.target.dataset.field;
     if (!field) return;
     const tr = e.target.closest('tr');
@@ -993,6 +1136,7 @@ async function loadPricing(view) {
   });
 
   tbl.addEventListener('click', (e) => {
+    if (!editMode) return;
     const b = e.target.closest('button[data-act]');
     if (!b) return;
     const i = Number(b.dataset.idx);
@@ -1002,6 +1146,7 @@ async function loadPricing(view) {
   });
 
   document.getElementById('addModel').onclick = () => {
+    if (!editMode) return;
     rows.push(mkRow('', null, true));
     renderRows();
     tbl.querySelector(`tr[data-idx="${rows.length - 1}"] input[data-field="name"]`)?.focus();

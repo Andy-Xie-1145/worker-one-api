@@ -12,6 +12,7 @@ import { normalizeUsage, openaiAdaptor } from '../src/relay/openai';
 import { anthropicAdaptor } from '../src/relay/anthropic';
 import { openaiResponsesAdaptor } from '../src/relay/responses';
 import { finishAnthropicStream, type AnthropicEncoderState } from '../src/relay/anthropic-inbound';
+import { compileBillingExpr, evaluateRate } from '../src/lib/pricing/expr';
 
 const tests: Array<[string, () => Promise<void> | void]> = [];
 const test = (name: string, fn: () => Promise<void> | void) => tests.push([name, fn]);
@@ -119,6 +120,20 @@ test('openaiAdaptor.convertResponse：HPD 混装 usage 原样透传 + 归一化�
   // 归一化：读=13，写=9
   assert.equal(r.usage.cached_tokens, 13);
   assert.equal(r.usage.cache_write_tokens, 9);
+});
+
+test('deepseek 渠道价时间表达式：高峰/窗外/周末三分支', () => {
+  const DS_IN = "(weekday('UTC') >= 1 && weekday('UTC') <= 5 && ((hour('UTC') >= 1 && hour('UTC') < 4) || (hour('UTC') >= 6 && hour('UTC') < 10))) ? 0.3 : 0.15";
+  const compiled = compileBillingExpr(DS_IN);
+  assert.ok(compiled.ok, compiled.ok ? '' : JSON.stringify((compiled as { error?: string }).error));
+  const program = (compiled as { program: Parameters<typeof evaluateRate>[0] }).program;
+  const rateAt = (iso: string) => {
+    const r = evaluateRate(program, { params: { context: 1000 }, now: new Date(iso) });
+    return r.ok ? r.rate : NaN;
+  };
+  assert.equal(rateAt('2026-11-09T02:30:00Z'), 0.3); // 周一 02:30Z，高峰窗内
+  assert.equal(rateAt('2026-11-09T12:00:00Z'), 0.15); // 工作日但窗外
+  assert.equal(rateAt('2026-11-08T16:30:00Z'), 0.15); // 周末
 });
 
 /* ---------------------------------------------------------------- runner */

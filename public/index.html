@@ -103,7 +103,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-01.2';
+const SPA_BUILD = '2026-11-09.1';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -440,7 +440,7 @@ async function loadTokens(view) {
       <td><span class="tag ${STATUS[t.status]?.[1] || ''}">${STATUS[t.status]?.[0] || t.status}</span></td>
       <td>${t.unlimited_quota ? '<span class="tag">无限</span>' : usd(t.remain_quota)}</td>
       <td>${usd(t.used_quota)}</td><td>${t.expired_time < 0 ? '永不' : ts(t.expired_time)}</td>
-      <td class="mono">${esc(t.models || '全部')}</td>
+      <td class="mono">${esc(t.models || '全部')}${t.channel_acl ? ` <span class="tag" title="渠道 ACL">${t.channel_acl.mode === 'whitelist' ? '白' : '黑'}[${esc(t.channel_acl.channels.join(',') || '空')}]</span>` : ''}</td>
       <td><button data-edit="${t.id}">编辑</button> <button class="danger" data-del="${t.id}">删除</button></td></tr>`;
     })}
   </div>`));
@@ -453,17 +453,27 @@ async function loadTokens(view) {
     <label><input type="checkbox" id="unl" style="width:auto" ${t.unlimited_quota ? 'checked' : ''}> 无限额度</label>
     <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
     <label>可用模型（逗号分隔，留空表示全部）</label><input id="models" value="${esc(t.models || '')}">
+    <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道）</label>
+    <select id="aclmode" style="margin-bottom:6px">
+      <option value=""${!t.channel_acl ? ' selected' : ''}>不限制（所有启用渠道按优先级参与）</option>
+      <option value="whitelist"${t.channel_acl?.mode === 'whitelist' ? ' selected' : ''}>白名单——只允许下列渠道（列表留空 = 全禁，等价禁用）</option>
+      <option value="blacklist"${t.channel_acl?.mode === 'blacklist' ? ' selected' : ''}>黑名单——禁止下列渠道（列表留空 = 全放）</option>
+    </select>
+    <input id="aclch" class="mono" placeholder="渠道 ID，逗号分隔，例：3,6" value="${esc((t.channel_acl?.channels || []).join(','))}" style="margin-bottom:6px">
     <p class="muted" style="margin:4px 0 0">价格按<b>渠道</b>配置（渠道页「价格覆盖」）——令牌混用渠道且有故障转移，在令牌上定价没有意义。</p>
     ${t.id ? '' : '<p class="muted" style="margin:4px 0 0">密钥创建后<b>自动进剪贴板</b>，页面不回显明文；要再复制，点列表里该行的「复制」。</p>'}
     ${t.id ? `<label>状态</label><select id="status"><option value="1"${t.status === 1 ? ' selected' : ''}>启用</option><option value="2"${t.status === 2 ? ' selected' : ''}>禁用</option></select>` : ''}`;
 
   const collect = (dlg) => {
+    const aclmode = val(dlg, 'aclmode');
+    const aclch = (val(dlg, 'aclch') || '').split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0);
     return {
       name: val(dlg, 'name') || '默认令牌',
       remain_quota: Math.round((parseFloat(val(dlg, 'quota')) || 0) * QUOTA_PER_USD),
       unlimited_quota: dlg.querySelector('#unl').checked,
       expired_time: val(dlg, 'exp') ? Math.floor(new Date(val(dlg, 'exp')).getTime() / 1000) : -1,
       models: val(dlg, 'models').trim(),
+      channel_acl: aclmode ? { mode: aclmode, channels: aclch } : null,
       ...(dlg.querySelector('#status') ? { status: Number(val(dlg, 'status')) } : {}),
     };
   };

@@ -7,7 +7,7 @@ import { randomKey } from '../lib/crypto';
 import { publicToken, revealTokenKey } from '../lib/token-key';
 import { requireAdmin, invalidateTokenCache, ensureOwner } from '../lib/auth';
 import { getOptions, setOptions, DEFAULT_OPTIONS } from '../lib/options';
-import { rebuildAbilities, deleteAbilities, listModels, csv, parseConfig, resolveTestModel } from '../lib/channel';
+import { rebuildAbilities, deleteAbilities, listModels, csv, parseConfig, resolveTestModel, validateTokenAclInput, parseTokenAcl } from '../lib/channel';
 import { buildProbeRequest } from '../lib/channel-probe';
 import { listUpstreamModels } from '../lib/upstream-models';
 import { loadModelBilling } from '../lib/model-billing';
@@ -259,14 +259,16 @@ api.post('/tokens', requireAdmin, async (c) => {
   const owner = await ensureOwner(c.env);
   const key = randomKey(24);
   const unlimited = b.unlimited_quota ? 1 : 0;
+  const acl = validateTokenAclInput(b.channel_acl);
+  if (!acl.ok) return c.json(fail(acl.error), 400);
   await c.env.DB.prepare(
-    'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models, channel_acl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   )
     .bind(
       owner.id, key, TokenStatusEnabled, String(b.name ?? '默认令牌'), now(), now(),
       Number.isFinite(b.expired_time) ? Number(b.expired_time) : -1,
       unlimited ? 0 : Math.max(0, Number(b.remain_quota) || 0),
-      unlimited, String(b.models ?? ''),
+      unlimited, String(b.models ?? ''), acl.json,
     )
     .run();
   const token = await c.env.DB.prepare('SELECT * FROM tokens WHERE key = ?').bind(key).first<TokenRow>();
@@ -292,7 +294,9 @@ api.put('/tokens/:id', requireAdmin, async (c) => {
 
   const b = await c.req.json<any>();
   const unlimited = b.unlimited_quota !== undefined ? (b.unlimited_quota ? 1 : 0) : token.unlimited_quota;
-  await c.env.DB.prepare('UPDATE tokens SET name = ?, status = ?, expired_time = ?, remain_quota = ?, unlimited_quota = ?, models = ? WHERE id = ?')
+  const acl = validateTokenAclInput(b.channel_acl !== undefined ? b.channel_acl : token.channel_acl);
+  if (!acl.ok) return c.json(fail(acl.error), 400);
+  await c.env.DB.prepare('UPDATE tokens SET name = ?, status = ?, expired_time = ?, remain_quota = ?, unlimited_quota = ?, models = ?, channel_acl = ? WHERE id = ?')
     .bind(
       String(b.name ?? token.name),
       Number(b.status ?? token.status),
@@ -300,6 +304,7 @@ api.put('/tokens/:id', requireAdmin, async (c) => {
       b.remain_quota !== undefined ? Math.max(0, Number(b.remain_quota) || 0) : token.remain_quota,
       unlimited,
       b.models !== undefined ? String(b.models) : token.models,
+      acl.json,
       id,
     )
     .run();

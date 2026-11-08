@@ -9,7 +9,7 @@ import {
   MODEL_PRICE_NOT_CONFIGURED, type BillingIdentity, type RateSet,
 } from '../lib/pricing';
 import type { ProbeContext } from '../lib/pricing/expr';
-import { selectChannel, mapModel, parseConfig, listModels, csv, parseChannelPriceConfig } from '../lib/channel';
+import { selectChannel, mapModel, parseConfig, listModels, csv, parseChannelPriceConfig, parseTokenAcl } from '../lib/channel';
 import { markRateLimited, clearRateLimit } from '../lib/cooldown';
 import {
   markDenied403, clearDenied403, extractDeniedMessage, UNKNOWN_COLO, DENY_403_FALLBACK_MESSAGE,
@@ -404,9 +404,13 @@ async function handleRelay(
     return written;
   };
 
+  // 令牌级渠道 ACL（白/黑名单）。解析一次，重试循环的每一轮都带同一份；
+  // 白名单空 = 全禁（selectChannel 返回 null → 503 no_channel）。
+  const channelAcl = parseTokenAcl(token.channel_acl);
+
   while (quotaAttempts < maxAttempts) {
     const attempt = round++;
-    const selection = await selectChannel(c.env, requestedModel, tried, colo);
+    const selection = await selectChannel(c.env, requestedModel, tried, colo, channelAcl);
     if (!selection) {
       /*
        * 「没有可用渠道」必须带着**客户端请求的那个模型串**落库。

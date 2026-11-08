@@ -2,7 +2,7 @@ import type { Env, TokenRow, ChannelRow } from '../types';
 import { getOptions, setOptions, DEFAULT_OPTIONS } from './options';
 import { ensureOwner, invalidateTokenCache } from './auth';
 import { applyCredit, reconcile } from './ledger';
-import { rebuildAbilities, deleteAbilities, listModels, resolveTestModel, parseConfig } from './channel';
+import { rebuildAbilities, deleteAbilities, listModels, resolveTestModel, parseConfig, parseTokenAcl } from './channel';
 import { buildProbeRequest } from './channel-probe';
 import { getHeartbeat, runWatchdog } from './watchdog';
 import { randomKey } from './crypto';
@@ -38,7 +38,28 @@ const TOKEN_FIELDS: Record<string, { column: string; norm: (v: string) => unknow
   unlimited: { column: 'unlimited_quota', norm: (v) => (['1', 'true', 'on', 'yes'].includes(v.toLowerCase()) ? 1 : 0) },
   status: { column: 'status', norm: (v) => ({ '1': 1, on: 1, enable: 1, '2': 2, off: 2, disable: 2 })[v] ?? null },
   expired: { column: 'expired_time', norm: (v) => Number(v) },
+  // 渠道 ACL：channels_acl=whitelist:1,2（只允许）| blacklist:3（禁止）| off（清除 = 不限制）。
+  // 白名单冒号后留空 = 全禁（等价禁用该令牌）。
+  channels_acl: {
+    column: 'channel_acl',
+    norm: (v) => {
+      const t = v.trim().toLowerCase();
+      if (!t || t === 'off' || t === 'none') return '';
+      const m = /^(whitelist|blacklist)\s*:\s*([\d,\s]*)$/.exec(t);
+      if (!m) return null;
+      const ids = m[2].split(',').map((x) => Number(x.trim())).filter((n) => Number.isInteger(n) && n > 0);
+      return JSON.stringify({ mode: m[1], channels: [...new Set(ids)].sort((a, b) => a - b) });
+    },
+  },
 };
+
+/** 令牌 ACL 的人类可读摘要（列表/输出用）。 */
+function aclSummary(raw: string): string {
+  const acl = parseTokenAcl(raw);
+  if (!acl) return '不限';
+  const label = acl.mode === 'whitelist' ? '白名单' : '黑名单';
+  return `${label}${acl.channels.length ? `[${acl.channels.join(',')}]` : '[空]'}`;
+}
 
 /**
  * 内置命令行界面（服务端）。
@@ -378,9 +399,9 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
   switch (sub) {
     case undefined: case 'list': {
       const rows = await env.DB.prepare('SELECT * FROM tokens ORDER BY id').all<TokenRow>();
-      const table2 = table(['ID', '名称', '密钥', '状态', '剩余', '已用', '模型限制'], (rows.results ?? []).map((t) => [
+      const table2 = table(['ID', '名称', '密钥', '状态', '剩余', '已用', '模型限制', '渠道ACL'], (rows.results ?? []).map((t) => [
         String(t.id), t.name, maskTokenKey(t.key), t.status === 1 ? '启用' : `停用(${t.status})`,
-        t.unlimited_quota ? '无限' : usd(t.remain_quota), usd(t.used_quota), t.models || '全部',
+        t.unlimited_quota ? '无限' : usd(t.remain_quota), usd(t.used_quota), t.models || '全部', aclSummary(t.channel_acl),
       ]));
       return { ok: true, output: table2 || '（还没有令牌）' };
     }
@@ -392,10 +413,13 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
       const unlimited = flags.has('--unlimited') ? 1 : 0;
       const usdAmount = Number((flags.get('--usd') ?? '').replace(/^\$/, ''));
       const models = flags.get('--models') ?? '';
+      const aclFlag = flags.get('--channels-acl');
+      const aclNorm = aclFlag === undefined ? '' : TOKEN_FIELDS.channels_acl.norm(aclFlag);
+      if (aclNorm === null) return { ok: false, output: `--channels-acl 格式：whitelist:1,2 | blacklist:3 | off（收到 "${aclFlag}"）` };
       await env.DB.prepare(
-        'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models) VALUES (?, ?, ?, ?, ?, ?, -1, ?, ?, ?)',
+        'INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, models, channel_acl) VALUES (?, ?, ?, ?, ?, ?, -1, ?, ?, ?, ?)',
       )
-        .bind(owner.id, key, TokenStatusEnabled, name, now(), now(), unlimited ? 0 : Math.round((Number.isFinite(usdAmount) ? usdAmount : 0) * QUOTA_PER_USD), unlimited, models)
+        .bind(owner.id, key, TokenStatusEnabled, name, now(), now(), unlimited ? 0 : Math.round((Number.isFinite(usdAmount) ? usdAmount : 0) * QUOTA_PER_USD), unlimited, models, aclNorm as string)
         .run();
       const created = await env.DB.prepare('SELECT * FROM tokens WHERE key = ?').bind(key).first<TokenRow>();
       const quotaText = unlimited ? '无限额度' : Number.isFinite(usdAmount) ? `$${usdAmount}` : '0 额度（可用 --usd/--unlimited 调整）';
@@ -434,7 +458,7 @@ async function tokenCmd(env: Env, args: string[]): Promise<CliResult> {
       const updated = await env.DB.prepare('SELECT * FROM tokens WHERE id = ?').bind(id).first<TokenRow>();
       return {
         ok: true,
-        output: `令牌 #${id}「${updated!.name}」已更新（${updated!.unlimited_quota ? '无限' : usd(updated!.remain_quota)}，模型：${updated!.models || '全部'}，状态=${updated!.status}）`,
+        output: `令牌 #${id}「${updated!.name}」已更新（${updated!.unlimited_quota ? '无限' : usd(updated!.remain_quota)}，模型：${updated!.models || '全部'}，渠道ACL：${aclSummary(updated!.channel_acl)}，状态=${updated!.status}）`,
       };
     }
     case 'key': {
@@ -840,16 +864,20 @@ function helpText(command?: string): string {
     '  （token key <id>），因为终端滚动历史、截图、AI 会话记录都会把回显留下来。',
     '',
     'token list',
-    '  令牌列表：ID / 名称 / 密钥遮罩 / 状态 / 剩余额度 / 已用 / 模型限制。',
+    '  令牌列表：ID / 名称 / 密钥遮罩 / 状态 / 剩余额度 / 已用 / 模型限制 / 渠道ACL。',
     '',
-    'token new <名称> [--usd N | --unlimited] [--models a,b]',
+    'token new <名称> [--usd N | --unlimited] [--models a,b] [--channels-acl whitelist:1,2]',
     '  创建令牌，只回报 #ID、名称和密钥遮罩，不打印明文。',
     '  --usd 设额度；--unlimited 不限额；--models 限制这把 Key 只能调指定模型（逗号分隔，留空 = 全部）。',
+    '  --channels-acl 渠道白/黑名单（与 --models 叠加：先限模型再选渠道）。',
     '  例：token new 笔记本 --unlimited --models deepseek-v4-pro,gpt-4o',
+    '  例：token new GPT专线 --unlimited --channels-acl whitelist:4',
     '  拿明文：token key <id>',
     '',
-    'token set <id> name=... models=a,b usd=N unlimited=1|0 status=1|2 expired=<unix>',
+    'token set <id> name=... models=a,b usd=N unlimited=1|0 status=1|2 expired=<unix> channels_acl=whitelist:1,2',
     '  按字段修改（一次可改多个）；expired 为 unix 秒，-1 = 永不过期。',
+    '  channels_acl=whitelist:1,2（只允许渠道 1、2）| blacklist:3（禁止渠道 3）| off（不限制）。',
+    '  ※ 白名单冒号后留空（whitelist:）= 全禁，等价于停用该令牌；黑名单留空（blacklist:）= 全放。',
     '',
     'token key <id>',
     '  显示完整密钥（sk- 前缀）——这是唯一的明文出口，输出单行方便 $(...) 捕获。',

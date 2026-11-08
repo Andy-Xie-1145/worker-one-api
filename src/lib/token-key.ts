@@ -13,6 +13,7 @@
 import type { Env, TokenRow } from '../types';
 import { LogTypeManage } from '../types';
 import { ensureOwner } from './auth';
+import { parseTokenAcl } from './channel';
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -42,10 +43,10 @@ export async function revealTokenKey(env: Env, token: TokenRow): Promise<string>
 }
 
 /** 令牌的默认对外视图：没有明文，只有遮罩。 */
-export type PublicToken = Omit<TokenRow, 'key'> & { key_masked: string };
+export type PublicToken = Omit<TokenRow, 'key' | 'channel_acl'> & { key_masked: string; channel_acl: ReturnType<typeof parseTokenAcl> };
 
 /** 去掉明文 key，补一个遮罩。列表/创建接口都走它，别各自拼。 */
 export function publicToken(t: TokenRow): PublicToken {
-  const { key, ...rest } = t;
-  return { ...rest, key_masked: maskTokenKey(key) };
+  const { key, channel_acl, ...rest } = t;
+  return { ...rest, key_masked: maskTokenKey(key), channel_acl: parseTokenAcl(channel_acl) };
 }

@@ -60,6 +60,8 @@ export interface TokenRow {
   unlimited_quota: number;
   used_quota: number;
   models: string;
+  /** 渠道访问控制 JSON：{"mode":"whitelist|blacklist","channels":[id…]}；空串 = 不限制。 */
+  channel_acl: string;
 }
 
 export interface ChannelRow {

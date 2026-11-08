@@ -326,12 +326,14 @@ api.delete('/tokens/:id', requireAdmin, async (c) => {
 /** 内置价格表外显 + 全局覆盖现状。每个 Key 的生效视图在 `GET /v1/pricing`（sk- 鉴权）。 */
 api.get('/pricing', requireAdmin, async (c) => {
   const options = await getOptions(c.env);
+  const channelModels = await listModels(c.env);
   return c.json(
     ok({
       built_in: PRICE_TABLE,
       default_price: options.DefaultPrice ?? DEFAULT_PRICE,
       global_overrides: options.ModelPriceOverride ?? {},
       alias_prefixes: ALIAS_PREFIXES,
+      channel_models: channelModels,
       quota_per_usd: QUOTA_PER_USD,
     }),
   );

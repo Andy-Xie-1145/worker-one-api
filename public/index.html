@@ -103,7 +103,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-09.5';
+const SPA_BUILD = '2026-11-09.6';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -1511,12 +1511,13 @@ async function pageTerminal(view) {
 
 /**
  * 别名组管理（并查集语义，无倍率）：组内名字视为同一个模型。
- * 生效延迟 ≤60s（options KV 缓存 TTL）。
+ * 纯 GUI：成员从下拉选择添加、chip 点 × 移除，不手写逗号串。
+ * 生效延迟 ≤60s（options KV 缓存 TTL）；保存为整包替换。
  */
 async function pageAliases(view) {
-  const opts = await api('/options');
-  const current = Array.isArray(opts.current?.AliasGroups) ? opts.current.AliasGroups : [];
-  let groups = current.map((g) => (Array.isArray(g) ? g.map((n) => String(n)) : []));
+  const [opts, pricing] = await Promise.all([api('/options'), api('/pricing')]);
+  const universe = [...new Set([...(pricing.channel_models || []), ...Object.keys(pricing.built_in || {})])].sort();
+  let groups = Array.isArray(opts.current?.AliasGroups) ? opts.current.AliasGroups.map((g) => (Array.isArray(g) ? g.map(String) : [])) : [];
 
   view.replaceChildren($(`<div class="card">
     <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">模型别名</h2><button class="primary" id="addGroup">＋ 新增别名组</button></div>
@@ -1527,22 +1528,43 @@ async function pageAliases(view) {
 
   const render = () => {
     const el = document.getElementById('aliasGroups');
-    el.innerHTML = groups.length ? groups.map((names, i) => `
-      <div class="card" style="margin:0 0 10px">
-        <div class="row" style="margin-bottom:6px"><b>别名组 ${i + 1}</b><button class="danger" data-del="${i}" style="margin-left:auto">删除组</button></div>
-        <input data-names value="${esc(names.join(', '))}" placeholder="名字，逗号分隔，例：deepseek-v4.1-flash, deepseek-v4-flash">
-      </div>`).join('') : '<p class="muted">暂无别名组。点「＋ 新增别名组」创建。</p>';
+    el.innerHTML = groups.length ? groups.map((names, gi) => {
+      const available = universe.filter((m) => !names.includes(m));
+      return `<div class="card" style="margin:0 0 10px">
+        <div class="row" style="margin-bottom:6px"><b>别名组 ${gi + 1}</b><span class="muted">${names.length} 个成员</span><button class="danger" data-del="${gi}" style="margin-left:auto">删除组</button></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+          ${names.map((n) => `<span class="tag" style="display:inline-flex;align-items:center;gap:4px"><span class="mono">${esc(n)}</span><button type="button" data-rm-gi="${gi}" data-rm-name="${esc(n)}" title="移除 ${esc(n)}" style="border:0;background:none;cursor:pointer;padding:0;color:var(--err);font-weight:700">×</button></span>`).join('') || '<span class="muted">（空组——从下方下拉添加成员后生效）</span>'}
+        </div>
+        <div class="row" style="margin-bottom:0">
+          <select data-add="${gi}" style="flex:1"><option value="">从模型列表选择要加入的名字…</option>${available.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('')}</select>
+          <button type="button" data-addbtn="${gi}">添加成员</button>
+        </div>
+      </div>`;
+    }).join('') : '<p class="muted">暂无别名组。点「＋ 新增别名组」创建，再从下拉添加成员。</p>';
     el.querySelectorAll('[data-del]').forEach((b) => (b.onclick = () => { groups.splice(Number(b.dataset.del), 1); render(); }));
+    el.querySelectorAll('[data-rm-name]').forEach((b) => (b.onclick = () => {
+      const gi = Number(b.dataset.rmGi), n = b.dataset.rmName;
+      groups[gi] = groups[gi].filter((x) => x !== n);
+      if (!groups[gi].length) groups.splice(gi, 1);
+      render();
+    }));
+    el.querySelectorAll('[data-addbtn]').forEach((b) => (b.onclick = () => {
+      const gi = Number(b.dataset.addbtn);
+      const sel = el.querySelector(`select[data-add="${gi}"]`);
+      const name = sel?.value;
+      if (!name) { toast('先在下拉里选一个要加入的名字', 'err'); return; }
+      groups[gi].push(name);
+      render();
+    }));
   };
   render();
 
   document.getElementById('addGroup').onclick = () => { groups.push([]); render(); };
   document.getElementById('saveAliases').onclick = async () => {
-    const parsed = [...document.getElementById('aliasGroups').querySelectorAll('[data-names]')]
-      .map((inp) => inp.value.split(',').map((s) => s.trim()).filter(Boolean)).filter((g) => g.length);
     try {
-      await api('/options', { method: 'PUT', body: { AliasGroups: parsed } });
+      await api('/options', { method: 'PUT', body: { AliasGroups: groups.filter((g) => g.length) } });
       toast('别名已保存（生效延迟 ≤60s）', 'ok');
+      render();
     } catch (e) { toast(e.message, 'err'); }
   };
 }

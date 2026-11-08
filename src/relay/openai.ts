@@ -48,6 +48,7 @@ export const openaiAdaptor: Adaptor = {
     if (ctx.mode === 'decisions') return { body: convertDecisionsResponse(json, ctx), usage: normalizeDecisionsUsage(json?.usage) };
     const usage: Usage = normalizeUsage(json?.usage);
     if (json && typeof json === 'object' && json.model) json.model = ctx.requestedModel;
+    canonicalizePromptDetails(json, usage);
     return { body: json, usage };
   },
 
@@ -63,6 +64,7 @@ export const openaiAdaptor: Adaptor = {
     let usage: Usage | undefined;
     if (json.usage) {
       usage = normalizeUsage(json.usage);
+      canonicalizePromptDetails(json, usage);
     } else {
       // Accumulate text so a usage-less upstream can still be billed.
       const delta = json.choices?.[0]?.delta?.content;
@@ -73,6 +75,25 @@ export const openaiAdaptor: Adaptor = {
     return { chunks: [json], usage };
   },
 };
+
+/**
+ * 把计费公式的三个字段钉进 prompt_tokens_details（cached_tokens / cache_write_tokens）。
+ *
+ * 公式口径：普通输入 = prompt_tokens − cached_tokens − cache_write_tokens，三桶互斥。
+ * HPD 这类聚合站把缓存写放在顶层别名（cache_creation_input_tokens / 
+ * prompt_cache_write_tokens），details 里没有 cache_write_tokens——调用方按公式读
+ * details 会漏掉 W。这里用别名归一后的值补齐缺的键：已有键不覆盖（尊重上游原值），
+ * 上游没报 usage 时不造结构。
+ */
+function canonicalizePromptDetails(json: any, usage: Usage): void {
+  const u = json?.usage;
+  if (!u || typeof u !== 'object') return;
+  if (typeof u.prompt_tokens !== 'number' && typeof u.input_tokens !== 'number') return;
+  let details = u.prompt_tokens_details;
+  if (!details || typeof details !== 'object') details = u.prompt_tokens_details = {};
+  if (details.cached_tokens === undefined && usage.cached_tokens !== undefined) details.cached_tokens = usage.cached_tokens;
+  if (details.cache_write_tokens === undefined && usage.cache_write_5m_tokens !== undefined) details.cache_write_tokens = usage.cache_write_5m_tokens;
+}
 
 /**
  * Most compatible endpoints live under /v1, but some vendors pin another
@@ -91,8 +112,11 @@ export function normalizeUsage(u: any): Usage {
   // 缓存计数的别名族：DeepSeek 报 prompt_cache_hit_tokens，OpenAI 嵌在
   // prompt_tokens_details.cached_tokens，HPD 这类聚合站还会补 anthropic 式的
   // cache_read_input_tokens——三者是同一计数器的不同名字，取最大值兜住各家拼写。
-  // 缓存写入同理（cache_creation_input_tokens / prompt_cache_write_tokens 是别名）；
-  // 写入只进 cache_write_tokens 供审计（billing_meta），计费分量走 cw5/cw1 两桶。
+  // 缓存写入同理（cache_creation_input_tokens / prompt_cache_write_tokens 是别名）。
+  // 按官方口径（prompt-caching guide）：input = 普通输入 + 缓存读 + 缓存写，三桶
+  // 互斥相加——写装进 cache_write_5m_tokens 计费桶（单写计数器没有 TTL 拆分时
+  // 归 30m 桶），quotaFromRates 扣减后按写价计，与 OpenAI/HPD expr 完全一致；
+  // 渠道未设写价时写价继承输入价，金额不变（幂等安全）。
   const cached = Math.max(
     Number(u?.prompt_cache_hit_tokens ?? 0) || 0,
     Number(u?.cache_read_input_tokens ?? 0) || 0,
@@ -108,7 +132,7 @@ export function normalizeUsage(u: any): Usage {
     completion_tokens: completion,
     total_tokens: prompt + completion,
     ...(cached > 0 ? { cached_tokens: Math.min(cached, prompt) } : {}),
-    ...(cacheWrite > 0 ? { cache_write_tokens: Math.min(cacheWrite, prompt) } : {}),
+    ...(cacheWrite > 0 ? { cache_write_5m_tokens: Math.min(cacheWrite, Math.max(0, prompt - cached)), cache_write_tokens: cacheWrite } : {}),
   };
 }
 

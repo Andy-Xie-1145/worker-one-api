@@ -13,6 +13,7 @@ import { anthropicAdaptor } from '../src/relay/anthropic';
 import { openaiResponsesAdaptor } from '../src/relay/responses';
 import { finishAnthropicStream, type AnthropicEncoderState } from '../src/relay/anthropic-inbound';
 import { compileBillingExpr, evaluateRate } from '../src/lib/pricing/expr';
+import { quotaFromRates } from '../src/lib/pricing/llm';
 
 const tests: Array<[string, () => Promise<void> | void]> = [];
 const test = (name: string, fn: () => Promise<void> | void) => tests.push([name, fn]);
@@ -25,7 +26,7 @@ function makeState(): AnthropicEncoderState {
 }
 const ctx = { requestedModel: 'm', upstreamModel: 'm', channel: {}, config: {}, path: '' } as any;
 
-test('normalizeUsage：HPD 三族缓存别名（读=取最大值，写=别名族）', () => {
+test('normalizeUsage：HPD 三族缓存别名（读=取最大值，写=别名族入计费桶）', () => {
   const u = normalizeUsage({
     prompt_tokens: 93386, completion_tokens: 5, total_tokens: 93391,
     prompt_cache_hit_tokens: 0,
@@ -37,7 +38,15 @@ test('normalizeUsage：HPD 三族缓存别名（读=取最大值，写=别名族
   assert.equal(u.prompt_tokens, 93386);
   assert.equal(u.completion_tokens, 5);
   assert.equal(u.cached_tokens, undefined); // 全零 → 省略缓存键（源行为）
-  assert.equal(u.cache_write_tokens, 12);
+  assert.equal(u.cache_write_5m_tokens, 12); // 写入计费桶（官方口径：三桶互斥）
+  assert.equal(u.cache_write_tokens, 12); // 审计兼容字段
+});
+
+test('normalizeUsage：写桶封顶在 prompt − cached（防异常样本负新鲜输入）', () => {
+  // 社区报过的异常样本形态：cached + write > prompt
+  const u = normalizeUsage({ prompt_tokens: 4583, completion_tokens: 15, prompt_tokens_details: { cached_tokens: 3945, cache_write_tokens: 4580 } });
+  assert.equal(u.cached_tokens, 3945);
+  assert.equal(u.cache_write_5m_tokens, 4583 - 3945); // 638，封顶
 });
 
 test('normalizeUsage：cache_read_input_tokens 别名参与取最大', () => {
@@ -123,9 +132,40 @@ test('openaiAdaptor.convertResponse：HPD 混装 usage 原样透传 + 归一化�
   // 原始 body 原样给客户端（model 改写除外）——别名字段一个不丢
   assert.equal(r.body.usage.cache_creation_input_tokens, 9);
   assert.equal(r.body.usage.prompt_cache_hit_tokens, 13);
-  // 归一化：读=13，写=9
+  // 归一化：读=13，写=9（进计费桶 + 审计字段）
   assert.equal(r.usage.cached_tokens, 13);
+  assert.equal(r.usage.cache_write_5m_tokens, 9);
   assert.equal(r.usage.cache_write_tokens, 9);
+});
+
+test('canonicalizePromptDetails：公式三字段钉进 prompt_tokens_details（HPD 顶层别名 → details）', () => {
+  // HPD 真实形态：写缓存在顶层别名，details 里没有 cache_write_tokens
+  const r = openaiAdaptor.convertResponse({
+    model: 'up', choices: [], usage: {
+      prompt_tokens: 100, completion_tokens: 5, total_tokens: 105,
+      cache_creation_input_tokens: 12, cache_read_input_tokens: 0, prompt_cache_write_tokens: 12,
+      prompt_tokens_details: { cached_tokens: 0 },
+    },
+  }, ctx);
+  const d = r.body.usage.prompt_tokens_details;
+  assert.equal(d.cached_tokens, 0); // 上游已有键：不覆盖
+  assert.equal(d.cache_write_tokens, 12); // 缺的公式字段：用别名归一值补齐
+  // 公式可算：(P−C−W)×in + C×cr + W×cw —— 三字段齐备
+  assert.equal(r.usage.cache_write_5m_tokens, 12);
+});
+
+test('canonicalizePromptDetails：上游无 usage 不造结构', () => {
+  const r = openaiAdaptor.convertResponse({ model: 'up', choices: [{ index: 0, message: { role: 'assistant', content: 'x' } }] }, ctx);
+  assert.equal(r.body.usage, undefined);
+});
+
+test('quotaFromRates：OpenAI 官方示例三桶互斥计费（12000=1000 新鲜+4000 读+7000 写）', () => {
+  // 官方 prompt-caching 指南示例：input=12000, cached=4000, write=7000(30m 3000+12h 4000)
+  // 官方算式：(1000×1 + 4000×0.1 + 3000×1.25 + 4000×2.5)/1M = $0.01515
+  const quota = quotaFromRates({ in: 1, cached_in: 0.1, cache_write_5m: 1.25, cache_write_1h: 2.5, out: 0 }, {
+    prompt_tokens: 12000, completion_tokens: 0, cached_tokens: 4000, cache_write_5m_tokens: 3000, cache_write_1h_tokens: 4000,
+  });
+  assert.equal(quota, Math.ceil(0.01515 * 500000));
 });
 
 test('deepseek 渠道价时间表达式：高峰/窗外/周末三分支', () => {

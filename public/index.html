@@ -103,7 +103,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-09.4';
+const SPA_BUILD = '2026-11-09.5';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -449,12 +449,20 @@ async function loadTokens(view) {
 
   view.querySelectorAll('[data-copy]').forEach((b) => (b.onclick = () => copyTokenKey(Number(b.dataset.copy), b)));
 
-  const form = (t = {}, chans = []) => `
+  const form = (t = {}, chans = [], knownModels = []) => {
+    const tModels = String(t.models ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    const modelUniverse = [...new Set([...(knownModels || []), ...(chans || []).flatMap((c) => String(c.models ?? '').split(',').map((s) => s.trim()).filter(Boolean)), ...tModels])].sort();
+    const modelChecked = new Set(tModels);
+    return `
     <label>名称</label><input id="name" value="${esc(t.name || '')}">
     <label>额度（美元，留空或勾选无限则不限）</label><input id="quota" type="number" step="0.01" value="${t.remain_quota ? (t.remain_quota / QUOTA_PER_USD).toFixed(4) : ''}">
     <label><input type="checkbox" id="unl" style="width:auto" ${t.unlimited_quota ? 'checked' : ''}> 无限额度</label>
     <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
-    <label>可用模型（逗号分隔，留空表示全部）</label><input id="models" value="${esc(t.models || '')}">
+    <label>可用模型（勾选；全不勾 = 全部。列表 = 内置价表 ∪ 各渠道模型 ∪ 本令牌已选）</label>
+    <div id="modelBoxes" style="border:1px solid var(--border);border-radius:8px;padding:8px;max-height:220px;overflow:auto;margin-bottom:6px">
+      ${modelUniverse.map((m) => `<label style="margin:2px 0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-m style="width:auto"${modelChecked.has(m) ? ' checked' : ''}> <span class="mono">${esc(m)}</span></label>`).join('') || '<span class="muted">（暂无可选模型）</span>'}
+    </div>
+    <label>其他模型（上面没列出的才手填，逗号分隔，一般留空）</label><input id="modelsExtra" value="">
     <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道。选白名单/黑名单后，在下方勾选渠道或分组）</label>
     <select id="aclmode" style="margin-bottom:6px">
       <option value=""${!t.channel_acl ? ' selected' : ''}>不限制（所有启用渠道按优先级参与）</option>
@@ -499,25 +507,28 @@ async function loadTokens(view) {
     sel.onchange = sync; sync();
   };
 
-  document.getElementById('new').onclick = () => dialog('新建令牌', form({}, chans), async (dlg) => {
-    wireAcl(dlg);
-    const t = await api('/tokens', { method: 'POST', body: collect(dlg) });
-    if (!t || typeof t.id !== 'number') throw new Error('接口没有返回令牌编号（页面可能已过期，请刷新后重试）');
-    // 明文只在「取回 → 剪贴板」这一跳里存在，绝不进 DOM/toast：否则 AI 自动化截图、
-    // 读页面都能把新 Key 带走。剪贴板不可用（无焦点/非安全上下文）时降级到该行「复制」。
-    await copyTokenKey(t.id, null, (why) => {
-      toast(`令牌 #${t.id}「${t.name}」已创建；剪贴板不可用（${why}），请点该行「复制」按钮`, 'err');
+  document.getElementById('new').onclick = () => {
+    const dlg = dialog('新建令牌', form({}, chans), async (dlg) => {
+      const t = await api('/tokens', { method: 'POST', body: collect(dlg) });
+      if (!t || typeof t.id !== 'number') throw new Error('接口没有返回令牌编号（页面可能已过期，请刷新后重试）');
+      // 明文只在「取回 → 剪贴板」这一跳里存在，绝不进 DOM/toast：否则 AI 自动化截图、
+      // 读页面都能把新 Key 带走。剪贴板不可用（无焦点/非安全上下文）时降级到该行「复制」。
+      await copyTokenKey(t.id, null, (why) => {
+        toast(`令牌 #${t.id}「${t.name}」已创建；剪贴板不可用（${why}），请点该行「复制」按钮`, 'err');
+      });
+      await loadTokens(view);
     });
-    await loadTokens(view);
-  });
+    wireAcl(dlg); // 打开即同步一次
+  };
 
   view.querySelectorAll('[data-edit]').forEach((b) => (b.onclick = () => {
     const t = rows.find((r) => r.id === Number(b.dataset.edit));
-    dialog('编辑令牌', form(t, chans), async (dlg) => {
+    const dlg = dialog('编辑令牌', form(t, chans), async (dlg) => {
       wireAcl(dlg);
       await api('/tokens/' + t.id, { method: 'PUT', body: collect(dlg) });
       toast('已保存', 'ok'); await loadTokens(view);
     });
+    wireAcl(dlg); // 打开即同步（双保险）
   }));
 
   view.querySelectorAll('[data-del]').forEach((b) => (b.onclick = async () => {

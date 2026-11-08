@@ -57,7 +57,7 @@ test('normalizeUsage：全零缓存 → 无缓存键', () => {
   assert.equal(u.cache_write_tokens, undefined);
 });
 
-test('anthropicAdaptor.convertResponse：cache_creation TTL 分桶（5m/1h）', () => {
+test('anthropicAdaptor.convertResponse：cache_creation TTL 分桶（5m/1h）+ OpenAI 式嵌套 details', () => {
   const r = anthropicAdaptor.convertResponse({
     content: [{ type: 'text', text: 'hi' }], stop_reason: 'end_turn',
     usage: { input_tokens: 46, output_tokens: 11, cache_read_input_tokens: 20, cache_creation: { ephemeral_5m_input_tokens: 4, ephemeral_1h_input_tokens: 6 } },
@@ -66,6 +66,9 @@ test('anthropicAdaptor.convertResponse：cache_creation TTL 分桶（5m/1h）', 
   assert.equal(r.usage.cached_tokens, 20);
   assert.equal(r.usage.cache_write_5m_tokens, 4);
   assert.equal(r.usage.cache_write_1h_tokens, 6);
+  // OpenAI 形状客户端读嵌套 details；顶层 cached_tokens 保留兼容
+  assert.deepEqual(r.body.usage.prompt_tokens_details, { cached_tokens: 20 });
+  assert.equal((r.body.usage as any).cached_tokens, 20);
 });
 
 test('anthropicAdaptor.convertResponse：只有写入总数时整体归 5m 桶', () => {
@@ -77,16 +80,19 @@ test('anthropicAdaptor.convertResponse：只有写入总数时整体归 5m 桶',
   assert.equal(r.usage.cache_write_1h_tokens ?? 0, 0);
 });
 
-test('finishAnthropicStream：message_delta 带官方缓存三字段（有缓存时）', () => {
+test('finishAnthropicStream：message_delta 带官方缓存三字段（input=新鲜部分，防重复计数）', () => {
   const out = finishAnthropicStream(makeState(), { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 30, cache_write_5m_tokens: 4, cache_write_1h_tokens: 5 });
   const delta = out.split('\n').filter((l) => l.startsWith('data: ') && l.includes('message_delta'))
     .map((l) => JSON.parse(l.slice(6)))[0];
-  assert.equal(delta.usage.input_tokens, 100);
+  // Anthropic 契约：三桶互斥，input_tokens 只装新鲜部分（100−30−4−5=61）
+  assert.equal(delta.usage.input_tokens, 61);
   assert.equal(delta.usage.output_tokens, 10);
   assert.equal(delta.usage.cache_read_input_tokens, 30);
   assert.equal(delta.usage.cache_creation_input_tokens, 9);
   assert.equal(delta.usage.cache_creation.ephemeral_5m_input_tokens, 4);
   assert.equal(delta.usage.cache_creation.ephemeral_1h_input_tokens, 5);
+  // 求和口径校验：三桶相加 = 总输入
+  assert.equal(delta.usage.input_tokens + delta.usage.cache_read_input_tokens + delta.usage.cache_creation_input_tokens, 100);
 });
 
 test('finishAnthropicStream：无缓存 → usage 只有 input/output（形状不变）', () => {

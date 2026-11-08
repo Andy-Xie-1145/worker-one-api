@@ -119,15 +119,18 @@ export function chatResponseToAnthropic(json: any, model: string): any {
 }
 
 /**
- * 客户端面的 Anthropic usage：官方协议自带缓存三字段（读 / 写总数 / 写 TTL 明细），
- * 内部 Usage 里有就如实带出去——上游（HPD 这类）报了缓存计数而客户端看不到，
- * 排障与成本核算都会缺一半信息。全零时不加键，保持无缓存请求的响应形状不变。
+ * 客户端面的 Anthropic usage：官方契约里 input_tokens **不含**缓存——
+ * 总输入 = input_tokens + cache_read_input_tokens + cache_creation_input_tokens，
+ * 三个桶互斥。内部 Usage 的 prompt_tokens 是 OpenAI 式「含缓存」的值，所以这里
+ * 必须换算成新鲜部分填 input_tokens，缓存计数拆到官方三字段；求和的客户端才不会
+ * 重复计数。全零时不加键，保持无缓存请求的响应形状不变。
  */
 function anthropicClientUsage(u: any): Record<string, unknown> {
   const cached = Number(u?.cached_tokens ?? 0) || 0;
   const cw5 = Number(u?.cache_write_5m_tokens ?? 0) || 0;
   const cw1 = Number(u?.cache_write_1h_tokens ?? 0) || 0;
-  const base = { input_tokens: Number(u?.prompt_tokens ?? 0) || 0, output_tokens: Number(u?.completion_tokens ?? 0) || 0 };
+  const fresh = Math.max(0, Number(u?.prompt_tokens ?? 0) || 0) - cached - cw5 - cw1;
+  const base = { input_tokens: fresh, output_tokens: Number(u?.completion_tokens ?? 0) || 0 };
   if (cached === 0 && cw5 === 0 && cw1 === 0) return base;
   return {
     ...base,

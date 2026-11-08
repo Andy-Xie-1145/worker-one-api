@@ -77,6 +77,13 @@ export const anthropicAdaptor: Adaptor = {
   convertResponse(json: any, ctx: AdaptorContext) {
     const usage = anthropicUsage(json?.usage);
 
+    // OpenAI 形状的客户端读 prompt_tokens_details.cached_tokens（嵌套），不是顶层
+    // cached_tokens——写一份标准嵌套（顶层字段保留，兼容老客户端）。
+    const bodyUsage: Record<string, unknown> = {
+      ...usage,
+      ...(usage.cached_tokens ? { prompt_tokens_details: { cached_tokens: usage.cached_tokens } } : {}),
+    };
+
     let text = '';
     const toolCalls: any[] = [];
     for (const block of json?.content ?? []) {
@@ -100,7 +107,7 @@ export const anthropicAdaptor: Adaptor = {
         created: Math.floor(Date.now() / 1000),
         model: ctx.requestedModel,
         choices: [{ index: 0, message, finish_reason: mapStopReason(json?.stop_reason) }],
-        usage,
+        usage: bodyUsage,
       },
       usage,
     };

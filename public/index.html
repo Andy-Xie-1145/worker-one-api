@@ -453,13 +453,13 @@ async function loadTokens(view) {
     <label><input type="checkbox" id="unl" style="width:auto" ${t.unlimited_quota ? 'checked' : ''}> 无限额度</label>
     <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
     <label>可用模型（逗号分隔，留空表示全部）</label><input id="models" value="${esc(t.models || '')}">
-    <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道）</label>
+    <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道。条目 = 渠道 ID 或 <b>分组名</b>，逗号分隔可混用）</label>
     <select id="aclmode" style="margin-bottom:6px">
       <option value=""${!t.channel_acl ? ' selected' : ''}>不限制（所有启用渠道按优先级参与）</option>
-      <option value="whitelist"${t.channel_acl?.mode === 'whitelist' ? ' selected' : ''}>白名单——只允许下列渠道（列表留空 = 全禁，等价禁用）</option>
-      <option value="blacklist"${t.channel_acl?.mode === 'blacklist' ? ' selected' : ''}>黑名单——禁止下列渠道（列表留空 = 全放）</option>
+      <option value="whitelist"${t.channel_acl?.mode === 'whitelist' ? ' selected' : ''}>白名单——只允许匹配条目的渠道（条目留空 = 全禁，等价禁用）</option>
+      <option value="blacklist"${t.channel_acl?.mode === 'blacklist' ? ' selected' : ''}>黑名单——禁止匹配条目的渠道（条目留空 = 全放）</option>
     </select>
-    <input id="aclch" class="mono" placeholder="渠道 ID，逗号分隔，例：3,6" value="${esc((t.channel_acl?.channels || []).join(','))}" style="margin-bottom:6px">
+    <input id="aclch" class="mono" placeholder="渠道 ID 或 分组名，逗号分隔，例：3, cn" value="${esc((t.channel_acl?.channels || []).join(','))}" style="margin-bottom:6px">
     <p class="muted" style="margin:4px 0 0">价格按<b>渠道</b>配置（渠道页「价格覆盖」）——令牌混用渠道且有故障转移，在令牌上定价没有意义。</p>
     ${t.id ? '' : '<p class="muted" style="margin:4px 0 0">密钥创建后<b>自动进剪贴板</b>，页面不回显明文；要再复制，点列表里该行的「复制」。</p>'}
     ${t.id ? `<label>状态</label><select id="status"><option value="1"${t.status === 1 ? ' selected' : ''}>启用</option><option value="2"${t.status === 2 ? ' selected' : ''}>禁用</option></select>` : ''}`;
@@ -506,16 +506,73 @@ async function loadTokens(view) {
 
 // ---------------------------------------------------------------- 渠道
 
+// 模型重定向：JSON ↔「旧名:新名」对文本 的双向换算（GUI 显示对文本，存储仍是 JSON）。
+function modelMappingToPairs(jsonText) {
+  if (!jsonText) return '';
+  try {
+    const o = JSON.parse(jsonText);
+    return Object.entries(o).map(([k, v]) => `${k}:${v}`).join(', ');
+  } catch { return jsonText; }
+}
+function pairsToModelMapping(text) {
+  const t = (text || '').trim();
+  if (!t) return '';
+  if (t.startsWith('{')) { JSON.parse(t); return t; } // 兼容直接粘贴 JSON
+  const out = {};
+  for (const pair of t.split(',')) {
+    const i = pair.indexOf(':');
+    if (i <= 0) throw new Error(`模型重定向格式错误：「${pair.trim()}」（应为 旧名:新名，逗号分隔，如 gpt-4:gpt-4o）`);
+    out[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
+  }
+  return JSON.stringify(out);
+}
+
+// 价格覆盖：JSON ↔ 行格式「模型 | 输入 | 输出 | 读 | 写30m | 写12h」的双向换算。
+// 行后三列可省略（省略的字段不进 PriceSpec = 按其默认规则计）。
+function priceConfigToLines(jsonText) {
+  if (!jsonText) return '';
+  try {
+    const o = JSON.parse(jsonText);
+    return Object.entries(o).map(([m, s]) => {
+      const cols = [m, s.in ?? '', s.out ?? ''];
+      if (s.cached_in !== undefined || s.cache_write_5m !== undefined || s.cache_write_1h !== undefined) cols.push(s.cached_in ?? '');
+      if (s.cache_write_5m !== undefined || s.cache_write_1h !== undefined) cols.push(s.cache_write_5m ?? '');
+      if (s.cache_write_1h !== undefined) cols.push(s.cache_write_1h ?? '');
+      return cols.join(' | ');
+    }).join('\n');
+  } catch { return jsonText; }
+}
+function linesToPriceConfig(text) {
+  const t = (text || '').trim();
+  if (!t) return '';
+  if (t.startsWith('{')) { JSON.parse(t); return t; } // 兼容直接粘贴 JSON
+  const out = {};
+  for (const line of t.split('\n')) {
+    const cols = line.split('|').map((s) => s.trim()).filter((s) => s !== '');
+    if (!cols.length) continue;
+    if (cols.length < 3) throw new Error(`价格覆盖行格式错误：「${line.trim()}」（至少：模型 | 输入 | 输出，用 | 分隔）`);
+    const [m, i2, o2, cr, cw5, cw1] = cols;
+    const spec = { in: i2, out: o2 };
+    if (cr !== undefined) spec.cached_in = cr;
+    if (cw5 !== undefined) spec.cache_write_5m = cw5;
+    if (cw1 !== undefined) spec.cache_write_1h = cw1;
+    out[m] = spec;
+  }
+  if (!Object.keys(out).length) throw new Error('价格覆盖为空（要清空请提交 {}）');
+  return JSON.stringify(out);
+}
+
 async function pageChannels(view) {
   const [rows, meta] = await Promise.all([api('/channels'), api('/channels/meta')]);
   const STATUS = { 1: ['启用', 'ok'], 2: ['手动禁用', 'err'], 3: ['自动禁用', 'warn'] };
 
   view.replaceChildren($(`<div class="card">
     <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">渠道</h2><button class="primary" id="new">新建渠道</button></div>
-    ${table(['ID', '名称', '类型', '状态', '优先级/权重', '模型', '已用', '响应', '操作'], rows, (ch) => `<tr>
+    ${table(['ID', '名称', '类型', '状态', '优先级/权重', '分组', '模型', '已用', '响应', '操作'], rows, (ch) => `<tr>
       <td>${ch.id}</td><td>${esc(ch.name)}</td><td>${esc(ch.type)}</td>
       <td><span class="tag ${STATUS[ch.status]?.[1] || ''}">${STATUS[ch.status]?.[0] || ch.status}</span></td>
       <td>${ch.priority} / ${ch.weight}</td>
+      <td>${esc(ch.group || 'default')}</td>
       <td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${esc(ch.models)}</td>
       <td>${usd(ch.used_quota)}</td><td>${ch.response_time ? ch.response_time + 'ms' : '—'}</td>
       <td style="white-space:nowrap"><button data-test="${ch.id}">测试</button> <button data-edit="${ch.id}">编辑</button> <button class="danger" data-del="${ch.id}">删除</button></td></tr>`)}
@@ -537,11 +594,13 @@ async function pageChannels(view) {
       <div><label>优先级（大者优先）</label><input id="priority" type="number" value="${ch.priority ?? 0}"></div>
       <div><label>权重（同优先级内随机）</label><input id="weight" type="number" min="1" value="${ch.weight ?? 1}"></div>
       <div><label>状态</label><select id="status"><option value="1"${ch.status === 1 ? ' selected' : ''}>启用</option><option value="2"${ch.status === 2 ? ' selected' : ''}>禁用</option></select></div>
+      <div><label>分组（轻量标签，供令牌渠道 ACL 按组指定）</label><input id="group" value="${esc(ch.group || 'default')}"></div>
     </div>
-    <label>模型重定向 JSON（可选，如 {"gpt-4":"gpt-4o"}）</label><textarea id="model_mapping">${esc(ch.model_mapping || '')}</textarea>
-    <label>价格覆盖 JSON（可选，仅本渠道生效：渠道价 &gt; 全局覆盖 &gt; 内置表）</label>
-    <textarea id="price_config" placeholder='{"glm-5.3-flash":{"in":0.15,"out":0.5,"cached_in":0.03},"my-model":{"in":"4*(context>272k?2:1)","out":20}}'>${ch.price_config && typeof ch.price_config === 'object' ? esc(JSON.stringify(ch.price_config, null, 2)) : ''}</textarea>
-    <p class="muted" style="margin:4px 0 0">键是<b>模型列表里写的名字</b>（请求名）；路由到本渠道就按这里的价。留空 = 不修改（新建时留空 = 无覆盖）；提交 <code>{}</code> 表示清空。</p>
+    <label>模型重定向（可选；每对 旧名:新名，逗号分隔，如 gpt-4:gpt-4o, a:b——也可直接粘贴 JSON）</label><textarea id="model_mapping">${modelMappingToPairs(ch.model_mapping)}</textarea>
+    <label>价格覆盖（仅本渠道生效：渠道价 &gt; 全局覆盖 &gt; 内置表）。每行一个模型：<code>模型 | 输入 | 输出 | 读 | 写30m | 写12h</code>（后三列可省略；值可写数字或费率表达式）</label>
+    <textarea id="price_config" placeholder='deepseek-v4.1-flash | (高峰判断?0.3:0.15) | 1.2 | 0.006
+glm-5.3 | 1.4 | 4.4 | 0.26'>${priceConfigToLines(ch.price_config)}</textarea>
+    <p class="muted" style="margin:4px 0 0">键是<b>模型列表里写的名字</b>（请求名）；路由到本渠道就按这里的价。留空 = 不修改（新建时留空 = 无覆盖）。也兼容直接粘贴 JSON 对象（提交 <code>{}</code> = 清空）。</p>
     <label>渠道额外配置 JSON（可选，如 {"api_version":"2024-10-21"}）</label><textarea id="config">${esc(ch.config || '')}</textarea>
     <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input type="checkbox" id="decisions" style="width:auto"> 此渠道承载决策接口（客户端 <code>POST /v1/decisions</code>）</label>
     <input id="decisions_path" placeholder="出站路径，默认 alpha/decisions（如 decide、systemone）">
@@ -644,7 +703,7 @@ async function pageChannels(view) {
   };
 
   const collect = (dlg) => {
-    for (const f of ['model_mapping', 'config']) {
+    for (const f of ['config']) {
       const v = val(dlg, f).trim();
       if (v) { try { JSON.parse(v); } catch { throw new Error(`${f} 不是合法 JSON`); } }
     }
@@ -652,18 +711,13 @@ async function pageChannels(view) {
       name: val(dlg, 'name'), type: val(dlg, 'type'), key: val(dlg, 'key'),
       base_url: val(dlg, 'base_url').trim(), models: val(dlg, 'models').trim(),
       priority: Number(val(dlg, 'priority')) || 0, weight: Number(val(dlg, 'weight')) || 1,
-      status: Number(val(dlg, 'status')),
-      model_mapping: val(dlg, 'model_mapping').trim(), config: val(dlg, 'config').trim(),
+      status: Number(val(dlg, 'status')), group: val(dlg, 'group').trim() || 'default',
+      model_mapping: pairsToModelMapping(val(dlg, 'model_mapping')), config: val(dlg, 'config').trim(),
       system_prompt: val(dlg, 'system_prompt'),
     };
-    // 价格覆盖：留空 = 不修改（新建时 = 无覆盖）；有内容 = JSON 对象整包提交（{} = 清空）。
+    // 价格覆盖：行格式（或直接粘贴 JSON）。留空 = 不修改（新建时 = 无覆盖）；{} = 清空。
     const raw = val(dlg, 'price_config').trim();
-    if (raw) {
-      let pc;
-      try { pc = JSON.parse(raw); } catch { throw new Error('价格覆盖不是合法 JSON'); }
-      if (!pc || typeof pc !== 'object' || Array.isArray(pc)) throw new Error('价格覆盖必须是 JSON 对象');
-      body.price_config = pc;
-    }
+    if (raw) body.price_config = linesToPriceConfig(raw);
     // 决策接口：decisions 类型只落 decisions_path（类型本身就是声明）；
     // openai 形状渠道按开关写 decisions / decisions_path。
     const dec = dlg.querySelector('#decisions');
@@ -1309,8 +1363,8 @@ async function pageSettings(view) {
         <div><label>渠道冷却上限（秒）</label><input id="ChannelCooldownMaxSec" type="number" min="0" value="${cur.ChannelCooldownMaxSec ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.ChannelCooldownMaxSec ?? '—')}</p></div>
       </div>
       <label><input type="checkbox" id="HealthEventsEnabled" style="width:auto" ${cur.HealthEventsEnabled ? 'checked' : ''}> 记录健康事件（失败请求写入 relay_events，供健康页统计）</label>
-      <label>仅决策接口的模型（JSON 数组，如 ["~typesafe/jev-latest", "foo/decide-x"]）</label>
-      <textarea id="DecisionOnlyModels">${esc(JSON.stringify(cur.DecisionOnlyModels ?? [], null, 2))}</textarea>
+      <label>仅决策接口的模型（逗号分隔，如 ~typesafe/jev-latest, foo/decide-x）</label>
+      <textarea id="DecisionOnlyModels">${esc((cur.DecisionOnlyModels ?? []).join(', '))}</textarea>
       <p class="muted" style="margin:4px 0 0">列在这里的模型不会出现在 <code>/v1/models</code>，发去 <code>/v1/chat/completions</code> 会被明确拒绝，只能走 <code>POST /v1/decisions</code>。<b>Decision API / System One 类型的渠道无需在此声明——模型已自动视为决策模型。</b>这里只用于：内置规则（自动识别 <code>jev</code> 前缀）之外、挂在 OpenAI 形状渠道上的决策模型——不声明会被当普通 chat 模型暴露，chat 请求发上游多半 404，决策请求则被 400 拒绝。</p>
       <div style="margin-top:12px"><button class="primary" id="saveOpts">保存系统设置</button></div>
     </div>
@@ -1333,7 +1387,7 @@ async function pageSettings(view) {
         ChannelCooldownBaseSec: num(val(document, 'ChannelCooldownBaseSec')),
         ChannelCooldownMaxSec: num(val(document, 'ChannelCooldownMaxSec')),
         HealthEventsEnabled: document.getElementById('HealthEventsEnabled').checked,
-        DecisionOnlyModels: JSON.parse(val(document, 'DecisionOnlyModels') || '[]'),
+        DecisionOnlyModels: val(document, 'DecisionOnlyModels').split(',').map((s) => s.trim()).filter(Boolean),
       };
       await api('/options', { method: 'PUT', body });
       state.status = await api('/status');

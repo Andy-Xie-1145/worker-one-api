@@ -78,6 +78,11 @@ export interface ChannelRow {
   base_url: string;
   balance: number;
   models: string;
+  /**
+   * 轻量分组标签（复用 0015 保留的遗留列；无任何倍率语义）。
+   * 供令牌渠道 ACL 按组名匹配：ACL 条目里的字符串与它相等即命中。
+   */
+  group: string;
   used_quota: number;
   model_mapping: string;
   config: string;

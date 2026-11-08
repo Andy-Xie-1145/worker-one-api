@@ -38,17 +38,17 @@ const TOKEN_FIELDS: Record<string, { column: string; norm: (v: string) => unknow
   unlimited: { column: 'unlimited_quota', norm: (v) => (['1', 'true', 'on', 'yes'].includes(v.toLowerCase()) ? 1 : 0) },
   status: { column: 'status', norm: (v) => ({ '1': 1, on: 1, enable: 1, '2': 2, off: 2, disable: 2 })[v] ?? null },
   expired: { column: 'expired_time', norm: (v) => Number(v) },
-  // 渠道 ACL：channels_acl=whitelist:1,2（只允许）| blacklist:3（禁止）| off（清除 = 不限制）。
-  // 白名单冒号后留空 = 全禁（等价禁用该令牌）。
+  // 渠道 ACL：channels_acl=whitelist:1,2,cn（只允许；条目=渠道 ID 或 分组名）|
+  // blacklist:3（禁止）| off（清除 = 不限制）。白名单冒号后留空 = 全禁（等价禁用该令牌）。
   channels_acl: {
     column: 'channel_acl',
     norm: (v) => {
       const t = v.trim().toLowerCase();
       if (!t || t === 'off' || t === 'none') return '';
-      const m = /^(whitelist|blacklist)\s*:\s*([\d,\s]*)$/.exec(t);
+      const m = /^(whitelist|blacklist)\s*:\s*([\w,\s\-]*)$/.exec(t);
       if (!m) return null;
-      const ids = m[2].split(',').map((x) => Number(x.trim())).filter((n) => Number.isInteger(n) && n > 0);
-      return JSON.stringify({ mode: m[1], channels: [...new Set(ids)].sort((a, b) => a - b) });
+      const ids = m[2].split(',').map((x) => x.trim()).filter((x) => x && (Number.isInteger(Number(x)) && Number(x) > 0 || /[a-z_]/.test(x)));
+      return JSON.stringify({ mode: m[1], channels: [...new Set(ids)].sort() });
     },
   },
 };

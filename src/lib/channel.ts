@@ -12,14 +12,16 @@ export function csv(value: string): string[] {
 
 export interface TokenChannelAcl {
   mode: 'whitelist' | 'blacklist';
-  channels: number[];
+  /** 条目：数字 = 渠道 ID；字符串 = 渠道分组名（channels."group"）。两者可混用。 */
+  channels: Array<number | string>;
 }
 
 /**
  * 解析令牌的渠道 ACL（tokens.channel_acl，JSON 文本）。三种返回：
  *   - null          ：未配置（'' / null），所有启用渠道参与选路；
- *   - {mode,channels}：合法配置。语义：whitelist 只允许 channels 内的渠道（空数组 =
- *     禁止任何渠道，等价禁用）；blacklist 禁止 channels 内的渠道（空数组 = 全放）；
+ *   - {mode,channels}：合法配置。条目匹配：渠道 ID 相等 **或** 渠道分组名相等。
+ *     语义：whitelist 只允许匹配条目的渠道（无匹配条目 = 禁止任何渠道，等价禁用）；
+ *     blacklist 禁止匹配条目的渠道（无条目 = 全放）；
  *   - 损坏的 JSON   ：**宁可关不可开**——按「白名单且为空」（全禁）处理并喊日志。
  *     这是访问控制，坏配置静默放行等于ACL 失效；流量恢复靠管理员修好 JSON。
  */
@@ -36,14 +38,16 @@ export function parseTokenAcl(raw: string | null | undefined): TokenChannelAcl |
     console.error(`[acl] 令牌 channel_acl 损坏，按全禁处理：${s.slice(0, 80)}`);
     return { mode: 'whitelist', channels: [] };
   }
-  const rawIds = (Array.isArray(p.channels) ? p.channels : []) as unknown[];
-  const channels = [...new Set(rawIds.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
-  return { mode: p.mode === 'whitelist' ? 'whitelist' : 'blacklist', channels };
+  const rawEntries = (Array.isArray(p.channels) ? p.channels : []) as unknown[];
+  const ids = [...new Set(rawEntries.filter((n): n is number => typeof n === 'number' && Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
+  const names = [...new Set(rawEntries.filter((n): n is string => typeof n === 'string' && n.trim() !== '').map((n) => n.trim()))].sort();
+  return { mode: p.mode === 'whitelist' ? 'whitelist' : 'blacklist', channels: [...ids, ...names] };
 }
 
 /**
  * 管理入口（API/CLI）写入前的校验：接受 {mode, channels} 对象或 null（清除），
- * 返回规范化 JSON 文本。白名单/黑名单互斥由结构保证——一个对象只有一个 mode。
+ * channels 条目 = 渠道 ID（正整数）或 分组名（非空字符串），可混用；返回规范化 JSON。
+ * 白名单/黑名单互斥由结构保证——一个对象只有一个 mode。
  * 已存储的 JSON 字符串原样回传时也能通过（重校验一遍，坏存储会被拦在门外）。
  */
 export function validateTokenAclInput(value: unknown): { ok: true; json: string } | { ok: false; error: string } {
@@ -61,9 +65,10 @@ export function validateTokenAclInput(value: unknown): { ok: true; json: string 
   if (typeof value !== 'object' || Array.isArray(value)) return { ok: false, error: 'channel_acl 需传对象 {mode, channels} 或 null（清除）' };
   const v = value as Record<string, unknown>;
   if (v.mode !== 'whitelist' && v.mode !== 'blacklist') return { ok: false, error: "channel_acl.mode 只能是 'whitelist' 或 'blacklist'（两模式互斥，由结构保证不能同时设置）" };
-  if (!Array.isArray(v.channels)) return { ok: false, error: 'channel_acl.channels 必须是渠道 ID 数组（白名单可为空数组 = 全禁）' };
-  const ids = [...new Set(v.channels.map((n: any) => Number(n)).filter((n: number) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
-  return { ok: true, json: JSON.stringify({ mode: v.mode, channels: ids }) };
+  if (!Array.isArray(v.channels)) return { ok: false, error: 'channel_acl.channels 必须是数组（条目 = 渠道 ID 或 分组名；白名单可为空数组 = 全禁）' };
+  const ids = [...new Set(v.channels.filter((n): n is number => typeof n === 'number' && Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
+  const names = [...new Set(v.channels.filter((n): n is string => typeof n === 'string' && n.trim() !== '').map((n) => n.trim()))].sort();
+  return { ok: true, json: JSON.stringify({ mode: v.mode, channels: [...ids, ...names] }) };
 }
 
 /**
@@ -124,13 +129,30 @@ export async function selectChannel(
 
   /*
    * 令牌级渠道 ACL（白/黑名单），在冷却/熔断检查**之前**——不允许的渠道连冷却
-   * 状态都不必查。白名单空 = 全禁（allowed.length === 0 → null → 503 no_channel）；
-   * 黑名单空 = 全放（过滤后原样）。过滤发生在候选生成阶段，重试/failover 的每一轮
-   * 都带同一份 ACL，被排除的渠道永远不会被选中。
+   * 状态都不必查。条目 = 渠道 ID 或 分组名（channels."group"，轻量分组，无倍率）。
+   * 白名单无匹配条目 = 全禁（null → 503 no_channel）；黑名单空 = 全放。
+   * 过滤发生在候选生成阶段，重试/failover 的每一轮都带同一份 ACL。
    */
   if (acl) {
-    const ids = acl.channels;
-    const allowed = acl.mode === 'whitelist' ? candidates.filter((r) => ids.includes(r.channel_id)) : candidates.filter((r) => !ids.includes(r.channel_id));
+    const match = (id: number): boolean => {
+      const byId = acl.channels.some((c) => typeof c === 'number' && c === id);
+      if (byId) return true;
+      const hasNames = acl.channels.some((c) => typeof c === 'string');
+      if (!hasNames) return false;
+      const row = channelGroups.get(id);
+      return row !== undefined && acl.channels.includes(row);
+    };
+    // 分组匹配需要候选渠道的分组名：一次批量查询（只有 ACL 条目含组名时才查）。
+    const channelGroups = acl.channels.some((c) => typeof c === 'string')
+      ? await (async () => {
+          const ids = candidates.map((r) => r.channel_id);
+          const rows2 = ids.length
+            ? await env.DB.prepare(`SELECT id, "group" FROM channels WHERE id IN (${ids.map(() => '?').join(',')})`).bind(...ids).all<{ id: number; group: string }>()
+            : { results: [] as Array<{ id: number; group: string }> };
+          return new Map((rows2.results ?? []).map((r) => [r.id, r.group ?? '']));
+        })()
+      : new Map<number, string>();
+    const allowed = candidates.filter((r) => (acl.mode === 'whitelist' ? match(r.channel_id) : !match(r.channel_id)));
     if (!allowed.length) return null;
     candidates = allowed;
   }

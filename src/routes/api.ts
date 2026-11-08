@@ -467,6 +467,8 @@ function channelFromBody(b: any, existing?: ChannelRow): { ch: Omit<ChannelRow, 
       priority: Number(b.priority ?? existing?.priority ?? 0),
       base_url: String(b.base_url ?? existing?.base_url ?? ''),
       models: String(b.models ?? existing?.models ?? ''),
+      // 轻量分组标签（无倍率语义）：供令牌渠道 ACL 按组名匹配；留空归 'default'。
+      group: String(b.group ?? existing?.group ?? 'default').trim() || 'default',
       model_mapping: String(b.model_mapping ?? existing?.model_mapping ?? ''),
       config: String(b.config ?? existing?.config ?? ''),
       system_prompt: String(b.system_prompt ?? existing?.system_prompt ?? ''),
@@ -483,9 +485,9 @@ api.post('/channels', requireAdmin, async (c) => {
   if (!ch.models) return c.json(fail('至少填写一个模型'), 400);
 
   await c.env.DB.prepare(
-    'INSERT INTO channels (type, key, status, name, weight, priority, created_time, base_url, models, model_mapping, config, system_prompt, price_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO channels (type, key, status, name, weight, priority, created_time, base_url, models, "group", model_mapping, config, system_prompt, price_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   )
-    .bind(ch.type, ch.key, ch.status, ch.name, ch.weight, ch.priority, now(), ch.base_url, ch.models, ch.model_mapping, ch.config, ch.system_prompt, ch.price_config)
+    .bind(ch.type, ch.key, ch.status, ch.name, ch.weight, ch.priority, now(), ch.base_url, ch.models, ch.group, ch.model_mapping, ch.config, ch.system_prompt, ch.price_config)
     .run();
 
   const created = await c.env.DB.prepare('SELECT * FROM channels ORDER BY id DESC LIMIT 1').first<ChannelRow>();
@@ -501,9 +503,9 @@ api.put('/channels/:id', requireAdmin, async (c) => {
   const { ch, priceError } = channelFromBody(await c.req.json<any>(), existing);
   if (priceError) return c.json(fail(priceError), 400);
   await c.env.DB.prepare(
-    'UPDATE channels SET type = ?, key = ?, status = ?, name = ?, weight = ?, priority = ?, base_url = ?, models = ?, model_mapping = ?, config = ?, system_prompt = ?, price_config = ? WHERE id = ?',
+    'UPDATE channels SET type = ?, key = ?, status = ?, name = ?, weight = ?, priority = ?, base_url = ?, models = ?, "group" = ?, model_mapping = ?, config = ?, system_prompt = ?, price_config = ? WHERE id = ?',
   )
-    .bind(ch.type, ch.key, ch.status, ch.name, ch.weight, ch.priority, ch.base_url, ch.models, ch.model_mapping, ch.config, ch.system_prompt, ch.price_config, id)
+    .bind(ch.type, ch.key, ch.status, ch.name, ch.weight, ch.priority, ch.base_url, ch.models, ch.group, ch.model_mapping, ch.config, ch.system_prompt, ch.price_config, id)
     .run();
 
   const updated = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<ChannelRow>();

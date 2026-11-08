@@ -65,7 +65,7 @@ function makeDB(w: World) {
       const rows = enabled ? w.abilities.filter((a) => a.enabled === 1) : w.abilities;
       return { results: [...new Set(rows.map((a) => a.model))].sort().map((model) => ({ model })) };
     }
-    if (/FROM abilities WHERE model = \? AND enabled = 1/.test(one)) {
+    if (/FROM abilities WHERE model (IN \(.*\)|= \?) AND enabled = 1/.test(one)) {
       return { results: w.abilities.filter((a) => a.model === binds[0] && a.enabled === 1) };
     }
     if (/^SELECT \* FROM channels WHERE id = \?/.test(one)) {

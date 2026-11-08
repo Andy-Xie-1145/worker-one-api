@@ -47,6 +47,13 @@ export interface Options {
    * **只增不减**：内置规则不能靠它关掉，否则一条配置就能把 Jev 放回聊天路上。
    */
   DecisionOnlyModels: string[];
+  /**
+   * 模型别名组（轻量分组，无倍率语义）：`[["deepseek-v4.1-flash","deepseek-v4-flash"], …]`。
+   * 并查集语义：组内名字视为同一个模型；跨组重名自动联通。
+   * 用途：路由按块匹配渠道、上游名翻译为渠道拥有的成员、令牌 models 拥有块内
+   * 任一名字即拥有全块。编辑入口：后台「模型别名」页。
+   */
+  AliasGroups: string[][];
 }
 
 export const DEFAULT_OPTIONS: Options = {
@@ -59,6 +66,7 @@ export const DEFAULT_OPTIONS: Options = {
   ModelPriceOverride: {},
   DefaultPrice: { in: 1, out: 3 },
   DecisionOnlyModels: [],
+  AliasGroups: [],
 };
 
 /** Options are read on nearly every request, so they are KV-cached for KV_TTL seconds.

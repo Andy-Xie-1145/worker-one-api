@@ -241,6 +241,7 @@ const PAGES = {
   channels: ['渠道', pageChannels],
   pricing: ['价格', pagePricing],
   billing: ['模型计费', pageModelBilling],
+  aliases: ['模型别名', pageAliases],
   health: ['健康', pageHealth],
   logs: ['日志', pageLogs],
   terminal: ['终端', pageTerminal],
@@ -1504,6 +1505,46 @@ async function pageTerminal(view) {
   };
 
   input.focus();
+}
+
+// ---------------------------------------------------------------- 模型别名
+
+/**
+ * 别名组管理（并查集语义，无倍率）：组内名字视为同一个模型。
+ * 生效延迟 ≤60s（options KV 缓存 TTL）。
+ */
+async function pageAliases(view) {
+  const opts = await api('/options');
+  const current = Array.isArray(opts.current?.AliasGroups) ? opts.current.AliasGroups : [];
+  let groups = current.map((g) => (Array.isArray(g) ? g.map((n) => String(n)) : []));
+
+  view.replaceChildren($(`<div class="card">
+    <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">模型别名</h2><button class="primary" id="addGroup">＋ 新增别名组</button></div>
+    <p class="muted" style="margin:0 0 10px">同一组的名字视为<b>同一个模型</b>（并查集，跨组重名自动合并为一个联通块）：调用组内<b>任意</b>名字都会路由到「拥有组内名字」的渠道，并自动翻译成该渠道自己的叫法；令牌模型白名单拥有组内<b>任一</b>名字即拥有全组。无倍率语义，保存为整包替换，生效延迟 ≤60s。</p>
+    <div id="aliasGroups"></div>
+    <div style="margin-top:12px"><button class="primary" id="saveAliases">保存全部</button></div>
+  </div>`));
+
+  const render = () => {
+    const el = document.getElementById('aliasGroups');
+    el.innerHTML = groups.length ? groups.map((names, i) => `
+      <div class="card" style="margin:0 0 10px">
+        <div class="row" style="margin-bottom:6px"><b>别名组 ${i + 1}</b><button class="danger" data-del="${i}" style="margin-left:auto">删除组</button></div>
+        <input data-names value="${esc(names.join(', '))}" placeholder="名字，逗号分隔，例：deepseek-v4.1-flash, deepseek-v4-flash">
+      </div>`).join('') : '<p class="muted">暂无别名组。点「＋ 新增别名组」创建。</p>';
+    el.querySelectorAll('[data-del]').forEach((b) => (b.onclick = () => { groups.splice(Number(b.dataset.del), 1); render(); }));
+  };
+  render();
+
+  document.getElementById('addGroup').onclick = () => { groups.push([]); render(); };
+  document.getElementById('saveAliases').onclick = async () => {
+    const parsed = [...document.getElementById('aliasGroups').querySelectorAll('[data-names]')]
+      .map((inp) => inp.value.split(',').map((s) => s.trim()).filter(Boolean)).filter((g) => g.length);
+    try {
+      await api('/options', { method: 'PUT', body: { AliasGroups: parsed } });
+      toast('别名已保存（生效延迟 ≤60s）', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+  };
 }
 
 // ---------------------------------------------------------------- 设置

@@ -2,6 +2,7 @@ import { type Env, type ChannelRow, ChannelStatusEnabled } from '../types';
 import { getCooling } from './cooldown';
 import { getDenied403, UNKNOWN_COLO, type Deny403Entry } from './deny403';
 import type { PriceSpec } from './pricing/llm';
+import { componentOf, type AliasIndex } from './alias';
 
 export function csv(value: string): string[] {
   return (value ?? '')
@@ -102,7 +103,7 @@ export async function deleteAbilities(env: Env, channelId: number): Promise<void
  * 恢复探测只发生在记录过期、渠道重新进入正常候选之后。
  */
 export type ChannelSelection =
-  | { kind: 'channel'; channel: ChannelRow }
+  | { kind: 'channel'; channel: ChannelRow; /** 别名解析后，该渠道在 abilities 里拥有的成员名（无别名 = 请求名）。 */ matchedModel: string }
   | { kind: 'all_denied_403'; earliest: Deny403Entry };
 
 /**
@@ -110,6 +111,10 @@ export type ChannelSelection =
  * random pick inside that tier. `exclude` carries channels already tried in
  * this request so retries land somewhere else. `colo` scopes the 403
  * soft-breaker (见 lib/deny403.ts)：同一渠道换个机房/模型不受另一处的熔断牵连。
+ *
+ * `aliasIndex`（模型别名并查集）：请求名展开为联通块全部成员，候选 = 拥有其中
+ * **任意**成员的渠道（每渠道取字典序最小成员，避免同渠道多成员重复计数）；
+ * matchedModel 带回该成员，出站名用它（= 翻译成渠道自己拥有的叫法）。
  */
 export async function selectChannel(
   env: Env,
@@ -117,14 +122,23 @@ export async function selectChannel(
   exclude: number[] = [],
   colo: string = UNKNOWN_COLO,
   acl?: TokenChannelAcl | null,
+  aliasIndex?: AliasIndex | null,
 ): Promise<ChannelSelection | null> {
+  const members = aliasIndex ? componentOf(aliasIndex, model) : [model];
   const rows = await env.DB.prepare(
-    'SELECT channel_id, priority, weight FROM abilities WHERE model = ? AND enabled = 1',
+    `SELECT model, channel_id, priority, weight FROM abilities WHERE model IN (${members.map(() => '?').join(',')}) AND enabled = 1 ORDER BY model`,
   )
-    .bind(model)
-    .all<{ channel_id: number; priority: number; weight: number }>();
+    .bind(...members)
+    .all<{ model: string; channel_id: number; priority: number; weight: number }>();
 
-  let candidates = (rows.results ?? []).filter((r) => !exclude.includes(r.channel_id));
+  // 每渠道取一个成员（同渠道多个成员同组时按字典序取首个，不重复计数）。
+  const seenCh = new Set<number>();
+  let candidates: Array<{ model: string; channel_id: number; priority: number; weight: number }> = [];
+  for (const r of rows.results ?? []) {
+    if (seenCh.has(r.channel_id) || exclude.includes(r.channel_id)) continue;
+    seenCh.add(r.channel_id);
+    candidates.push(r);
+  }
   if (!candidates.length) return null;
 
   /*
@@ -205,7 +219,7 @@ export async function selectChannel(
   const channel = await env.DB.prepare('SELECT * FROM channels WHERE id = ? AND status = ?')
     .bind(picked.channel_id, ChannelStatusEnabled)
     .first<ChannelRow>();
-  return channel ? { kind: 'channel', channel } : null;
+  return channel ? { kind: 'channel', channel, matchedModel: picked.model } : null;
 }
 
 /** Applies the channel's model_mapping JSON, e.g. {"gpt-4":"gpt-4o"}. */

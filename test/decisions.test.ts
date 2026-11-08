@@ -103,7 +103,7 @@ function makeDB(w: World) {
       const models = [...new Set(scoped.map((a) => a.model))].sort();
       return { results: models.map((model) => ({ model })) };
     }
-    if (/FROM abilities WHERE model = \? AND enabled = 1/.test(one)) {
+    if (/FROM abilities WHERE model (IN \(.*\)|= \?) AND enabled = 1/.test(one)) {
       return { results: w.abilities.filter((a) => a.model === binds[0] && a.enabled !== 0) };
     }
     if (/^SELECT \* FROM channels WHERE id = \?/.test(one)) {

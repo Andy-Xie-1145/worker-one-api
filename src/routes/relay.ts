@@ -10,6 +10,7 @@ import {
 } from '../lib/pricing';
 import type { ProbeContext } from '../lib/pricing/expr';
 import { selectChannel, mapModel, parseConfig, listModels, csv, parseChannelPriceConfig, parseTokenAcl } from '../lib/channel';
+import { getAliasIndex, componentOf } from '../lib/alias';
 import { markRateLimited, clearRateLimit } from '../lib/cooldown';
 import {
   markDenied403, clearDenied403, extractDeniedMessage, UNKNOWN_COLO, DENY_403_FALLBACK_MESSAGE,
@@ -64,13 +65,19 @@ relay.get('/models', async (c) => {
   // decisions 类型渠道上的模型自动按决策模型分诊（与请求时分诊同一份规则）。
   const models = filterByCapability(await listModels(c.env), capability, options, await channelDeclaredDecisionOnly(c.env));
   const allowed = csv(auth.token.models);
-  const visible = allowed.length ? models.filter((m) => allowed.includes(m)) : models;
+  let visible = models;
+  if (allowed.length) {
+    // 别名联通块展开：块内任一名字在令牌白名单 = 全块可见（可用别名一并列出）。
+    const index = await getAliasIndex(c.env);
+    const expanded = new Set<string>();
+    for (const name of allowed) for (const m of componentOf(index, name)) expanded.add(m);
+    visible = models.filter((m) => expanded.has(m));
+  }
   return c.json({
     object: 'list',
     data: visible.map((id) => ({ id, object: 'model', created: 1700000000, owned_by: 'one-api' })),
   });
 });
-
 relay.get('/models/:model', (c) =>
   c.json({ id: c.req.param('model'), object: 'model', created: 1700000000, owned_by: 'one-api' }),
 );
@@ -291,9 +298,16 @@ async function handleRelay(
   const requestedModel = String(body.model ?? '');
   if (!requestedModel) return fail('缺少 model 字段', 'invalid_request_error', 400);
 
+  // 别名并查集：一次解析（options 走 KV 缓存），授权检查与选路共用同一份。
+  const aliasIndex = await getAliasIndex(c.env);
+
   const allowed = csv(token.models);
-  if (allowed.length && !allowed.includes(requestedModel)) {
-    return fail(`令牌无权访问模型 ${requestedModel}`, 'permission_error', 403);
+  if (allowed.length) {
+    // 别名联通块展开：令牌拥有块内任一名字 = 拥有全块——请求块内任意别名都放行。
+    const members = componentOf(aliasIndex, requestedModel);
+    if (!members.some((m) => allowed.includes(m))) {
+      return fail(`令牌无权访问模型 ${requestedModel}`, 'permission_error', 403);
+    }
   }
 
   const options = await getOptions(c.env);
@@ -410,7 +424,7 @@ async function handleRelay(
 
   while (quotaAttempts < maxAttempts) {
     const attempt = round++;
-    const selection = await selectChannel(c.env, requestedModel, tried, colo, channelAcl);
+    const selection = await selectChannel(c.env, requestedModel, tried, colo, channelAcl, aliasIndex);
     if (!selection) {
       /*
        * 「没有可用渠道」必须带着**客户端请求的那个模型串**落库。
@@ -469,6 +483,8 @@ async function handleRelay(
 
     const channel = selection.channel;
     tried.push(channel.id);
+    // 别名解析出的成员：该渠道在 abilities 里实际拥有的名字（出站就用它）。
+    const servedModel = selection.matchedModel ?? requestedModel;
 
     /*
      * 计费身份 + 费率，在发出任何上游请求、动任何一分钱之前解析。
@@ -481,7 +497,7 @@ async function handleRelay(
      * 循环必然结束。`stage: 'pricing'` 的事件让「哪个模型没配价/哪条表达式坏了」
      * 直接落在健康页里，不用开 tail 蹲现场。
      */
-    const upstreamModel = mapModel(channel, requestedModel);
+    const upstreamModel = mapModel(channel, servedModel);
     const identity = resolveBillableModel(requestedModel, upstreamModel, options, parseChannelPriceConfig(channel));
     if (!identity) {
       events.push({
@@ -548,7 +564,7 @@ async function handleRelay(
 
     const attemptStarted = Date.now();
     const result = await attemptUpstream(c, {
-      channel, body, requestedModel, mode, path, token, user, options, decisionsDialect, reservation, started, protocol,
+      channel, body, requestedModel, servedModel, mode, path, token, user, options, decisionsDialect, reservation, started, protocol,
     });
     if (result.kind === 'ok') {
       // 成功即清掉退避计数，否则偶发限流会让这个渠道一直踩着上次的档位往上爬
@@ -567,7 +583,7 @@ async function handleRelay(
       stage: result.stage,
       status: result.status,
       modelName: requestedModel,
-      upstreamModel: mapModel(channel, requestedModel),
+      upstreamModel: mapModel(channel, servedModel),
       channelId: channel.id,
       channelType: channel.type,
       userId: user.id,
@@ -669,6 +685,8 @@ interface AttemptArgs {
   channel: ChannelRow;
   body: ChatRequest;
   requestedModel: string;
+  /** 别名解析后该渠道实际拥有的成员名（无别名 = 请求名）。出站 body 与计费都用它。 */
+  servedModel: string;
   mode: RelayMode;
   path: string;
   token: TokenRow;
@@ -701,9 +719,9 @@ type AttemptResult =
   | { kind: 'error'; status: number; body: unknown; stage: 'build' | 'network' | 'upstream'; errorText: string };
 
 async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult> {
-  const { channel, body, requestedModel, mode, path, token, user, options, reservation, started, protocol } = args;
+  const { channel, body, requestedModel, servedModel, mode, path, token, user, options, reservation, started, protocol } = args;
 
-  const upstreamModel = mapModel(channel, requestedModel);
+  const upstreamModel = mapModel(channel, servedModel);
   const config = parseConfig(channel);
   const ctx: AdaptorContext = { channel, upstreamModel, requestedModel, mode, path, config };
   const adaptor = getAdaptor(channel.type);

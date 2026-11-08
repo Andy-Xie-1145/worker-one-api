@@ -134,8 +134,14 @@ function makeDB(w: World) {
       const models = [...new Set(w.abilities.filter((a) => a.enabled === 1).map((a) => a.model))].sort();
       return { results: models.map((model) => ({ model })) };
     }
-    if (/FROM abilities WHERE model = \? AND enabled = 1/.test(one)) {
-      return { results: w.abilities.filter((a) => a.model === binds[0] && a.enabled === 1) };
+    if (/FROM abilities WHERE model (IN \(.*\)|= \?) AND enabled = 1/.test(one)) {
+      // 兼容两种形状：精确 = ?（旧）与别名展开 IN (…)（新）。binds 里的字符串即成员名。
+      const wanted = binds.filter((b) => typeof b === 'string');
+      return {
+        results: w.abilities
+          .filter((a) => wanted.includes(a.model) && a.enabled === 1)
+          .sort((x, y) => x.model.localeCompare(y.model)),
+      };
     }
     if (/^SELECT \* FROM channels WHERE id = \?/.test(one)) {
       return w.channels.find((ch) => ch.id === binds[0] && ch.status === binds[1]) ?? null;

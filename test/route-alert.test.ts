@@ -84,7 +84,7 @@ function makeDB(w: World) {
       if (/RETURNING id/.test(one)) return { results: [{ id: 1 }] };
       return {};
     }
-    if (/FROM abilities WHERE model = \? AND enabled = 1/.test(one)) {
+    if (/FROM abilities WHERE model (IN \(.*\)|= \?) AND enabled = 1/.test(one)) {
       return { results: w.abilities.filter((a) => a.model === binds[0] && a.enabled === 1) };
     }
     if (/^SELECT \* FROM channels WHERE id = \?/.test(one)) {

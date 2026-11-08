@@ -36,6 +36,7 @@
     "test:maintenance-gate": "esbuild test/maintenance-gate.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/maintenance-gate.mjs --log-level=error && node node_modules/.cache/maintenance-gate.mjs",
     "test:usage-aliases": "esbuild test/usage-aliases.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/usage-aliases.mjs --log-level=error && node node_modules/.cache/usage-aliases.mjs",
     "test:token-channel-acl": "esbuild test/token-channel-acl.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/token-channel-acl.mjs --log-level=error && node node_modules/.cache/token-channel-acl.mjs",
+    "test:model-alias": "esbuild test/model-alias.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/model-alias.mjs --log-level=error && node node_modules/.cache/model-alias.mjs",
     "test:spa-build": "esbuild test/spa-build.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/spa-build.mjs --log-level=error && node node_modules/.cache/spa-build.mjs",
     "test:anthropic-inbound": "esbuild test/anthropic-inbound.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/anthropic-inbound.mjs --log-level=error && node node_modules/.cache/anthropic-inbound.mjs"
   },

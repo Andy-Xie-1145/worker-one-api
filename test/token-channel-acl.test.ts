@@ -37,10 +37,15 @@ function freshDB(): DatabaseSync {
 }
 
 function kvMock() {
-  const map = new Map<string, unknown>();
+  // 忠实仿真真 KV：put 存字符串，get 带 type:'json' 时解析（与生产 KV 一致）。
+  const map = new Map<string, string>();
   return {
-    get: async (k: string) => (map.has(k) ? map.get(k) : null),
-    put: async (k: string, v: unknown) => { map.set(k, v); },
+    get: async (k: string, type?: string) => {
+      if (!map.has(k)) return null;
+      const v = map.get(k)!;
+      return type === 'json' ? JSON.parse(v) : v;
+    },
+    put: async (k: string, v: unknown) => { map.set(k, typeof v === 'string' ? v : JSON.stringify(v)); },
     delete: async (k: string) => { map.delete(k); },
   };
 }

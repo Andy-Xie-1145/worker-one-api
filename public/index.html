@@ -483,6 +483,7 @@ async function loadTokens(view) {
     <p class="muted" style="margin:4px 0 0">价格按<b>渠道</b>配置（渠道页「价格覆盖」）——令牌混用渠道且有故障转移，在令牌上定价没有意义。</p>
     ${t.id ? '' : '<p class="muted" style="margin:4px 0 0">密钥创建后<b>自动进剪贴板</b>，页面不回显明文；要再复制，点列表里该行的「复制」。</p>'}
     ${t.id ? `<label>状态</label><select id="status"><option value="1"${t.status === 1 ? ' selected' : ''}>启用</option><option value="2"${t.status === 2 ? ' selected' : ''}>禁用</option></select>` : ''}`;
+  };
 
   const collect = (dlg) => {
     const aclmode = val(dlg, 'aclmode');

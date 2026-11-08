@@ -703,10 +703,11 @@ async function optCmd(env: Env, args: string[]): Promise<CliResult> {
 }
 
 async function logs(env: Env, n: number): Promise<CliResult> {
-  const rows = await env.DB.prepare('SELECT created_at, type, model_name, quota, content FROM logs ORDER BY id DESC LIMIT ?').bind(Math.min(50, Math.max(1, n))).all<any>();
+  const rows = await env.DB.prepare('SELECT created_at, type, model_name, upstream_model, quota, content FROM logs ORDER BY id DESC LIMIT ?').bind(Math.min(50, Math.max(1, n))).all<any>();
   const TYPE: Record<number, string> = { 1: '充值', 2: '消费', 3: '管理', 4: '系统' };
-  const table2 = table(['时间', '类型', '模型', '消耗', '详情'], (rows.results ?? []).map((l) => [
-    new Date(l.created_at * 1000).toISOString().slice(5, 16).replace('T', ' '), TYPE[l.type] ?? l.type, l.model_name || '—', usd(l.quota), String(l.content).slice(0, 60),
+  const table2 = table(['时间', '类型', '模型', '渠道模型', '消耗', '详情'], (rows.results ?? []).map((l) => [
+    new Date(l.created_at * 1000).toISOString().slice(5, 16).replace('T', ' '), TYPE[l.type] ?? l.type, l.model_name || '—',
+    l.upstream_model && l.upstream_model !== l.model_name ? l.upstream_model : '—', usd(l.quota), String(l.content).slice(0, 60),
   ]));
   return { ok: true, output: table2 || '（暂无日志）' };
 }

@@ -103,7 +103,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-09.1';
+const SPA_BUILD = '2026-11-09.2';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -1277,9 +1277,11 @@ async function pageLogs(view) {
 
   view.replaceChildren($(`<div class="card">
     <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">日志</h2><span class="muted">全站视角 · 最近 200 条</span></div>
-    ${table(['时间', '类型', '用户', '令牌', '模型', '输入', '输出', '耗时', '消耗', '详情'], rows, (l) => `<tr>
+    ${table(['时间', '类型', '用户', '令牌', '模型', '渠道模型', '输入', '输出', '耗时', '消耗', '详情'], rows, (l) => `<tr>
       <td>${ts(l.created_at)}</td><td>${TYPE[l.type] || l.type}</td><td>${esc(l.username)}</td><td>${esc(l.token_name)}</td>
-      <td class="mono">${esc(l.model_name)}</td><td>${l.prompt_tokens}</td><td>${l.completion_tokens}</td>
+      <td class="mono">${esc(l.model_name)}</td>
+      <td class="mono">${l.upstream_model && l.upstream_model !== l.model_name ? esc(l.upstream_model) : '—'}</td>
+      <td>${l.prompt_tokens}</td><td>${l.completion_tokens}</td>
       <td>${l.elapsed_ms ? l.elapsed_ms + 'ms' : '—'}</td><td>${usd(l.quota)}</td>
       <td class="muted" style="max-width:280px">${esc(l.content)}</td></tr>`)}
   </div>`));

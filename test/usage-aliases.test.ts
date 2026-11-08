@@ -14,6 +14,10 @@ import { openaiResponsesAdaptor } from '../src/relay/responses';
 import { finishAnthropicStream, type AnthropicEncoderState } from '../src/relay/anthropic-inbound';
 import { compileBillingExpr, evaluateRate } from '../src/lib/pricing/expr';
 import { quotaFromRates } from '../src/lib/pricing/llm';
+import { postConsume } from '../src/lib/billing';
+import { DatabaseSync } from 'node:sqlite';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 
 const tests: Array<[string, () => Promise<void> | void]> = [];
 const test = (name: string, fn: () => Promise<void> | void) => tests.push([name, fn]);
@@ -166,6 +170,46 @@ test('quotaFromRates：OpenAI 官方示例三桶互斥计费（12000=1000 新鲜
     prompt_tokens: 12000, completion_tokens: 0, cached_tokens: 4000, cache_write_5m_tokens: 3000, cache_write_1h_tokens: 4000,
   });
   assert.equal(quota, Math.ceil(0.01515 * 500000));
+});
+
+test('postConsume：logs.upstream_model 落渠道模型，与请求名不同时 content 标注', async () => {
+  const migrationsDir = [join(process.cwd(), 'migrations'), join(process.cwd(), 'worker-one-api', 'migrations')].find((p) => existsSync(p)) ?? 'migrations';
+  const db = new DatabaseSync(':memory:');
+  for (const f of readdirSync(migrationsDir).filter((f) => f.endsWith('.sql')).sort()) db.exec(readFileSync(join(migrationsDir, f), 'utf8'));
+  db.exec(`INSERT INTO users (id, username, password, role, status, quota) VALUES (1, 'o', '', 100, 1, 1000000)`);
+  db.exec(`INSERT INTO tokens (user_id, key, status, unlimited_quota, models) VALUES (1, 'k', 1, 1, '')`);
+  db.exec(`INSERT INTO channels (id, type, status, models) VALUES (7, 'openai', 1, 'x')`);
+  const norm = (v: unknown) => (typeof v === 'boolean' ? Number(v) : v === undefined ? null : v);
+  const stmt = (sql: string, binds: unknown[] = []) => {
+    const exec = () => db.prepare(sql).all(...(binds.map(norm) as any[]));
+    return {
+      bind: (...b: unknown[]) => stmt(sql, b),
+      all: async () => ({ results: exec(), success: true, meta: {} }),
+      first: async (col?: string) => { const row = exec()[0] as any; return row === undefined ? null : col ? row[col] : row; },
+      run: async () => ({ results: exec(), success: true, meta: {} }),
+      _exec: exec,
+    };
+  };
+  const env = {
+    DB: {
+      prepare: (sql: string) => stmt(sql),
+      batch: async (stmts: any[]) => {
+        db.exec('BEGIN');
+        try { const out = stmts.map((s) => ({ results: s._exec(), success: true, meta: {} })); db.exec('COMMIT'); return out; }
+        catch (e) { db.exec('ROLLBACK'); throw e; }
+      },
+    },
+  } as never;
+  const token = { id: 1, user_id: 1, key: 'k', status: 1, name: 't', unlimited_quota: 1, remain_quota: 0, used_quota: 0, models: '' } as never;
+  const user = { id: 1, username: 'o', quota: 1000000, used_quota: 0 } as never;
+  await postConsume(env, {
+    token, user, channelId: 7, modelName: 'gemini-3.8-flash', upstreamModel: 'gemini-flash',
+    usage: { prompt_tokens: 10, completion_tokens: 2 }, preConsumed: 0, options: {}, elapsedMs: 5,
+  } as never);
+  const row = db.prepare('SELECT model_name, upstream_model, content FROM logs ORDER BY id DESC LIMIT 1').get() as any;
+  assert.equal(row.model_name, 'gemini-3.8-flash'); // 请求名不变（计费身份）
+  assert.equal(row.upstream_model, 'gemini-flash'); // 渠道实际服务的模型
+  assert.ok(String(row.content).includes('渠道模型 gemini-flash'), 'content 应标注渠道模型');
 });
 
 test('deepseek 渠道价时间表达式：高峰/窗外/周末三分支', () => {

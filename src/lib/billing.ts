@@ -142,20 +142,21 @@ export async function postConsume(
     usage.cache_write_5m_tokens || usage.cache_write_1h_tokens
       ? `，缓存写入 ${usage.cache_write_5m_tokens ?? 0}/${usage.cache_write_1h_tokens ?? 0}`
       : '';
+  const upstreamPart = args.upstreamModel && args.upstreamModel !== modelName ? `，渠道模型 ${args.upstreamModel}` : '';
   const content =
     args.content ??
     `输入 ${usage.prompt_tokens} tokens${usage.cached_tokens ? `（缓存命中 ${usage.cached_tokens}）` : ''}${cachePart}，` +
-      `输出 ${usage.completion_tokens} tokens${pricePart}，消耗 $${quotaToUSD(quota).toFixed(6)}`;
+      `输出 ${usage.completion_tokens} tokens${pricePart}，消耗 $${quotaToUSD(quota).toFixed(6)}${upstreamPart}`;
 
   const also: D1PreparedStatement[] = [
     env.DB.prepare('UPDATE users SET used_quota = used_quota + ? WHERE id = ?').bind(quota, user.id),
     env.DB.prepare('UPDATE tokens SET used_quota = used_quota + ?, accessed_time = ? WHERE id = ?').bind(quota, now, token.id),
     env.DB.prepare('UPDATE channels SET used_quota = used_quota + ? WHERE id = ?').bind(quota, channelId),
     env.DB.prepare(
-      `INSERT INTO logs (user_id, created_at, type, content, username, token_name, model_name, quota, prompt_tokens, completion_tokens, channel_id, elapsed_ms, billing_meta)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO logs (user_id, created_at, type, content, username, token_name, model_name, upstream_model, quota, prompt_tokens, completion_tokens, channel_id, elapsed_ms, billing_meta)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
-      user.id, now, LogTypeConsume, content, user.username, token.name, modelName, quota,
+      user.id, now, LogTypeConsume, content, user.username, token.name, modelName, args.upstreamModel ?? '', quota,
       usage.prompt_tokens, usage.completion_tokens, channelId, elapsedMs,
       // billing_meta（0016）：「模型计费」页的缓存命中/价格版本都从这列聚合。
       // 部署顺序是先迁移后发版，这里不做缺列兼容分支。

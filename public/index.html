@@ -469,7 +469,7 @@ async function loadTokens(view) {
     <label>过期时间（留空为永不过期）</label><input id="exp" type="datetime-local" value="${t.expired_time > 0 ? new Date(t.expired_time * 1000).toISOString().slice(0, 16) : ''}">
     <label>可用模型（勾选；全不勾 = 全部。列表 = 内置价表 ∪ 各渠道模型 ∪ 本令牌已选）</label>
     <div id="modelBoxes" style="border:1px solid var(--border);border-radius:8px;padding:8px;max-height:220px;overflow:auto;margin-bottom:6px">
-      ${modelUniverse.map((m) => `<label style="margin:2px 0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-m style="width:auto"${modelChecked.has(m) ? ' checked' : ''}> <span class="mono">${esc(m)}</span></label>`).join('') || '<span class="muted">（暂无可选模型）</span>'}
+      ${modelUniverse.map((m) => `<label style="margin:2px 0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-m="${esc(m)}" style="width:auto"${modelChecked.has(m) ? ' checked' : ''}> <span class="mono">${esc(m)}</span></label>`).join('') || '<span class="muted">（暂无可选模型）</span>'}
     </div>
     <label>其他模型（上面没列出的才手填，逗号分隔，一般留空）</label><input id="modelsExtra" value="">
     <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道。选白名单/黑名单后，在下方勾选渠道或标签）</label>
@@ -503,7 +503,8 @@ async function loadTokens(view) {
       remain_quota: Math.round((parseFloat(val(dlg, 'quota')) || 0) * QUOTA_PER_USD),
       unlimited_quota: dlg.querySelector('#unl').checked,
       expired_time: val(dlg, 'exp') ? Math.floor(new Date(val(dlg, 'exp')).getTime() / 1000) : -1,
-      models: val(dlg, 'models').trim(),
+      models: [...dlg.querySelectorAll('#modelBoxes [data-m]:checked')].map((x) => x.dataset.m).filter(Boolean)
+        .concat((val(dlg, 'modelsExtra') || '').split(',').map((s) => s.trim()).filter(Boolean)).join(','),
       channel_acl: aclmode ? { mode: aclmode, channels: [...ids, ...groups] } : null,
       ...(dlg.querySelector('#status') ? { status: Number(val(dlg, 'status')) } : {}),
     };

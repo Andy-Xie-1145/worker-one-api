@@ -84,13 +84,13 @@ function asD1(db: DatabaseSync) {
   };
 }
 
-/** 建库 + 种子（owner 用户 / 两个渠道 A(优先级10, a.test, 组cn) B(优先级0, b.test, 组other) / abilities / 一把令牌）。 */
+/** 建库 + 种子（owner 用户 / 两个渠道 A(优先级10, a.test, 标签cn) B(优先级0, b.test, 标签other) / abilities / 一把令牌）。 */
 function setup(aclJson: string, tokenModels = MODEL) {
   const db = freshDB();
   db.exec(`INSERT INTO users (id, username, password, display_name, role, status, quota, used_quota, request_count, created_time) VALUES (1, 'owner', '', 'Owner', 100, 1, 10000000, 0, 0, 0)`);
-  db.exec(`INSERT INTO channels (id, type, key, status, name, weight, priority, base_url, models, "group") VALUES
-    (1, 'openai', 'k-a', 1, 'A', 1, 10, 'https://a.test', '${MODEL}', 'cn'),
-    (2, 'openai', 'k-b', 1, 'B', 1, 0, 'https://b.test', '${MODEL}', 'other')`);
+  db.exec(`INSERT INTO channels (id, type, key, status, name, weight, priority, base_url, models, tags) VALUES
+    (1, 'openai', 'k-a', 1, 'A', 1, 10, 'https://a.test', '${MODEL}', '["cn"]'),
+    (2, 'openai', 'k-b', 1, 'B', 1, 0, 'https://b.test', '${MODEL}', '["other"]')`);
   db.exec(`INSERT INTO abilities (model, channel_id, enabled, priority, weight) VALUES
     ('${MODEL}', 1, 1, 10, 1),
     ('${MODEL}', 2, 1, 0, 1)`);
@@ -214,7 +214,7 @@ test('决策端也被 ACL 过滤：whitelist [B] 时 /v1/decisions 落 B', async
   } finally { mock.restore(); }
 });
 
-test('白名单 [组名 cn]：A 命中组、B（other 组）被排除', async () => {
+test('白名单 [标签 cn]：A 命中标签、B（other 标签）被排除', async () => {
   const { env } = setup(JSON.stringify({ mode: 'whitelist', channels: ['cn'] }));
   const mock = mockUpstream();
   try {
@@ -225,7 +225,7 @@ test('白名单 [组名 cn]：A 命中组、B（other 组）被排除', async ()
   } finally { mock.restore(); }
 });
 
-test('黑名单 [组名 cn]：A 被排除落 B；混合条目 [2, cn] 命中并集 → A', async () => {
+test('黑名单 [标签 cn]：A 被排除落 B；混合条目 [2, cn] 命中并集 → A', async () => {
   const { env } = setup(JSON.stringify({ mode: 'blacklist', channels: ['cn'] }));
   const mock = mockUpstream();
   try {

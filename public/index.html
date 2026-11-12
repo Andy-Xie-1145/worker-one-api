@@ -103,7 +103,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-09.6';
+const SPA_BUILD = '2026-11-12.1';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -428,6 +428,14 @@ async function pageTokens(view) {
   await loadTokens(view);
 }
 
+/** 渠道标签解析（channels.tags JSON 数组字符串）；坏值回空数组。 */
+function parseTags(s) {
+  try {
+    const a = JSON.parse(s || '[]');
+    return Array.isArray(a) ? a.map((x) => String(x)).filter(Boolean) : [];
+  } catch { return []; }
+}
+
 async function loadTokens(view) {
   const [rows, chans] = await Promise.all([api('/tokens'), api('/channels')]);
   const STATUS = { 1: ['启用', 'ok'], 2: ['已禁用', 'err'], 3: ['已过期', 'warn'], 4: ['额度耗尽', 'warn'] };
@@ -464,22 +472,22 @@ async function loadTokens(view) {
       ${modelUniverse.map((m) => `<label style="margin:2px 0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-m style="width:auto"${modelChecked.has(m) ? ' checked' : ''}> <span class="mono">${esc(m)}</span></label>`).join('') || '<span class="muted">（暂无可选模型）</span>'}
     </div>
     <label>其他模型（上面没列出的才手填，逗号分隔，一般留空）</label><input id="modelsExtra" value="">
-    <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道。选白名单/黑名单后，在下方勾选渠道或分组）</label>
+    <label>渠道 ACL（可选；与模型限制叠加——先限模型再选渠道。选白名单/黑名单后，在下方勾选渠道或标签）</label>
     <select id="aclmode" style="margin-bottom:6px">
       <option value=""${!t.channel_acl ? ' selected' : ''}>不限制（所有启用渠道按优先级参与）</option>
-      <option value="whitelist"${t.channel_acl?.mode === 'whitelist' ? ' selected' : ''}>白名单——只允许勾选的渠道/分组（全不勾 = 全禁，等价禁用）</option>
-      <option value="blacklist"${t.channel_acl?.mode === 'blacklist' ? ' selected' : ''}>黑名单——禁止勾选的渠道/分组（全不勾 = 全放）</option>
+      <option value="whitelist"${t.channel_acl?.mode === 'whitelist' ? ' selected' : ''}>白名单——只允许勾选的渠道/标签（全不勾 = 全禁，等价禁用）</option>
+      <option value="blacklist"${t.channel_acl?.mode === 'blacklist' ? ' selected' : ''}>黑名单——禁止勾选的渠道/标签（全不勾 = 全放）</option>
     </select>
     <div id="aclBoxes" style="display:none;border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:6px">
       <div style="font-weight:600;margin-bottom:4px">按渠道勾选（条目 = 渠道 ID）</div>
       <div style="display:flex;flex-wrap:wrap;gap:4px 14px;margin-bottom:8px">
-        ${(chans || []).map((c) => `<label style="margin:0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-aclc="${c.id}" style="width:auto"${(t.channel_acl?.channels || []).some((e) => String(e) === String(c.id)) ? ' checked' : ''}> <span class="mono">#${c.id} ${esc(c.name)}</span><span class="muted">（${esc(c.group || 'default')}）</span></label>`).join('') || '<span class="muted">（暂无渠道）</span>'}
+        ${(chans || []).map((c) => `<label style="margin:0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-aclc="${c.id}" style="width:auto"${(t.channel_acl?.channels || []).some((e) => String(e) === String(c.id)) ? ' checked' : ''}> <span class="mono">#${c.id} ${esc(c.name)}</span><span class="muted">（${esc(parseTags(c.tags).join(',') || '无标签')}）</span></label>`).join('') || '<span class="muted">（暂无渠道）</span>'}
       </div>
-      <div style="font-weight:600;margin-bottom:4px">按分组勾选（条目 = 组名；组内渠道增减自动跟随）</div>
+      <div style="font-weight:600;margin-bottom:4px">按标签勾选（条目 = 标签名；渠道打上/去掉标签自动跟随）</div>
       <div style="display:flex;flex-wrap:wrap;gap:4px 14px">
-        ${[...new Set((chans || []).map((c) => c.group || 'default'))].sort().map((g) => `<label style="margin:0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-aclg="${esc(g)}" style="width:auto"${(t.channel_acl?.channels || []).some((e) => String(e) === g) ? ' checked' : ''}> <span class="mono">${esc(g)}</span></label>`).join('') || '<span class="muted">（暂无分组）</span>'}
+        ${[...new Set((chans || []).flatMap((c) => parseTags(c.tags)))].sort().map((g) => `<label style="margin:0;display:flex;align-items:center;gap:4px"><input type="checkbox" data-aclg="${esc(g)}" style="width:auto"${(t.channel_acl?.channels || []).some((e) => String(e) === g) ? ' checked' : ''}> <span class="mono">${esc(g)}</span></label>`).join('') || '<span class="muted">（暂无标签——先在渠道页给渠道打标签）</span>'}
       </div>
-      <p class="muted" style="margin:6px 0 0">白名单：勾选 = 允许；全不勾 = 全禁（等价禁用）。黑名单：勾选 = 禁止；全不勾 = 全放。</p>
+      <p class="muted" style="margin:6px 0 0">白名单：勾选 = 允许；全不勾 = 全禁（等价禁用）。黑名单：勾选 = 禁止；全不勾 = 全放。一个渠道可有多个标签，命中任一勾选条目即匹配。</p>
     </div>
     <p class="muted" style="margin:4px 0 0">价格按<b>渠道</b>配置（渠道页「价格覆盖」）——令牌混用渠道且有故障转移，在令牌上定价没有意义。</p>
     ${t.id ? '' : '<p class="muted" style="margin:4px 0 0">密钥创建后<b>自动进剪贴板</b>，页面不回显明文；要再复制，点列表里该行的「复制」。</p>'}
@@ -627,11 +635,11 @@ async function pageChannels(view) {
 
   view.replaceChildren($(`<div class="card">
     <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">渠道</h2><button class="primary" id="new">新建渠道</button></div>
-    ${table(['ID', '名称', '类型', '状态', '优先级/权重', '分组', '模型', '已用', '响应', '操作'], rows, (ch) => `<tr>
+    ${table(['ID', '名称', '类型', '状态', '优先级/权重', '标签', '模型', '已用', '响应', '操作'], rows, (ch) => `<tr>
       <td>${ch.id}</td><td>${esc(ch.name)}</td><td>${esc(ch.type)}</td>
       <td><span class="tag ${STATUS[ch.status]?.[1] || ''}">${STATUS[ch.status]?.[0] || ch.status}</span></td>
       <td>${ch.priority} / ${ch.weight}</td>
-      <td>${esc(ch.group || 'default')}</td>
+      <td>${parseTags(ch.tags).map((t2) => `<span class="tag">${esc(t2)}</span>`).join(' ') || '<span class="muted">—</span>'}</td>
       <td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${esc(ch.models)}</td>
       <td>${usd(ch.used_quota)}</td><td>${ch.response_time ? ch.response_time + 'ms' : '—'}</td>
       <td style="white-space:nowrap"><button data-test="${ch.id}">测试</button> <button data-edit="${ch.id}">编辑</button> <button class="danger" data-del="${ch.id}">删除</button></td></tr>`)}
@@ -658,7 +666,10 @@ async function pageChannels(view) {
       <div><label>优先级（大者优先）</label><input id="priority" type="number" value="${ch.priority ?? 0}"></div>
       <div><label>权重（同优先级内随机）</label><input id="weight" type="number" min="1" value="${ch.weight ?? 1}"></div>
       <div><label>状态</label><select id="status"><option value="1"${ch.status === 1 ? ' selected' : ''}>启用</option><option value="2"${ch.status === 2 ? ' selected' : ''}>禁用</option></select></div>
-      <div><label>分组（轻量标签，供令牌渠道 ACL 按组指定）</label><input id="group" value="${esc(ch.group || 'default')}"></div>
+      <div><label>标签（可选，可多个；回车或点 ＋ 添加，点 × 移除。供令牌渠道 ACL 按标签过滤）</label>
+        <div id="tagChips" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px;min-height:26px"></div>
+        <div class="row" style="margin-bottom:0"><input id="tagInput" placeholder="输入标签名" style="flex:1"><button type="button" id="tagAdd" style="width:auto">＋</button></div>
+      </div>
     </div>
     <label>模型重定向（可选：把「请求模型」改写成「渠道模型」——两个下拉选好点「添加」；下方文本可直接编辑/删除，也可粘贴 JSON）</label>
     <div class="row" style="margin-bottom:6px">
@@ -739,6 +750,26 @@ async function pageChannels(view) {
     dlg.querySelector('#preset').onchange = (e) => { if (e.target.value) dlg.querySelector('#base_url').value = e.target.value; };
     dlg.querySelector('#fill').onclick = () => { dlg.querySelector('#models').value = meta.known_models.join(','); };
     dlg.querySelector('#fetchModels').onclick = () => fetchUpstreamModels(dlg, ch);
+    // 标签 chip 输入：回车或点 ＋ 添加一个标签，chip 上 × 移除。
+    dlg._tags = parseTags(ch.tags);
+    const renderTags = () => {
+      const box = dlg.querySelector('#tagChips');
+      if (!box) return;
+      box.innerHTML = (dlg._tags || []).map((t2, i2) => `<span class="tag" style="display:inline-flex;align-items:center;gap:4px"><span class="mono">${esc(t2)}</span><button type="button" data-trem="${i2}" title="移除 ${esc(t2)}" style="border:0;background:none;cursor:pointer;padding:0;color:var(--err);font-weight:700">×</button></span>`).join('') || '<span class="muted">（无标签）</span>';
+      box.querySelectorAll('[data-trem]').forEach((b2) => (b2.onclick = () => { dlg._tags.splice(Number(b2.dataset.trem), 1); renderTags(); }));
+    };
+    renderTags();
+    const addTag = () => {
+      const inp = dlg.querySelector('#tagInput');
+      const t2 = (inp?.value || '').trim();
+      if (!t2) return;
+      dlg._tags = dlg._tags || [];
+      if (!dlg._tags.includes(t2)) dlg._tags.push(t2);
+      inp.value = '';
+      renderTags();
+    };
+    dlg.querySelector('#tagAdd').onclick = addTag;
+    dlg.querySelector('#tagInput').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); addTag(); } };
     // 模型重定向双下拉：选项随「模型列表」输入实时刷新；「添加」合并进对文本（同键覆盖）。
     const mmRebuild = () => {
       const froms = new Set(meta.known_models || []);
@@ -815,7 +846,7 @@ async function pageChannels(view) {
       name: val(dlg, 'name'), type: val(dlg, 'type'), key: val(dlg, 'key'),
       base_url: val(dlg, 'base_url').trim(), models: val(dlg, 'models').trim(),
       priority: Number(val(dlg, 'priority')) || 0, weight: Number(val(dlg, 'weight')) || 1,
-      status: Number(val(dlg, 'status')), group: val(dlg, 'group').trim() || 'default',
+      status: Number(val(dlg, 'status')), tags: (dlg._tags || []).slice(),
       model_mapping: pairsToModelMapping(val(dlg, 'model_mapping')), config: val(dlg, 'config').trim(),
       system_prompt: val(dlg, 'system_prompt'),
     };

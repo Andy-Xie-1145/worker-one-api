@@ -79,10 +79,13 @@ export interface ChannelRow {
   balance: number;
   models: string;
   /**
-   * 轻量分组标签（复用 0015 保留的遗留列；无任何倍率语义）。
-   * 供令牌渠道 ACL 按组名匹配：ACL 条目里的字符串与它相等即命中。
+   * 轻量分组标签（多值，JSON 字符串数组；无任何倍率语义）。
+   * 供令牌渠道 ACL 按标签匹配：ACL 条目里的字符串出现在标签数组中即命中。
+   * （迁移自 0019；旧单值 "group" 列保留为惰性遗留，不再读写。）
    */
-  group: string;
+  tags: string;
+  /** 惰性遗留列（0015）：单值分组，已被 tags 取代，代码不再读写（仅 SELECT * 会带出）。 */
+  group?: string;
   used_quota: number;
   model_mapping: string;
   config: string;

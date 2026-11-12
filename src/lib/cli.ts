@@ -28,6 +28,8 @@ const CHANNEL_FIELDS: Record<string, (v: string) => unknown> = {
   model_mapping: (v) => v,
   config: (v) => v,
   system_prompt: (v) => v,
+  // 渠道标签（多值）：tags=a,b → JSON 数组（供令牌渠道 ACL 按标签过滤）。
+  tags: (v) => JSON.stringify(v.split(',').map((s) => s.trim()).filter(Boolean)),
 };
 
 /** token set 允许修改的字段 → SQL 列名 + 归一化（usd 是 CLI 别名，落在 remain_quota 上）。 */

@@ -103,7 +103,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-12.1';
+const SPA_BUILD = '2026-11-13.1';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -1465,7 +1465,11 @@ async function pageLogs(view) {
   const rows = await api('/logs?limit=200');
   const TYPE = { 1: '充值', 2: '消费', 3: '管理', 4: '系统' };
 
-  view.replaceChildren($(`<div class="card">
+  // 活跃请求面板：每 5s 自刷新；页面被切走（DOM 断开）后自动停止。
+  const live = $('<div class="card" style="margin-bottom:12px"><div class="row" style="margin-bottom:8px"><h2 style="margin:0;flex:1">进行中</h2><span class="muted" id="inflightHint">加载中…</span></div><div id="inflightBody" class="muted">—</div></div>');
+  const holder = $(`<div></div>`);
+  holder.append(live);
+  holder.append($(`<div class="card">
     <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">日志</h2><span class="muted">全站视角 · 最近 200 条</span></div>
     ${table(['时间', '类型', '用户', '令牌', '模型', '渠道模型', '输入', '输出', '耗时', '消耗', '详情'], rows, (l) => `<tr>
       <td>${ts(l.created_at)}</td><td>${TYPE[l.type] || l.type}</td><td>${esc(l.username)}</td><td>${esc(l.token_name)}</td>
@@ -1475,6 +1479,29 @@ async function pageLogs(view) {
       <td>${l.elapsed_ms ? l.elapsed_ms + 'ms' : '—'}</td><td>${usd(l.quota)}</td>
       <td class="muted" style="max-width:280px">${esc(l.content)}</td></tr>`)}
   </div>`));
+  view.replaceChildren(holder);
+
+  const PHASE = { route: '选路中', upstream: '调上游', stream: '流式转发' };
+  const renderInflight = (d) => {
+    const body = document.getElementById('inflightBody');
+    const hint = document.getElementById('inflightHint');
+    if (!body || !hint) return;
+    const rr = d?.rows ?? [];
+    hint.textContent = `${rr.length} 个进行中 · 每 5 秒刷新`;
+    body.className = '';
+    body.innerHTML = rr.length ? table(['开始', '已耗时', '令牌', '模型', '协议', '阶段', '渠道'], rr, (r) => `<tr>
+      <td>${ts(r.started_at)}</td>
+      <td>${Math.max(0, Math.round((d.now - r.started_at) * 1000) / 1000).toFixed(0)}s</td>
+      <td>${esc(r.token_name)}</td><td class="mono">${esc(r.model_name)}</td>
+      <td>${esc(r.protocol)}</td><td>${PHASE[r.phase] || esc(r.phase)}${r.stream ? '（流）' : ''}</td>
+      <td>${r.channel_name ? esc(r.channel_name) : '—'}</td></tr>`) : '<span class="muted">当前没有进行中的请求。</span>';
+  };
+  const tick = async () => {
+    if (!holder.isConnected) { clearInterval(timer); return; }
+    try { renderInflight(await api('/inflight')); } catch { /* 网络抖动忽略，下一轮再试 */ }
+  };
+  tick();
+  const timer = setInterval(tick, 5000);
 }
 
 // ---------------------------------------------------------------- 终端

@@ -13,4 +13,4 @@
  * （再用 sessionStorage 防重载循环，仍然不一致就挂横幅让人硬刷新）。
  * 改前端行为时记得改这里 + index.html 的 SPA_BUILD，两处同步。
  */
-export const SPA_BUILD = '2026-11-12.1';
+export const SPA_BUILD = '2026-11-13.1';

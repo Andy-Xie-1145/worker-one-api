@@ -13,6 +13,7 @@ import { listUpstreamModels } from '../lib/upstream-models';
 import { loadModelBilling } from '../lib/model-billing';
 import { reconcile, applyCredit } from '../lib/ledger';
 import { getHeartbeat, runWatchdog } from '../lib/watchdog';
+import { listInflight } from '../lib/inflight';
 import { listCooling, deriveState, percentiles, engineOf } from '../lib/health';
 import { ADAPTORS, OPENAI_COMPATIBLE_PRESETS } from '../relay';
 import { PRICE_TABLE, DEFAULT_PRICE, ALIAS_PREFIXES, QUOTA_PER_USD, quotaToUSD, validatePriceSpec, type Price, type PriceSpec } from '../lib/pricing';
@@ -799,6 +800,12 @@ api.get('/logs', requireAdmin, async (c) => {
   const offset = Math.max(0, Number(c.req.query('offset')) || 0);
   const rows = await c.env.DB.prepare('SELECT * FROM logs ORDER BY id DESC LIMIT ? OFFSET ?').bind(limit, offset).all();
   return c.json(ok(rows.results ?? []));
+});
+
+// 活跃请求（migration 0021）：此刻仍在进行的调用 + 阶段。悬挂行（运行时强拆的调用）
+// 按 started_at 懒回收，见 lib/inflight.ts。
+api.get('/inflight', requireAdmin, async (c) => {
+  return c.json(ok(await listInflight(c.env)));
 });
 
 api.get('/dashboard', requireAdmin, async (c) => {

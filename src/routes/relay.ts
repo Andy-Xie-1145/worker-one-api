@@ -3,6 +3,7 @@ import { type Env, type Vars, type ChannelRow, type TokenRow, type UserRow, Chan
 import { authenticateToken } from '../lib/auth';
 import { getOptions, type Options } from '../lib/options';
 import { preConsume, postConsume, refund, type Usage } from '../lib/billing';
+import { registerInflight, updateInflight, deleteInflight } from '../lib/inflight';
 import {
   calcQuota, resolvePrice, quotaToUSD, QUOTA_PER_USD,
   resolveBillableModel, resolveRates, sameBillingIdentity, quotaFromRates,
@@ -298,6 +299,21 @@ async function handleRelay(
   const requestedModel = String(body.model ?? '');
   if (!requestedModel) return fail('缺少 model 字段', 'invalid_request_error', 400);
 
+  /*
+   * 活跃请求登记（migration 0021）：鉴权通过即写一行，响应完全送达后由 waitUntil 删除。
+   * logs 只在结算时落库、relay_events 只记失败，「正在跑」的请求原本完全不可见——
+   * 客户端半路断开、运行时强拆调用时连 cancel() 都不会执行（watchdog.ts 实测过零痕迹）。
+   * 有了这行，GET /api/inflight 随时能回答「此刻有哪些请求、在哪个阶段」。
+   * 强拆时删除不会执行 → 行悬挂，读取端按 started_at 懒回收（lib/inflight.ts）。
+   */
+  const requestId = crypto.randomUUID();
+  let streaming = false;
+  // 登记用 await（不用 waitUntil）：后面各路径的删除依赖这行先落地，避免 DELETE 跑赢 INSERT。
+  await registerInflight(c.env, {
+    requestId, tokenId: token.id, tokenName: token.name, userId: user.id, username: user.username,
+    modelName: requestedModel, protocol, stream: body.stream === true, startedAt: Math.floor(started / 1000),
+  });
+
   // 别名并查集：一次解析（options 走 KV 缓存），授权检查与选路共用同一份。
   const aliasIndex = await getAliasIndex(c.env);
 
@@ -564,7 +580,7 @@ async function handleRelay(
 
     const attemptStarted = Date.now();
     const result = await attemptUpstream(c, {
-      channel, body, requestedModel, servedModel, mode, path, token, user, options, decisionsDialect, reservation, started, protocol,
+      channel, body, requestedModel, servedModel, mode, path, token, user, options, decisionsDialect, reservation, started, protocol, requestId,
     });
     if (result.kind === 'ok') {
       // 成功即清掉退避计数，否则偶发限流会让这个渠道一直踩着上次的档位往上爬
@@ -655,6 +671,9 @@ async function handleRelay(
 
   await release();
 
+  // 整体失败退出（渠道全灭 / 全被定价关卡跳过）：请求没有变成流，直接销登记行。
+  c.executionCtx?.waitUntil?.(deleteInflight(c.env, requestId));
+
   // 一个上游请求都没发出去（全部渠道被定价关卡跳过）：如实告诉用户是价格没配，
   // 而不是「渠道全部失败」——前者去价格页补一行就能修，后者只会让人去查渠道。
   if (!lastError && pricingSkips > 0) {
@@ -705,6 +724,8 @@ interface AttemptArgs {
   };
   started: number;
   protocol: Protocol;
+  /** 活跃请求登记行的 request_id（inflight_requests），进入上游/流式阶段时更新它。 */
+  requestId: string;
 }
 
 /*
@@ -719,7 +740,12 @@ type AttemptResult =
   | { kind: 'error'; status: number; body: unknown; stage: 'build' | 'network' | 'upstream'; errorText: string };
 
 async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult> {
-  const { channel, body, requestedModel, servedModel, mode, path, token, user, options, reservation, started, protocol } = args;
+  const { channel, body, requestedModel, servedModel, mode, path, token, user, options, reservation, started, protocol, requestId } = args;
+
+  // 活跃面板：这一笔正在打哪个渠道。fire-and-forget，失败只留日志。
+  c.executionCtx?.waitUntil?.(
+    updateInflight(c.env, requestId, { phase: 'upstream', channelId: channel.id, channelName: channel.name }),
+  );
 
   const upstreamModel = mapModel(channel, servedModel);
   const config = parseConfig(channel);
@@ -829,6 +855,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
         billing: { rates: reservation.rates, source: reservation.identity.source, via: reservation.identity.via, billingModel: reservation.identity.billingModel, trace: reservation.trace },
       }),
     );
+    c.executionCtx?.waitUntil?.(deleteInflight(c.env, requestId));
     const payload =
       protocol === 'anthropic' ? chatResponseToAnthropic(converted, requestedModel)
       : protocol === 'responses' ? chatResponseToResponses(converted, requestedModel)
@@ -851,7 +878,10 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
  * accumulating usage so billing can be settled once the stream ends.
  */
 function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof getAdaptor>, ctx: AdaptorContext, args: AttemptArgs): Response {
-  const { channel, body, requestedModel, token, user, options, reservation, started, protocol } = args;
+  const { channel, body, requestedModel, token, user, options, reservation, started, protocol, requestId } = args;
+
+  // 活跃面板：流已建立，正在逐事件转发上游 SSE。
+  c.executionCtx?.waitUntil?.(updateInflight(c.env, requestId, { phase: 'stream' }));
   const encoder = new TextEncoder();
   const state = newStreamState();
   // Anthropic's stream is explicitly bracketed, so it needs its own state
@@ -866,6 +896,9 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
   const settle = () => {
     if (settled) return;
     settled = true;
+    // 活跃登记行随流的终结一并删除（正常结束 / 上游中断 / 客户端取消都走这里）。
+    // 强拆调用时这里不会执行 → 行悬挂，由 /api/inflight 的分层回收兜底。
+    c.executionCtx?.waitUntil?.(deleteInflight(c.env, requestId));
     const finalUsage = usage ?? estimateUsage(body, state);
     c.executionCtx.waitUntil(
       postConsume(c.env, {

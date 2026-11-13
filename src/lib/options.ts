@@ -54,6 +54,20 @@ export interface Options {
    * 任一名字即拥有全块。编辑入口：后台「模型别名」页。
    */
   AliasGroups: string[][];
+  /**
+   * 上游超时三段式（2026-11-13：废除 120s 一刀切——45 万 token 的正常长流会被
+   * 拦腰截断，健康与否只能看"有没有动静"，不能看"总共跑了多久"）。
+   *
+   * - UpstreamHeadersTimeoutSec：等响应头的上限。HPD 这类排队型上游死不给头时，
+   *   快速失败让重试循环换下一个渠道；
+   * - UpstreamBodyIdleTimeoutSec：流式 body 的空闲上限——连续这么多秒一个字节
+   *   都没有才判死（连接假死）。**健康的生成每秒都在吐字，永远不会触发**；
+   *   没有流式总时长上限：长流跑多久都行，网关绝不主动切。
+   * - UpstreamBodyTimeoutSec：非流式响应体的整体读取上限（非流式没有"空闲"概念）。
+   */
+  UpstreamHeadersTimeoutSec: number;
+  UpstreamBodyIdleTimeoutSec: number;
+  UpstreamBodyTimeoutSec: number;
 }
 
 export const DEFAULT_OPTIONS: Options = {
@@ -67,6 +81,9 @@ export const DEFAULT_OPTIONS: Options = {
   DefaultPrice: { in: 1, out: 3 },
   DecisionOnlyModels: [],
   AliasGroups: [],
+  UpstreamHeadersTimeoutSec: 60,
+  UpstreamBodyIdleTimeoutSec: 300,
+  UpstreamBodyTimeoutSec: 600,
 };
 
 /** Options are read on nearly every request, so they are KV-cached for KV_TTL seconds.

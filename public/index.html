@@ -103,7 +103,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-13.1';
+const SPA_BUILD = '2026-11-13.2';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -1642,6 +1642,9 @@ async function pageSettings(view) {
         <div><label>失败重试次数</label><input id="RetryTimes" type="number" min="0" max="10" value="${cur.RetryTimes ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.RetryTimes ?? '—')}</p></div>
         <div><label>渠道冷却基数（秒）</label><input id="ChannelCooldownBaseSec" type="number" min="0" value="${cur.ChannelCooldownBaseSec ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.ChannelCooldownBaseSec ?? '—')}</p></div>
         <div><label>渠道冷却上限（秒）</label><input id="ChannelCooldownMaxSec" type="number" min="0" value="${cur.ChannelCooldownMaxSec ?? 0}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.ChannelCooldownMaxSec ?? '—')}</p></div>
+        <div><label>上游响应头超时（秒）</label><input id="UpstreamHeadersTimeoutSec" type="number" min="1" value="${cur.UpstreamHeadersTimeoutSec ?? 60}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.UpstreamHeadersTimeoutSec ?? '—')}，超时换渠道</p></div>
+        <div><label>流式空闲超时（秒）</label><input id="UpstreamBodyIdleTimeoutSec" type="number" min="1" value="${cur.UpstreamBodyIdleTimeoutSec ?? 300}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.UpstreamBodyIdleTimeoutSec ?? '—')}，连续无字节才判死；<b>长流没有总时长上限</b></p></div>
+        <div><label>非流式响应体超时（秒）</label><input id="UpstreamBodyTimeoutSec" type="number" min="0" value="${cur.UpstreamBodyTimeoutSec ?? 600}"><p class="muted" style="margin:4px 0 0">默认 ${esc(defs.UpstreamBodyTimeoutSec ?? '—')}，<b>0 = 不限制</b>（非流式没有空闲信号，此值仅防连接假死）</p></div>
       </div>
       <label><input type="checkbox" id="HealthEventsEnabled" style="width:auto" ${cur.HealthEventsEnabled ? 'checked' : ''}> 记录健康事件（失败请求写入 relay_events，供健康页统计）</label>
       <label>仅决策接口的模型（逗号分隔，如 ~typesafe/jev-latest, foo/decide-x）</label>
@@ -1667,6 +1670,9 @@ async function pageSettings(view) {
         RetryTimes: num(val(document, 'RetryTimes')),
         ChannelCooldownBaseSec: num(val(document, 'ChannelCooldownBaseSec')),
         ChannelCooldownMaxSec: num(val(document, 'ChannelCooldownMaxSec')),
+        UpstreamHeadersTimeoutSec: num(val(document, 'UpstreamHeadersTimeoutSec')),
+        UpstreamBodyIdleTimeoutSec: num(val(document, 'UpstreamBodyIdleTimeoutSec')),
+        UpstreamBodyTimeoutSec: num(val(document, 'UpstreamBodyTimeoutSec')),
         HealthEventsEnabled: document.getElementById('HealthEventsEnabled').checked,
         DecisionOnlyModels: val(document, 'DecisionOnlyModels').split(',').map((s) => s.trim()).filter(Boolean),
       };

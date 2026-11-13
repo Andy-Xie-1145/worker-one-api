@@ -45,7 +45,8 @@ import {
 
 const relay = new Hono<{ Bindings: Env; Variables: Vars }>();
 
-const UPSTREAM_TIMEOUT_MS = 120_000;
+// 上游超时已改为三段式（见 options.ts Upstream*TimeoutSec 注释）：
+//   响应头 60s / 流式空闲 300s / 非流式体 600s——流式没有总时长上限，健康长流绝不主动切。
 
 function errorBody(message: string, type = 'one_api_error', code?: string) {
   return { error: { message, type, code: code ?? null } };
@@ -791,16 +792,24 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
   }
 
   let upstream: Response;
+  // 响应头阶段单独限速（默认 60s，UpstreamHeadersTimeoutSec）：排队型上游死不给头时
+  // 快速失败换渠道。收到头立刻解除——**流式 body 不设总时长上限**（2026-11-13 废除
+  // 120s 一刀切：45 万 token 的正常长流会被拦腰截断），存活判据是 sse.ts 的空闲超时。
+  const headersMs = Math.max(1, Number(options.UpstreamHeadersTimeoutSec ?? 60)) * 1000;
+  const ctrl = new AbortController();
+  const headersTimer = setTimeout(() => ctrl.abort(new Error(`响应头超时（${headersMs / 1000}s 无响应）`)), headersMs);
   try {
     upstream = await fetch(built.url, {
       method: 'POST',
       headers: built.headers,
       body: built.body,
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      signal: ctrl.signal,
     });
   } catch (e: any) {
     const message = `请求渠道 ${channel.name} 失败: ${e?.message ?? e}`;
     return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'network', errorText: message };
+  } finally {
+    clearTimeout(headersTimer); // 头到了就解除信号——此后绝不再 abort，长流不受任何总时长限制
   }
 
   if (!upstream.ok) {
@@ -828,13 +837,29 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
      * 成功状态下的响应体读取/解析同样可能失败（空体、截断、非 JSON）。
      * 这类失败按 502 计入既有重试/退款路径——上游可能已经为这次生成扣了费，
      * 但响应丢了就等于没交付，换下一个渠道重试是正确语义。
+     * 非流式没有"空闲"概念，整体读给一个兜底上限（默认 600s，可配 0 关闭——
+     * 关闭后头阶段之外的挂死无人管，不建议）。
      */
     let json: any;
+    const bodyMs = Math.max(0, Number(options.UpstreamBodyTimeoutSec ?? 600)) * 1000;
+    let bodyTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      json = await upstream.json<any>();
+      json = await Promise.race([
+        upstream.json<any>(),
+        bodyMs
+          ? new Promise<never>((_, rej) => {
+              bodyTimer = setTimeout(() => {
+                ctrl.abort(new Error('响应体超时'));
+                rej(new Error(`响应体读取超时（${bodyMs / 1000}s）`));
+              }, bodyMs);
+            })
+          : new Promise<never>(() => {}),
+      ]);
     } catch (e: any) {
       const message = `渠道 ${channel.name} 响应体读取/解析失败: ${e?.message ?? e}`;
       return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'upstream', errorText: message };
+    } finally {
+      clearTimeout(bodyTimer);
     }
     const { body: converted, usage } = adaptor.convertResponse(json, ctx);
     /*
@@ -912,8 +937,11 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      // 流式空闲超时（默认 300s 无字节才判死，UpstreamBodyIdleTimeoutSec 可调）：
+      // 没有总时长上限——健康长流跑多久都行，网关绝不主动切。
+      const idleMs = Math.max(1, Number(options.UpstreamBodyIdleTimeoutSec ?? 300)) * 1000;
       try {
-        for await (const event of readSSE(upstream.body!)) {
+        for await (const event of readSSE(upstream.body!, { idleMs })) {
           const out = adaptor.convertStreamEvent(event, ctx, state);
           if (out.usage && (out.usage.prompt_tokens || out.usage.completion_tokens)) usage = out.usage;
           for (const chunk of out.chunks) {
@@ -937,10 +965,12 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
               : SSE_DONE;
         controller.enqueue(encoder.encode(tail));
       } catch (e: any) {
-        const message = `流式传输中断: ${e?.message ?? e}`;
+        const idle = e?.name === 'UpstreamIdleTimeoutError';
+        const message = idle ? `流式空闲超时: ${e.message}` : `流式传输中断: ${e?.message ?? e}`;
         /*
          * 客户端早就拿到 200 了，所以这次不算进用户可见的失败率（final=0），
-         * 但渠道确实断在半路上，健康度必须看得见。
+         * 但渠道确实断在半路上，健康度必须看得见。空闲超时单独记 errorCode，
+         * 「正常长流被误杀」与「连接假死」在事件页一眼可分。
          */
         if (options.HealthEventsEnabled !== false) {
           c.executionCtx?.waitUntil?.(
@@ -953,7 +983,7 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
               userId: user.id,
               final: false,
               elapsedMs: Date.now() - started,
-              errorCode: 'stream_interrupted',
+              errorCode: idle ? 'stream_idle_timeout' : 'stream_interrupted',
               errorText: message,
             }]),
           );

@@ -3,14 +3,38 @@ export interface SSEEvent {
   data: string;
 }
 
-/** Splits a byte stream into SSE events without buffering the whole response. */
-export async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<SSEEvent> {
+/** 流式空闲超时：连续 idleMs 毫秒没有任何字节才抛——健康生成每秒都在吐字，永不触发。 */
+export class UpstreamIdleTimeoutError extends Error {
+  constructor(public idleMs: number) {
+    super(`上游 ${Math.round(idleMs / 1000)}s 无任何数据，连接判死`);
+    this.name = 'UpstreamIdleTimeoutError';
+  }
+}
+
+async function readWithIdle<T extends ReadableStreamDefaultReader<Uint8Array>>(
+  reader: T,
+  idleMs: number | undefined,
+): Promise<{ done: boolean; value?: Uint8Array }> {
+  if (!idleMs) return reader.read();
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new UpstreamIdleTimeoutError(idleMs)), idleMs);
+    reader.read().then(
+      (r) => { clearTimeout(timer); resolve(r); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+/** Splits a byte stream into SSE events without buffering the whole response.
+ *  opts.idleMs：流式空闲超时（毫秒）。只盯"有没有动静"，不设总时长上限——
+ *  健康的长流跑多久都行（2026-11-13 废除 120s 一刀切）。空闲触发时取消上游流。 */
+export async function* readSSE(body: ReadableStream<Uint8Array>, opts?: { idleMs?: number }): AsyncGenerator<SSEEvent> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithIdle(reader, opts?.idleMs);
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       let idx: number;
@@ -25,6 +49,8 @@ export async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator
     const tail = parseEvent(buf);
     if (tail) yield tail;
   } finally {
+    // 空闲超时抛出时取消上游连接，别让死连接挂着；正常读完 cancel 也无害。
+    if (opts?.idleMs) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

@@ -194,7 +194,7 @@ const drain = async () => {
   while (pending.length) await pending.shift();
 };
 
-async function call(w: World, model: string, responses: Array<{ status: number; body: any }>) {
+async function call(w: World, model: string, responses: Array<{ status: number; body: any }>, rawBody?: string) {
   const env = { DB: makeDB(w), CACHE: w.kv, ASSETS: { fetch: async () => new Response('spa') }, ADMIN_KEY: ADMIN } as never;
   const calls: any[] = [];
   const original = globalThis.fetch;
@@ -208,7 +208,7 @@ async function call(w: World, model: string, responses: Array<{ status: number; 
       new Request('https://oneapi.test/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${KEY}` },
-        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+        body: rawBody ?? JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
       }),
       env,
       ctx,
@@ -252,6 +252,39 @@ test('定价模型照常：预扣 → 上游 → 结算，费率钉住不再重�
   assert.ok(pre && fin, '一对 pre/fin ref');
   // gpt-a 没在价格表 → 兜底 $1/$3：1000×$1 + 100×$3 = $0.0013 → 650 quota
   assert.equal(pre.delta + fin.delta, -650, '净扣 650 quota');
+});
+
+test('分档费率按上游实测 prompt_tokens 重判档——估算越档不得双倍计费', async () => {
+  // 2026-11-13 生产实况：34.8 万 token 的中文载荷，字符估算（长度÷3）被高估过
+  // 50 万分档线，按 long 档双倍计费。钉住语义保持（身份/来源/时间），但结算时
+  // 必须用上游回报的 prompt_tokens 对同一个 spec 重判档。
+  const tierConfig = JSON.stringify({
+    'gpt-a': {
+      in: 'context > 500000 ? 0.179104 : 0.089552',
+      out: 'context > 500000 ? 0.671642 : 0.447761',
+    },
+  });
+  const w = makeWorld({
+    channels: [{
+      id: 6, type: 'openai', key: 'key-a', status: 1, name: 'channel-a', weight: 1, priority: 10,
+      base_url: 'https://a.test/api', models: 'gpt-a', group: 'default', model_mapping: '', config: '', system_prompt: '',
+      price_config: tierConfig,
+    }],
+    abilities: [{ group: 'default', model: 'gpt-a', channel_id: 6, enabled: 1, priority: 10, weight: 1 }],
+  });
+  // 160 万字符载荷 → 预扣估算 context ≈ 53 万（>50 万，钉住 long 档）；
+  // 上游实测 prompt_tokens = 40 万（<50 万，应按 standard 档结算）。
+  const rawBody = JSON.stringify({ model: 'gpt-a', messages: [{ role: 'user', content: 'a'.repeat(1_600_000) }] });
+  const { res } = await call(w, 'gpt-a', [
+    { status: 200, body: { id: 'c3', object: 'chat.completion', model: 'gpt-a', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 400000, completion_tokens: 500, total_tokens: 400500 } } },
+  ], rawBody);
+  assert.equal(res.status, 200);
+  // 结算按实测 40 万 token 走 standard 档：(40 万×0.089552 + 500×0.447761)/1e6 = $0.036045 → ceil 18023
+  // 若仍按预扣钉住的 long 档，会是 35989——双倍。
+  const consumeLog = w.logs.find((b) => b[2] === 2);
+  assert.ok(consumeLog, '有计费日志');
+  assert.equal(consumeLog[8], 18023, `quota 应为 standard 档 18023，实际 ${consumeLog[8]}`);
+  assert.equal(w.credits.some((c) => c.ref.startsWith('fin:')), true, '有结算行');
 });
 
 /* ------------------------------------------------------- Anthropic 缓存三拆 */

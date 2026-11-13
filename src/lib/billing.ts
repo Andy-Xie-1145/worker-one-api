@@ -1,6 +1,7 @@
 import { type Env, type TokenRow, type UserRow, LogTypeConsume, TokenStatusExhausted } from '../types';
 import { calcQuotaDetailed, quotaFromRates, quotaToUSD, LLM_PRICING_VERSION } from './pricing';
-import type { RateSet, PriceSource } from './pricing/llm';
+import type { RateSet, PriceSource, PriceSpec } from './pricing/llm';
+import { resolveRates } from './pricing/llm';
 import type { ExprTrace } from './pricing/expr';
 import { applyCreditGated, applyCredit } from './ledger';
 import type { Options } from './options';
@@ -126,13 +127,54 @@ export async function postConsume(
      * 不再重新查价——两次解析之间配置/时间函数可能变化，前后不一致会让找平出错。
      * 缺省时回退到重新解析（老调用方/测试的兼容路径）。
      */
-    billing?: { rates: RateSet; source: PriceSource; via?: 'requested' | 'upstream'; billingModel?: string; trace?: ExprTrace };
+    billing?: {
+      rates: RateSet;
+      source: PriceSource;
+      via?: 'requested' | 'upstream';
+      billingModel?: string;
+      trace?: ExprTrace;
+      /** 预扣时用的价格 spec：带分档表达式的费率在结算时按**实测 token 数**重判档。 */
+      spec?: PriceSpec;
+      /** 预扣时刻：分档重求值时传给时间函数，保持与预扣同一时间语义。 */
+      pinTime?: Date;
+      /** 请求级数量（费率表达式里的 `n`）。 */
+      n?: number;
+    };
   },
 ): Promise<number> {
   const { token, user, channelId, modelName, usage, preConsumed, options, elapsedMs } = args;
-  const detail = args.billing
-    ? { quota: quotaFromRates(args.billing.rates, usage), source: args.billing.source, trace: args.billing.trace }
-    : calcQuotaDetailed(modelName, usage, options, args.upstreamModel);
+  let detail: { quota: number; source: PriceSource; trace?: ExprTrace };
+  if (args.billing) {
+    /*
+     * 分档费率按上游实测 token 数重判档。预扣时的 context 只有字符估算
+     * （JSON 长度÷3，中文被高估 2~3 倍），34 万 token 的中文载荷会被估过
+     * 50 万分档线、按长档双倍计费（2026-11-13 实况）。这里用上游回报的
+     * prompt_tokens 对**同一个 spec** 重新求值——计费身份/来源仍然钉住，
+     * 只有档位回归实测；pinTime 让时间函数与预扣同时刻，语义不变。
+     * 重新求值失败 → 保守沿用预扣钉住的费率。
+     */
+    let rates = args.billing.rates;
+    let tier = args.billing.trace?.matchedTier;
+    if (args.billing.spec) {
+      const re = resolveRates(
+        args.billing.spec,
+        { context: Math.max(0, usage.prompt_tokens), n: args.billing.n ?? usage.n ?? 1 },
+        undefined,
+        args.billing.pinTime,
+      );
+      if (re.ok) {
+        rates = re.rates;
+        if (re.trace.matchedTier) tier = re.trace.matchedTier;
+      }
+    }
+    detail = {
+      quota: quotaFromRates(rates, usage),
+      source: args.billing.source,
+      trace: { ...args.billing.trace, ...(tier ? { matchedTier: tier } : {}) },
+    };
+  } else {
+    detail = calcQuotaDetailed(modelName, usage, options, args.upstreamModel);
+  }
   const quota = detail.quota;
   const delta = quota - preConsumed;
   const now = Math.floor(Date.now() / 1000);

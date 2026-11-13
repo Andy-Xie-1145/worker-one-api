@@ -312,17 +312,19 @@ test('入站流式：推理过程有完整事件序列（item.added / delta / do
   assert.match(a, /"delta":"先想"/);
   const b = encodeResponsesChunk(enc, { id: 'ch_r', choices: [{ delta: { reasoning_content: '一下' }, }] }, 'm');
   assert.match(b, /"delta":"一下"/, '第二个推理增量沿用同一个 reasoning 项');
-  // 文本项在推理项之后（output_index 递增）
+  // 正文增量先收口 reasoning 项（保持块边界；done 三连跟随块的终结，不再堆到 finish）
   const c = encodeResponsesChunk(enc, { id: 'ch_r', choices: [{ delta: { content: '答案' } }] }, 'm');
+  assert.match(c, /event: response\.reasoning_summary_text\.done/, '正文开始前 reasoning 项收口');
+  assert.match(c, /event: response\.reasoning_summary_part\.done/);
+  assert.match(c, /event: response\.output_item\.done/);
   assert.match(c, /"output_index":1/);
+  assert.ok(c.indexOf('reasoning_summary_text.done') < c.indexOf('output_text.delta'), 'reasoning done 先于正文 delta');
   // 上游在最后一个 chunk 给 usage 明细
   encodeResponsesChunk(enc, { id: 'ch_r', choices: [], usage: { prompt_tokens: 11, completion_tokens: 9, total_tokens: 20, completion_tokens_details: { reasoning_tokens: 7 }, prompt_tokens_details: { cached_tokens: 3 } } }, 'm');
   const tail = finishResponsesStream(enc, 'm', { prompt_tokens: 11, completion_tokens: 9, total_tokens: 20 });
-  assert.match(tail, /event: response\.reasoning_summary_text\.done/);
-  assert.match(tail, /event: response\.reasoning_summary_part\.done/);
   assert.match(tail, /event: response\.output_text\.done/);
   assert.match(tail, /event: response\.content_part\.done/);
-  assert.equal((tail.match(/event: response\.output_item\.done/g) ?? []).length, 2, 'reasoning 与 message 各有一次 done');
+  assert.equal((tail.match(/event: response\.output_item\.done/g) ?? []).length, 1, 'reasoning 已在正文边界收口，finish 只剩 message 的 done');
   assert.match(tail, /event: response\.completed/);
   const completed = JSON.parse(/data: (\{"type":"response\.completed".*)/.exec(tail)![1]);
   assert.equal(completed.response.output.length, 2);

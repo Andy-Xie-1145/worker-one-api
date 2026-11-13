@@ -272,6 +272,8 @@ export interface ResponsesEncoder {
   message: MessageState | null;
   /** 按 chat 侧 index 累积的工具调用。 */
   calls: Map<number, CallState>;
+  /** 已收口的输出项（{index, item}）：HPD 这类上游把推理拆成多段穿插在正文/工具之间，每段各自成 item。 */
+  closedItems: Array<{ index: number; item: any }>;
   /** 中枢侧的 finish_reason（'length' → 最终事件是 response.incomplete）。 */
   finishReason: string | null;
   /** 上游失败透传（chat chunk 带 error）时的错误信息。 */
@@ -290,6 +292,7 @@ export function newResponsesEncoder(): ResponsesEncoder {
     reasoning: null,
     message: null,
     calls: new Map(),
+    closedItems: [],
     finishReason: null,
     errorMsg: null,
     finished: false,
@@ -300,7 +303,7 @@ export function newResponsesEncoder(): ResponsesEncoder {
 
 /** 编码器累积出的 output items——最终响应对象要带完整内容，不能是空数组。 */
 function encoderOutput(enc: ResponsesEncoder): any[] {
-  const items: Array<{ index: number; item: any }> = [];
+  const items: Array<{ index: number; item: any }> = [...enc.closedItems];
   if (enc.reasoning) {
     items.push({
       index: enc.reasoning.index,
@@ -360,6 +363,20 @@ function encoderDoneEvents(enc: ResponsesEncoder): string {
   return parts.sort((a, b) => a.index - b.index).map((p) => p.text).join('');
 }
 
+/** 关闭当前 reasoning 输出项：补齐官方规定的 done 事件三连，并把成品存进 closedItems。没开着就返回空串。 */
+function closeReasoningItem(enc: ResponsesEncoder): string {
+  if (!enc.reasoning) return '';
+  const { index, itemId, acc } = enc.reasoning;
+  enc.reasoning = null;
+  const item = { id: itemId, type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: acc }] };
+  enc.closedItems.push({ index, item });
+  return (
+    sse('response.reasoning_summary_text.done', { type: 'response.reasoning_summary_text.done', item_id: itemId, output_index: index, summary_index: 0, text: acc }) +
+    sse('response.reasoning_summary_part.done', { type: 'response.reasoning_summary_part.done', item_id: itemId, output_index: index, summary_index: 0, part: { type: 'summary_text', text: acc } }) +
+    sse('response.output_item.done', { type: 'response.output_item.done', output_index: index, item })
+  );
+}
+
 function sse(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
@@ -414,7 +431,8 @@ export function encodeResponsesChunk(enc: ResponsesEncoder, chatChunk: any, mode
   if (reasoningDelta) {
     if (!enc.reasoning) {
       const index = enc.nextIndex++;
-      const itemId = `rs_${enc.responseId || Date.now()}`;
+      // id 必须带 index：HPD 会拆多个 reasoning item，responseId 对它们是相同的。
+      const itemId = `rs_${enc.responseId || Date.now()}_${index}`;
       enc.reasoning = { index, itemId, acc: '' };
       out += sse('response.output_item.added', {
         type: 'response.output_item.added', output_index: index,
@@ -432,8 +450,11 @@ export function encodeResponsesChunk(enc: ResponsesEncoder, chatChunk: any, mode
     });
   }
 
-  // 文本增量
+  // 文本增量。正文开始前先收口开着的 reasoning 项——HPD 这类上游把推理拆成多段
+  // 穿插在正文/工具调用之间，「中断即收口、推理再现即开新项」保住块边界，
+  // 也让 output_index 保持单调（2026-11-13 用户实测：一段正文前有 4 个独立思考块）。
   if (typeof delta?.content === 'string' && delta.content) {
+    out += closeReasoningItem(enc);
     if (!enc.message) {
       const index = enc.nextIndex++;
       const itemId = `msg_${enc.responseId || Date.now()}`;
@@ -455,6 +476,8 @@ export function encodeResponsesChunk(enc: ResponsesEncoder, chatChunk: any, mode
   }
 
   // 工具调用增量：按 chat 侧 index 累积完整参数；首个增量时开 output item。
+  // 工具调用同样会打断推理段：先收口开着的 reasoning 项再开工具项。
+  if (delta?.tool_calls?.length) out += closeReasoningItem(enc);
   for (const tc of delta?.tool_calls ?? []) {
     const idx = Number(tc.index ?? 0);
     let entry = enc.calls.get(idx);

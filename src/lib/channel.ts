@@ -23,12 +23,25 @@ export function parseChannelTags(raw: string | null | undefined): string[] {
   }
 }
 
-/** 渠道标签写入前规范化：undefined = 保持不变；数组 = 去空白去重；其余非法。 */
+/** 渠道标签写入前规范化：数组 = 去空白去重；JSON 数组字符串 = 原样解析（幂等）；逗号分隔字符串 = 切分；其余非法。 */
 export function normalizeChannelTags(value: unknown): { ok: true; json: string } | { ok: false; error: string } {
   if (value === undefined || value === null) return { ok: false, error: '__absent__' };
   let list: unknown[];
   if (Array.isArray(value)) list = value;
-  else if (typeof value === 'string') list = value.split(',');
+  else if (typeof value === 'string') {
+    /*
+     * 字符串若本身就是 JSON 数组（存量列的存储形态），按数组解析而不是按逗号切分。
+     * 否则「PUT 不带 tags → 合并存量字符串 → 当成一个标签名再序列化」会把
+     * ["HPD-DOG"] 双重编码成 ["[\"HPD-DOG\"]"]——标签 ACL 匹配就此全灭（2026-11-13 实况）。
+     */
+    const trimmed = value.trim();
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        list = Array.isArray(parsed) ? parsed : [value];
+      } catch { list = [value]; }
+    } else list = value.split(',');
+  }
   else return { ok: false, error: 'tags 必须是字符串数组或逗号分隔字符串' };
   const tags = [...new Set(list.map((n) => String(n ?? '').trim()).filter(Boolean))];
   for (const t of tags) if (t.length > 64) return { ok: false, error: `标签过长（≤64 字符）：${t.slice(0, 20)}…` };

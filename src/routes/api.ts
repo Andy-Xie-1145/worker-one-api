@@ -460,9 +460,16 @@ function channelFromBody(b: any, existing?: ChannelRow): { ch: Omit<ChannelRow, 
     if (!price.ok) return { ch: null as never, priceError: price.error };
     priceJson = price.json;
   }
-  // tags 不出现 = 不修改（编辑时）；传数组 / 逗号分隔字符串 = 设置，[] = 清空。
-  const tagsNorm = normalizeChannelTags(b.tags !== undefined ? b.tags : (existing?.tags ?? '[]'));
-  if (!tagsNorm.ok) return { ch: null as never, priceError: tagsNorm.error };
+  // tags 不出现 = 原样保留存量（绝不再规范化）；传数组 / 逗号分隔 / JSON 数组字符串 = 设置，[] = 清空。
+  // 曾经的写法是把存量 JSON 字符串塞回规范化函数，导致 ["HPD-DOG"] 被双重编码、标签 ACL 全灭。
+  let tagsJson: string;
+  if (b.tags !== undefined) {
+    const tagsNorm = normalizeChannelTags(b.tags);
+    if (!tagsNorm.ok) return { ch: null as never, priceError: tagsNorm.error };
+    tagsJson = tagsNorm.json;
+  } else {
+    tagsJson = existing?.tags ?? '[]';
+  }
   return {
     ch: {
       type: String(b.type ?? existing?.type ?? 'openai'),
@@ -473,7 +480,7 @@ function channelFromBody(b: any, existing?: ChannelRow): { ch: Omit<ChannelRow, 
       priority: Number(b.priority ?? existing?.priority ?? 0),
       base_url: String(b.base_url ?? existing?.base_url ?? ''),
       models: String(b.models ?? existing?.models ?? ''),
-      tags: tagsNorm.json,
+      tags: tagsJson,
       // 旧单值 "group" 列：被 tags 取代，更新时不再改写（惰性遗留）。
       model_mapping: String(b.model_mapping ?? existing?.model_mapping ?? ''),
       config: String(b.config ?? existing?.config ?? ''),

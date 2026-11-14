@@ -740,16 +740,20 @@ api.get('/health/models', requireAdmin, async (c) => {
     /*
      * 路由缺口：请求了但一个渠道都匹配不上的模型。
      *
-     * 这就是本次事故的形状——OneAPI 只回一句「没有可用渠道」，而那句话里的模型名
+     * 这就是本次事故的形状——OneAI 只回一句「没有可用渠道」，而那句话里的模型名
      * 从来没被记下来过。LEFT JOIN abilities 的两个计数把「这个分组下真的一个都
      * 没有」和「有但都被禁用了」分开，因为两者的修法完全不同。
+     *
+     * 只认 final = 1：重试循环里「候选已试完」记的是 final=0，那不是缺口——
+     * 模型有渠道、渠道也启用着，只是这一轮全挂了，真实原因在 upstream 事件里。
+     * 令牌 ACL 拒绝走 stage='acl_denied'（403），也不该算作路由缺口。
      */
     c.env.DB.prepare(
       `SELECT e.model_name, COUNT(*) AS n, MAX(e.created_at) AS last_at,
               (SELECT COUNT(*) FROM abilities a WHERE a.model = e.model_name) AS declared,
               (SELECT COUNT(*) FROM abilities a WHERE a.model = e.model_name AND a.enabled = 1) AS enabled
        FROM relay_events e
-       WHERE e.stage = 'no_channel' AND e.created_at >= ?
+       WHERE e.stage = 'no_channel' AND e.final = 1 AND e.created_at >= ?
        GROUP BY e.model_name ORDER BY n DESC`,
     ).bind(since).all<any>(),
   ]);

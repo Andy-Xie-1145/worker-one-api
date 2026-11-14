@@ -158,7 +158,7 @@ export async function postConsume(
     if (args.billing.spec) {
       const re = resolveRates(
         args.billing.spec,
-        { context: Math.max(0, usage.prompt_tokens), n: args.billing.n ?? usage.n ?? 1 },
+        { context: Math.max(0, usage.prompt_tokens), n: args.billing.n ?? 1 },
         undefined,
         args.billing.pinTime,
       );

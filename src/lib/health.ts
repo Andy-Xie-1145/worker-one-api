@@ -21,7 +21,7 @@ import type { Env } from '../types';
 /** relay_events 的一行。除 stage 外都可省，省掉的走 DDL 里的 DEFAULT。 */
 export interface RelayEvent {
   /** `pricing` = 查不到价/费率求值失败被跳过的渠道（严格计费的可见性）。 */
-  stage: 'no_channel' | 'build' | 'network' | 'upstream' | 'stream' | 'quota' | 'deny403' | 'pricing';
+  stage: 'no_channel' | 'build' | 'network' | 'upstream' | 'stream' | 'quota' | 'deny403' | 'pricing' | 'acl_denied';
   outcome?: string;
   modelName?: string;
   upstreamModel?: string;

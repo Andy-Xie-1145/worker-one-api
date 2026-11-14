@@ -153,12 +153,13 @@ test('白名单 [B]：低优先级渠道被强制选中（核心用例）', asyn
   } finally { mock.restore(); }
 });
 
-test('白名单空数组：全禁（503，上游零调用）——等价禁用', async () => {
+test('白名单空数组：全禁（403 permission_error，上游零调用）——等价禁用', async () => {
   const { env } = setup(JSON.stringify({ mode: 'whitelist', channels: [] }));
   const mock = mockUpstream();
   try {
     const res = await call(env, '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: MODEL, messages: [{ role: 'user', content: 'hi' }] }) });
-    assert.equal(res.status, 503);
+    assert.equal(res.status, 403, '权限拒绝必须是 403，不能是 503（那会被当成路由缺口）');
+    assert.equal((await res.json() as any).error?.type, 'permission_error');
     assert.equal(mock.urls.length, 0, '全禁时不得发出任何上游请求');
   } finally { mock.restore(); }
 });
@@ -184,22 +185,22 @@ test('黑名单 [A]：A 被排除，落 B', async () => {
   } finally { mock.restore(); }
 });
 
-test('黑名单 [A,B]：全部被禁 → 503', async () => {
+test('黑名单 [A,B]：全部被禁 → 403 permission_error', async () => {
   const { env } = setup(JSON.stringify({ mode: 'blacklist', channels: [1, 2] }));
   const mock = mockUpstream();
   try {
     const res = await call(env, '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: MODEL, messages: [{ role: 'user', content: 'hi' }] }) });
-    assert.equal(res.status, 503);
+    assert.equal(res.status, 403);
     assert.equal(mock.urls.length, 0);
   } finally { mock.restore(); }
 });
 
-test('损坏的 ACL JSON：fail-close 全禁（503），绝不静默放行', async () => {
+test('损坏的 ACL JSON：fail-close 全禁（403），绝不静默放行', async () => {
   const { env } = setup('not-json{{{');
   const mock = mockUpstream();
   try {
     const res = await call(env, '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: MODEL, messages: [{ role: 'user', content: 'hi' }] }) });
-    assert.equal(res.status, 503);
+    assert.equal(res.status, 403);
     assert.equal(mock.urls.length, 0);
   } finally { mock.restore(); }
 });
@@ -262,6 +263,61 @@ test('管理 API：mode 非法 → 400；合法写入 → GET 回解析对象；
   assert.equal((db.prepare('SELECT channel_acl FROM tokens WHERE id = 1').get() as any).channel_acl, '');
 });
 
+test('对照：无 ACL 且模型确实无渠道 → 仍是 503 并记 final=1 的真缺口事件', async () => {
+  const { db, env } = setup('', ''); // 令牌不限模型，ACL 为空
+  const mock = mockUpstream();
+  try {
+    const res = await call(env, '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm-absent', messages: [{ role: 'user', content: 'hi' }] }) });
+    assert.equal(res.status, 503, '配置里没有该模型的渠道 = 服务端路由缺口，不是权限问题');
+    assert.equal(mock.urls.length, 0);
+    const gaps = db.prepare(`SELECT model_name, final FROM relay_events WHERE stage = 'no_channel'`).all() as any[];
+    assert.deepEqual(gaps.map((g) => [g.model_name, g.final]), [['m-absent', 1]], '真缺口记 final=1');
+  } finally { mock.restore(); }
+});
+
+test('重试耗尽不是路由缺口：上游全 502 时不得记 no_channel（模型声明/启用 1/1 不能被冤枉）', async () => {
+  const { db, env } = setup('');
+  const urls: string[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: any) => {
+    urls.push(String(typeof input === 'string' ? input : input.url));
+    return new Response('error code: 502\n', { status: 502, headers: { 'Content-Type': 'text/plain' } });
+  }) as any;
+  try {
+    const res = await call(env, '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: MODEL, messages: [{ role: 'user', content: 'hi' }] }) });
+    assert.equal(res.status, 502, '如实回上游的 502');
+    assert.ok(urls.length >= 1, '确实打过上游');
+    const noChannel = db.prepare(`SELECT COUNT(*) AS n FROM relay_events WHERE stage = 'no_channel'`).get() as any;
+    assert.equal(noChannel.n, 0, '候选试完 ≠ 路由缺口，不许记 no_channel');
+    const upstream = db.prepare(`SELECT COUNT(*) AS n FROM relay_events WHERE stage = 'upstream'`).get() as any;
+    assert.ok(upstream.n >= 1, '真实原因留在 upstream 事件里');
+  } finally { globalThis.fetch = original; }
+});
+
+test('存在性优先于权限：受限令牌请求**不存在**的模型 → 503，不是 403', async () => {
+  const { db, env } = setup('', MODEL); // 令牌只允许 MODEL
+  const mock = mockUpstream();
+  try {
+    const res = await call(env, '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm-absent', messages: [{ role: 'user', content: 'hi' }] }) });
+    assert.equal(res.status, 503, '模型根本不存在 → 配置问题优先于权限提示');
+    assert.equal((await res.json() as any).error?.code, null);
+    assert.equal(mock.urls.length, 0);
+    const gaps = db.prepare(`SELECT model_name, final FROM relay_events WHERE stage = 'no_channel'`).all() as any[];
+    assert.deepEqual(gaps.map((g) => [g.model_name, g.final]), [['m-absent', 1]], '真缺口照常记账');
+  } finally { mock.restore(); }
+});
+
+test('存在性优先于权限：受限令牌请求**存在但不被允许**的模型 → 403', async () => {
+  const { env } = setup('', 'm-other');
+  const mock = mockUpstream();
+  try {
+    const res = await call(env, '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: MODEL, messages: [{ role: 'user', content: 'hi' }] }) });
+    assert.equal(res.status, 403);
+    assert.equal((await res.json() as any).error?.type, 'permission_error');
+    assert.equal(mock.urls.length, 0);
+  } finally { mock.restore(); }
+});
+
 /* ---------------------------------------------------------------- runner */
 (async () => {
   let failed = 0;
@@ -280,4 +336,6 @@ test('管理 API：mode 非法 → 400；合法写入 → GET 回解析对象；
     process.exit(1);
   }
   console.log(`\n${tests.length} passed`);
+  // 显式退出：node:sqlite 的 DatabaseSync 会占住事件循环，不 exit 进程会一直挂着。
+  process.exit(0);
 })();

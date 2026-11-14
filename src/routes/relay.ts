@@ -10,7 +10,7 @@ import {
   MODEL_PRICE_NOT_CONFIGURED, type BillingIdentity, type RateSet,
 } from '../lib/pricing';
 import type { ProbeContext } from '../lib/pricing/expr';
-import { selectChannel, mapModel, parseConfig, listModels, csv, parseChannelPriceConfig, parseTokenAcl } from '../lib/channel';
+import { selectChannel, mapModel, parseConfig, listModels, csv, parseChannelPriceConfig, parseTokenAcl, anyChannelServes } from '../lib/channel';
 import { getAliasIndex, componentOf } from '../lib/alias';
 import { markRateLimited, clearRateLimit } from '../lib/cooldown';
 import {
@@ -262,7 +262,7 @@ async function handleRelay(
   const fail = (message: string, type: string, status: number) => {
     if (protocol === 'anthropic') return c.json(anthropicError(message, type), status);
     if (protocol === 'gemini') {
-      const statusText = status === 400 ? 'INVALID_ARGUMENT' : status === 401 ? 'UNAUTHENTICATED' : status === 503 ? 'UNAVAILABLE' : 'INTERNAL';
+      const statusText = status === 400 ? 'INVALID_ARGUMENT' : status === 401 ? 'UNAUTHENTICATED' : status === 403 ? 'PERMISSION_DENIED' : status === 404 ? 'NOT_FOUND' : status === 503 ? 'UNAVAILABLE' : 'INTERNAL';
       return c.json({ error: { code: status, message, status: statusText } }, status);
     }
     return c.json(errorBody(message, type), status);
@@ -317,15 +317,6 @@ async function handleRelay(
 
   // 别名并查集：一次解析（options 走 KV 缓存），授权检查与选路共用同一份。
   const aliasIndex = await getAliasIndex(c.env);
-
-  const allowed = csv(token.models);
-  if (allowed.length) {
-    // 别名联通块展开：令牌拥有块内任一名字 = 拥有全块——请求块内任意别名都放行。
-    const members = componentOf(aliasIndex, requestedModel);
-    if (!members.some((m) => allowed.includes(m))) {
-      return fail(`令牌无权访问模型 ${requestedModel}`, 'permission_error', 403);
-    }
-  }
 
   const options = await getOptions(c.env);
 
@@ -436,43 +427,113 @@ async function handleRelay(
   };
 
   // 令牌级渠道 ACL（白/黑名单）。解析一次，重试循环的每一轮都带同一份；
-  // 白名单空 = 全禁（selectChannel 返回 null → 503 no_channel）。
+  // 白名单无匹配 / 黑名单全覆盖 = 令牌无权用这些渠道 → 403 permission_error
+  // （selectChannel 回 acl_denied 区分于「配置里没这个模型的渠道」的 503）。
   const channelAcl = parseTokenAcl(token.channel_acl);
 
-  while (quotaAttempts < maxAttempts) {
-    const attempt = round++;
-    const selection = await selectChannel(c.env, requestedModel, tried, colo, channelAcl, aliasIndex);
-    if (!selection) {
-      /*
-       * 「没有可用渠道」必须带着**客户端请求的那个模型串**落库。
-       *
-       * 这条 503 的报文里一直有模型名，但它只存在于那一次 HTTP 响应里，没人记。
-       * 结果就是线上 72% 的请求在这里失败了整晚，事后却查不出到底是哪个模型没配
-       * ——只能开 tail 蹲现场。这一行就是为了让那种蹲守再也不必发生。
-       */
-      events.push({
-        stage: 'no_channel',
-        status: 503,
-        modelName: requestedModel,
-        userId: user.id,
-        attempt,
-        final: attempt === 0,
-        errorCode: 'no_channel',
-      });
-
-      if (attempt === 0) {
+  /*
+   * 模型授权列表（tokens.models）。判定顺序：**存在性优先于权限**。
+   *
+   * 令牌受限、且请求的模型不在其允许列表里时，要先问「这个模型到底有没有渠道
+   * 声明」：
+   *   - 一个都没有 → 503 no_channel（真·路由缺口，去补渠道声明或改模型名）；
+   *   - 有 → 403 permission_error（去改令牌允许列表）。
+   * 反过来的话，一个根本不存在的模型会回 403「令牌无权访问」，把人引去查令牌
+   * 配置，而真正该修的是模型名——排查方向从一开始就错了（2026-11-14）。
+   *
+   * 查询只在**将被拒绝**时发生：放行的请求不为这条判定付任何 D1 往返。
+   */
+  const allowedModels = csv(token.models);
+  if (allowedModels.length) {
+    // 别名联通块展开：令牌拥有块内任一名字 = 拥有全块——请求块内任意别名都放行。
+    const members = componentOf(aliasIndex, requestedModel);
+    if (!members.some((m) => allowedModels.includes(m))) {
+      if (!(await anyChannelServes(c.env, members))) {
+        events.push({
+          stage: 'no_channel',
+          status: 503,
+          modelName: requestedModel,
+          userId: user.id,
+          attempt: 0,
+          final: true,
+          errorCode: 'no_channel',
+        });
         const written = flushEvents();
-        /*
-         * 路由缺口告警（lib/route-alert.ts）。排在事件落库之后，「近 1 小时次数」才含本次；
-         * 挂 waitUntil，不占这条 503 的响应时间。alertRouteGap 自己吞异常、自己冷却去重。
-         */
         c.executionCtx?.waitUntil?.(
           Promise.resolve(written).then(() => alertRouteGap(c.env, { model: requestedModel })),
         );
         await release();
         return fail(`没有可用于模型 ${requestedModel} 的渠道`, 'invalid_request_error', 503);
       }
-      break;
+      return fail(`令牌无权访问模型 ${requestedModel}`, 'permission_error', 403);
+    }
+  }
+
+  while (quotaAttempts < maxAttempts) {
+    const attempt = round++;
+    const selection = await selectChannel(c.env, requestedModel, tried, colo, channelAcl, aliasIndex);
+
+    /*
+     * 令牌的渠道 ACL 把候选全拒了：这是**权限问题**，必须回 403 permission_error。
+     *
+     * 不能落到下面的 503 no_channel——那是在说「服务端没给这个模型配渠道」，会让
+     * 调用方去查路由配置，而实际原因是这把 Key 的白/黑名单不允许。两类原因混在
+     * 一个状态码里，排查方向从一开始就是错的。
+     */
+    if (selection?.kind === 'acl_denied') {
+      const reason =
+        selection.aclMode === 'whitelist'
+          ? `令牌的渠道白名单没有匹配到可用于模型 ${requestedModel} 的渠道`
+          : `令牌的渠道黑名单排除了所有可用于模型 ${requestedModel} 的渠道`;
+      events.push({
+        stage: 'acl_denied',
+        status: 403,
+        modelName: requestedModel,
+        userId: user.id,
+        attempt,
+        final: true,
+        errorCode: 'acl_denied',
+        errorText: reason,
+      });
+      flushEvents();
+      await release();
+      return fail(reason, 'permission_error', 403);
+    }
+
+    if (!selection) {
+      /*
+       * 走到这里有两种完全不同的情况，必须分开：
+       *
+       *   attempt === 0：配置里**真的没有**该模型的启用渠道 → 真·路由缺口，
+       *     记 no_channel 事件 + 告警 + 503。
+       *   attempt > 0：候选已经试完（前面的尝试都失败了）→ **不是缺口**，
+       *     模型有渠道、渠道也启用着，只是这次全挂了。真实原因已经在
+       *     upstream/network 事件里，这里再记一条 no_channel 只会把健康的
+       *     模型（声明/启用 1/1）冤枉成"路由缺口"（2026-11-14 实况：
+       *     elephant-1 因上游 502 重试耗尽，被记成缺口）。
+       */
+      if (attempt > 0) break;
+
+      events.push({
+        stage: 'no_channel',
+        status: 503,
+        modelName: requestedModel,
+        userId: user.id,
+        attempt,
+        final: true,
+        errorCode: 'no_channel',
+      });
+
+      const written = flushEvents();
+      /*
+       * 路由缺口告警（lib/route-alert.ts）。排在事件落库之后，「近 1 小时次数」才含本次；
+       * 挂 waitUntil，不占这条 503 的响应时间。alertRouteGap 自己吞异常、自己冷却去重。
+       */
+      c.executionCtx?.waitUntil?.(
+        Promise.resolve(written).then(() => alertRouteGap(c.env, { model: requestedModel })),
+      );
+      await release();
+      return fail(`没有可用于模型 ${requestedModel} 的渠道`, 'invalid_request_error', 503);
     }
 
     /*
@@ -859,7 +920,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
       const message = `渠道 ${channel.name} 响应体读取/解析失败: ${e?.message ?? e}`;
       return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'upstream', errorText: message };
     } finally {
-      clearTimeout(bodyTimer);
+      if (typeof bodyTimer === 'number') clearTimeout(bodyTimer);
     }
     const { body: converted, usage } = adaptor.convertResponse(json, ctx);
     /*

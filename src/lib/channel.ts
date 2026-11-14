@@ -134,14 +134,36 @@ export async function deleteAbilities(env: Env, channelId: number): Promise<void
 }
 
 /**
- * selectChannel 的结果：选到了渠道、一个都没有（503 no_channel）、或候选全部
- * 处于**仍有效**的 403 软熔断。最后一种带着最早到期的记录回给调用方，由它
- * 0 fetch 直接回 403（复用缓存的错误 message）——熔断期内不发任何探测，
- * 恢复探测只发生在记录过期、渠道重新进入正常候选之后。
+ * 该模型（别名联通块的任一成员）是否有**启用**渠道声明它。
+ *
+ * 只用来区分两种完全不同的拒绝原因——「模型根本不存在」（配置问题，503）与
+ * 「令牌无权访问」（权限问题，403）。权限判定之前先问这一句，否则对不存在的
+ * 模型回 403 会把调用方引去查令牌配置，而真正要修的是模型名或渠道声明。
+ */
+export async function anyChannelServes(env: Env, members: string[]): Promise<boolean> {
+  if (!members.length) return false;
+  const row = await env.DB.prepare(
+    `SELECT 1 AS hit FROM abilities WHERE model IN (${members.map(() => '?').join(',')}) AND enabled = 1 LIMIT 1`,
+  )
+    .bind(...members)
+    .first<{ hit: number }>();
+  return !!row;
+}
+
+/**
+ * selectChannel 的结果：
+ *   - channel：选到了渠道；
+ *   - acl_denied：**令牌的渠道 ACL 拒绝了全部候选**——这是权限问题，调用方必须回
+ *     403 permission_error，不能伪装成「没有可用渠道」（503 会让人去查路由配置）；
+ *   - all_denied_403：候选全部处于**仍有效**的 403 软熔断。带着最早到期的记录回给
+ *     调用方，由它 0 fetch 直接回 403（复用缓存的错误 message）——熔断期内不发任何
+ *     探测，恢复探测只发生在记录过期、渠道重新进入正常候选之后；
+ *   - null：配置里根本没有该模型的启用渠道（服务端路由缺口，调用方回 503 no_channel）。
  */
 export type ChannelSelection =
   | { kind: 'channel'; channel: ChannelRow; /** 别名解析后，该渠道在 abilities 里拥有的成员名（无别名 = 请求名）。 */ matchedModel: string }
-  | { kind: 'all_denied_403'; earliest: Deny403Entry };
+  | { kind: 'all_denied_403'; earliest: Deny403Entry }
+  | { kind: 'acl_denied'; aclMode: 'whitelist' | 'blacklist' };
 
 /**
  * Picks a channel for a model: highest priority tier first, then a weighted
@@ -182,7 +204,8 @@ export async function selectChannel(
    * 令牌级渠道 ACL（白/黑名单），在冷却/熔断检查**之前**——不允许的渠道连冷却
    * 状态都不必查。条目 = 渠道 ID 或 渠道标签（channels.tags，多值，无倍率）。
    * 标签匹配 = 渠道标签数组包含该条目（一个渠道可同时属于多个标签）。
-   * 白名单无匹配条目 = 全禁（null → 503 no_channel）；黑名单空 = 全放。
+   * 白名单无匹配条目 / 黑名单全覆盖 = 令牌无权用这些渠道 → 回 acl_denied，
+   * 由调用方转成 **403 permission_error**（不是 503：模型配置着，是权限挡住了）。
    * 过滤发生在候选生成阶段，重试/failover 的每一轮都带同一份 ACL。
    */
   if (acl) {
@@ -204,7 +227,7 @@ export async function selectChannel(
         })()
       : new Map<number, string[]>();
     const allowed = candidates.filter((r) => (acl.mode === 'whitelist' ? match(r.channel_id) : !match(r.channel_id)));
-    if (!allowed.length) return null;
+    if (!allowed.length) return { kind: 'acl_denied', aclMode: acl.mode };
     candidates = allowed;
   }
 

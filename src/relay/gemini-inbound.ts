@@ -17,7 +17,7 @@ export class GeminiInboundError extends Error {}
 
 /** Gemini 请求 → 中枢 ChatRequest。 */
 export function geminiToChatRequest(raw: any, model: string): ChatRequest {
-  if (!raw || typeof raw !== 'object') throw new GeminiInboundError('请求体不是合法的 JSON 对象');
+  if (!raw || typeof raw !== 'object') throw new GeminiInboundError('Request body is not a valid JSON object');
   const req: ChatRequest = { model };
   const messages: ChatRequest['messages'] = [];
 

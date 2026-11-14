@@ -235,10 +235,10 @@ export function geminiHandler(c: any) {
   const model = colon > 0 ? tail.slice(0, colon) : '';
   const action = colon > 0 ? tail.slice(colon + 1) : '';
   if (!model || (action !== 'generateContent' && action !== 'streamGenerateContent')) {
-    return c.json({ error: { code: 404, message: `未知的 Gemini 端点：${tail}`, status: 'NOT_FOUND' } }, 404);
+    return c.json({ error: { code: 404, message: `Unknown Gemini endpoint: ${tail}`, status: 'NOT_FOUND' } }, 404);
   }
   if (action === 'streamGenerateContent' && new URL(c.req.url).searchParams.get('alt') !== 'sse') {
-    return c.json({ error: { code: 400, message: '流式仅支持 streamGenerateContent?alt=sse（官方 SDK 的默认走法）', status: 'INVALID_ARGUMENT' } }, 400);
+    return c.json({ error: { code: 400, message: 'Streaming requires streamGenerateContent?alt=sse (the official SDK default)', status: 'INVALID_ARGUMENT' } }, 400);
   }
   return handleRelay(c, 'chat', 'chat/completions', 'gemini', { urlModel: model, forceStream: action === 'streamGenerateContent' });
 }
@@ -292,13 +292,13 @@ async function handleRelay(
     }
   } catch (e) {
     if (e instanceof ResponsesInboundError || e instanceof GeminiInboundError) return fail(e.message, 'invalid_request_error', 400);
-    return fail('请求体不是合法的 JSON', 'invalid_request_error', 400);
+    return fail('Request body is not valid JSON', 'invalid_request_error', 400);
   }
   if (via?.urlModel) body.model = via.urlModel;
   if (via?.forceStream) body.stream = true;
 
   const requestedModel = String(body.model ?? '');
-  if (!requestedModel) return fail('缺少 model 字段', 'invalid_request_error', 400);
+  if (!requestedModel) return fail("Missing 'model' field", 'invalid_request_error', 400);
 
   /*
    * 活跃请求登记（migration 0021）：鉴权通过即写一行，响应完全送达后由 waitUntil 删除。
@@ -334,10 +334,10 @@ async function handleRelay(
     decisionOnly = isDecisionOnlyModel(requestedModel, options, await channelDeclaredDecisionOnly(c.env));
   }
   if (mode === 'decisions' && !decisionOnly) {
-    return fail(`模型 ${requestedModel} 不是决策模型，请改用 /v1/chat/completions`, 'invalid_request_error', 400);
+    return fail(`Model ${requestedModel} is not a decision model; use /v1/chat/completions instead`, 'invalid_request_error', 400);
   }
   if (mode !== 'decisions' && decisionOnly) {
-    return fail(`模型 ${requestedModel} 只支持决策接口，请改用 POST /v1/decisions 或 POST /v1/systemone`, 'invalid_request_error', 400);
+    return fail(`Model ${requestedModel} only supports the decisions API; use POST /v1/decisions or POST /v1/systemone`, 'invalid_request_error', 400);
   }
   /*
    * 入站决策方言：state = TypeSafe（System One），input = OpenAI（Decisions）。
@@ -352,7 +352,7 @@ async function handleRelay(
    * 「有人在按流式用一个非流式接口」。改写客户端的请求是在替它把 bug 藏起来。
    */
   if (mode === 'decisions' && body.stream) {
-    return fail('决策接口不支持流式（stream），请去掉该字段后重试', 'invalid_request_error', 400);
+    return fail('The decisions API does not support streaming (stream); remove that field and retry', 'invalid_request_error', 400);
   }
 
   /*
@@ -463,9 +463,9 @@ async function handleRelay(
           Promise.resolve(written).then(() => alertRouteGap(c.env, { model: requestedModel })),
         );
         await release();
-        return fail(`没有可用于模型 ${requestedModel} 的渠道`, 'invalid_request_error', 503);
+        return fail(`No channel available for model ${requestedModel}`, 'invalid_request_error', 503);
       }
-      return fail(`令牌无权访问模型 ${requestedModel}`, 'permission_error', 403);
+      return fail(`Token is not allowed to access model ${requestedModel}`, 'permission_error', 403);
     }
   }
 
@@ -483,8 +483,8 @@ async function handleRelay(
     if (selection?.kind === 'acl_denied') {
       const reason =
         selection.aclMode === 'whitelist'
-          ? `令牌的渠道白名单没有匹配到可用于模型 ${requestedModel} 的渠道`
-          : `令牌的渠道黑名单排除了所有可用于模型 ${requestedModel} 的渠道`;
+          ? `Token channel whitelist matched no upstream serving model ${requestedModel}`
+          : `Token channel blacklist excluded every upstream serving model ${requestedModel}`;
       events.push({
         stage: 'acl_denied',
         status: 403,
@@ -533,7 +533,7 @@ async function handleRelay(
         Promise.resolve(written).then(() => alertRouteGap(c.env, { model: requestedModel })),
       );
       await release();
-      return fail(`没有可用于模型 ${requestedModel} 的渠道`, 'invalid_request_error', 503);
+      return fail(`No channel available for model ${requestedModel}`, 'invalid_request_error', 503);
     }
 
     /*
@@ -628,7 +628,7 @@ async function handleRelay(
       const pre = await preConsume(c.env, token, user, amount, reserveRef);
       if (!pre.ok) {
         flushEvents();
-        return fail(pre.message ?? '额度不足', 'insufficient_quota', 403);
+        return fail(pre.message ?? 'Insufficient quota', 'insufficient_quota', 403);
       }
       reservation = {
         amount,
@@ -739,24 +739,24 @@ async function handleRelay(
   // 一个上游请求都没发出去（全部渠道被定价关卡跳过）：如实告诉用户是价格没配，
   // 而不是「渠道全部失败」——前者去价格页补一行就能修，后者只会让人去查渠道。
   if (!lastError && pricingSkips > 0) {
-    if (protocol === 'anthropic') return c.json(anthropicError(`模型 ${requestedModel} 未配置价格（model_price_not_configured）`, 'api_error'), 503);
-    if (protocol === 'gemini') return c.json({ error: { code: 503, message: `模型 ${requestedModel} 未配置价格（model_price_not_configured）`, status: 'UNAVAILABLE' } }, 503);
-    return c.json(errorBody(`模型 ${requestedModel} 未配置价格（strict billing）`, 'invalid_request_error', MODEL_PRICE_NOT_CONFIGURED), 503);
+    if (protocol === 'anthropic') return c.json(anthropicError(`Model ${requestedModel} has no price configured (model_price_not_configured)`, 'api_error'), 503);
+    if (protocol === 'gemini') return c.json({ error: { code: 503, message: `Model ${requestedModel} has no price configured (model_price_not_configured)`, status: 'UNAVAILABLE' } }, 503);
+    return c.json(errorBody(`Model ${requestedModel} has no price configured (strict billing)`, 'invalid_request_error', MODEL_PRICE_NOT_CONFIGURED), 503);
   }
   if (protocol === 'anthropic') {
-    const message = typeof (lastError?.body as any)?.error?.message === 'string' ? (lastError!.body as any).error.message : '上游渠道全部失败';
+    const message = typeof (lastError?.body as any)?.error?.message === 'string' ? (lastError!.body as any).error.message : 'All upstream channels failed';
     return c.json(anthropicError(message, 'api_error'), (lastError?.status ?? 502) as any);
   }
   // 错误信息统一过滤：只透传上游 error.message（可读原因），丢弃响应体其余字段——
   // 防止上游在错误里意外回显密钥、请求体等敏感内容（审计建议）。
-  const safe = lastError ? clientSafeErrorBody(lastError.body, lastError.status) : errorBody('上游渠道全部失败', 'upstream_error');
+  const safe = lastError ? clientSafeErrorBody(lastError.body, lastError.status) : errorBody('All upstream channels failed', 'upstream_error');
   return c.json(safe, (lastError?.status ?? 502) as any);
 }
 
 /** 上游错误体 → 客户端安全的错误形状：只保留 message/type/code，其余一律丢弃。 */
 function clientSafeErrorBody(body: unknown, status: number) {
   const err = (body as any)?.error;
-  const message = typeof err?.message === 'string' && err.message ? err.message.slice(0, 2000) : `上游返回 ${status}`;
+  const message = typeof err?.message === 'string' && err.message ? err.message.slice(0, 2000) : `Upstream returned ${status}`;
   const type = typeof err?.type === 'string' && err.type ? err.type : 'upstream_error';
   const code = typeof err?.code === 'string' ? err.code : typeof err?.code === 'number' ? String(err.code) : null;
   return errorBody(message, type, code);
@@ -823,10 +823,10 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
    */
   if (mode === 'decisions') {
     const support = !adaptor.supportsDecisions
-      ? { ok: false as const, reason: `渠道类型 ${channel.type} 不是 OpenAI 形状` }
+      ? { ok: false as const, reason: `channel type ${channel.type} is not OpenAI-shaped` }
       : decisionsSupport(channel, config);
     if (!support.ok) {
-      const message = `渠道 ${channel.name} 不支持决策接口：${support.reason}`;
+      const message = `Channel ${channel.name} does not support the decisions API: ${support.reason}`;
       return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
     }
     // 路径由渠道决定（decisions→/v1/decisions、systemone→/v1/systemone，config.decisions_path 可覆盖）。
@@ -840,7 +840,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
      * 就已按决策模型拦下 chat；这条守卫是给「模型同时挂在 chat 渠道」的边角：
      * 500 = 跳过此渠道继续换下一个，而不是把整条路径打死。
      */
-    const message = `渠道 ${channel.name} 是决策专用渠道（${channel.type}），只承接 POST /v1/decisions 或 POST /v1/systemone`;
+    const message = `Channel ${channel.name} is decisions-only (${channel.type}); it serves only POST /v1/decisions or POST /v1/systemone`;
     return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
   }
 
@@ -848,7 +848,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
   try {
     built = adaptor.buildRequest(body, ctx);
   } catch (e: any) {
-    const message = `渠道 ${channel.name} 配置错误: ${e?.message ?? e}`;
+    const message = `Channel ${channel.name} misconfigured: ${e?.message ?? e}`;
     return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
   }
 
@@ -858,7 +858,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
   // 120s 一刀切：45 万 token 的正常长流会被拦腰截断），存活判据是 sse.ts 的空闲超时。
   const headersMs = Math.max(1, Number(options.UpstreamHeadersTimeoutSec ?? 60)) * 1000;
   const ctrl = new AbortController();
-  const headersTimer = setTimeout(() => ctrl.abort(new Error(`响应头超时（${headersMs / 1000}s 无响应）`)), headersMs);
+  const headersTimer = setTimeout(() => ctrl.abort(new Error(`Upstream headers timeout (no response within ${headersMs / 1000}s)`)), headersMs);
   try {
     upstream = await fetch(built.url, {
       method: 'POST',
@@ -867,7 +867,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
       signal: ctrl.signal,
     });
   } catch (e: any) {
-    const message = `请求渠道 ${channel.name} 失败: ${e?.message ?? e}`;
+    const message = `Request to channel ${channel.name} failed: ${e?.message ?? e}`;
     return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'network', errorText: message };
   } finally {
     clearTimeout(headersTimer); // 头到了就解除信号——此后绝不再 abort，长流不受任何总时长限制
@@ -888,7 +888,7 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
     try {
       parsed = JSON.parse(text);
     } catch {
-      parsed = errorBody(text.slice(0, 2000) || `上游返回 ${upstream.status}`, 'upstream_error');
+      parsed = errorBody(text.slice(0, 2000) || `Upstream returned ${upstream.status}`, 'upstream_error');
     }
     return { kind: 'error', status: upstream.status, body: parsed, stage: 'upstream', errorText: text };
   }
@@ -903,24 +903,26 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
      */
     let json: any;
     const bodyMs = Math.max(0, Number(options.UpstreamBodyTimeoutSec ?? 600)) * 1000;
-    let bodyTimer: ReturnType<typeof setTimeout> | undefined;
+    // any：workerd 的 setTimeout 返回数字，Node（测试环境）返回 Timeout 对象——
+    // 用 typeof==='number' 判会漏清定时器，进程要多等满超时才退出。
+    let bodyTimer: any;
     try {
       json = await Promise.race([
         upstream.json<any>(),
         bodyMs
           ? new Promise<never>((_, rej) => {
               bodyTimer = setTimeout(() => {
-                ctrl.abort(new Error('响应体超时'));
-                rej(new Error(`响应体读取超时（${bodyMs / 1000}s）`));
+                ctrl.abort(new Error('Upstream body timeout'));
+                rej(new Error(`Upstream body read timeout (${bodyMs / 1000}s)`));
               }, bodyMs);
             })
           : new Promise<never>(() => {}),
       ]);
     } catch (e: any) {
-      const message = `渠道 ${channel.name} 响应体读取/解析失败: ${e?.message ?? e}`;
+      const message = `Channel ${channel.name} response body read/parse failed: ${e?.message ?? e}`;
       return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'upstream', errorText: message };
     } finally {
-      if (typeof bodyTimer === 'number') clearTimeout(bodyTimer);
+      if (bodyTimer !== undefined) clearTimeout(bodyTimer);
     }
     const { body: converted, usage } = adaptor.convertResponse(json, ctx);
     /*
@@ -1027,7 +1029,7 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
         controller.enqueue(encoder.encode(tail));
       } catch (e: any) {
         const idle = e?.name === 'UpstreamIdleTimeoutError';
-        const message = idle ? `流式空闲超时: ${e.message}` : `流式传输中断: ${e?.message ?? e}`;
+        const message = idle ? `Stream idle timeout: ${e.message}` : `Stream interrupted: ${e?.message ?? e}`;
         /*
          * 客户端早就拿到 200 了，所以这次不算进用户可见的失败率（final=0），
          * 但渠道确实断在半路上，健康度必须看得见。空闲超时单独记 errorCode，

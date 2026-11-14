@@ -110,7 +110,7 @@ export function decisionsSupport(
   if (host && DECISIONS_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`))) {
     return { ok: true, path: DECISIONS_PATH };
   }
-  return { ok: false, reason: host ? `上游 ${host} 未声明决策接口` : '渠道未配置 base_url' };
+  return { ok: false, reason: host ? `upstream ${host} does not declare the decisions API` : 'channel has no base_url configured' };
 }
 
 function hostOf(baseURL: string): string | null {

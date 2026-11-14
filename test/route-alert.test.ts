@@ -247,7 +247,7 @@ test('企业微信发送失败（HTTP 500 / errcode / 抛异常）：503 不受�
       const res = await relay(envOf(w, kv, { WECOM_HEALTH_WEBHOOK_URL: WEBHOOK }));
       assert.equal(res.status, 503, '告警失败绝不改变主流程');
       const body = (await res.json()) as any;
-      assert.match(body.error.message, /没有可用于模型/);
+      assert.match(body.error.message, /No channel available for model/);
       assert.equal(w.credits.reduce((s, c) => s + c.delta, 0), 0, '预扣照常退回');
       assert.equal(f.sent.length, 1);
       assert.ok(errs.lines.length > 0, '失败要留日志');

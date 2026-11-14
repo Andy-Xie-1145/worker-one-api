@@ -27,7 +27,7 @@ export class ResponsesInboundError extends Error {
 
 /** Responses 请求 → 中枢 ChatRequest。不合法处抛 ResponsesInboundError。 */
 export function responsesToChatRequest(raw: any): ChatRequest {
-  if (!raw || typeof raw !== 'object') throw new ResponsesInboundError('请求体不是合法的 JSON 对象');
+  if (!raw || typeof raw !== 'object') throw new ResponsesInboundError('Request body is not a valid JSON object');
   if (raw.previous_response_id !== undefined && raw.previous_response_id !== null) {
     throw new ResponsesInboundError(
       '本网关是无状态代理，不支持 previous_response_id（无法引用历史响应）。请携带完整对话上下文重试。',
@@ -86,7 +86,7 @@ export function responsesToChatRequest(raw: any): ChatRequest {
       // reasoning 等状态 item：中枢形状无处安放，跳过（不影响请求语义）。
     }
   } else if (input !== undefined) {
-    throw new ResponsesInboundError('input 必须是字符串或 item 数组');
+    throw new ResponsesInboundError("'input' must be a string or an array of items");
   }
 
   if (raw.max_output_tokens !== undefined) req.max_tokens = Number(raw.max_output_tokens) || undefined;

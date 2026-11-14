@@ -12,7 +12,7 @@ export const azureAdaptor: Adaptor = {
 
   buildRequest(req: ChatRequest, ctx: AdaptorContext) {
     const base = ctx.channel.base_url;
-    if (!base) throw new Error('Azure 渠道必须填写 base_url（形如 https://<resource>.openai.azure.com）');
+    if (!base) throw new Error('Azure channel requires base_url (e.g. https://<resource>.openai.azure.com)');
     const apiVersion = ctx.config.api_version || DEFAULT_API_VERSION;
     // The deployment name is the mapped model name.
     const deployment = ctx.config.deployment || ctx.upstreamModel;

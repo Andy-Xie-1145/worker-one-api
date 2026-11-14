@@ -294,7 +294,7 @@ test('令牌模型白名单不含 Jev 时 403', async () => {
   w.token.models = 'gpt-4o,glm-5.2';
   const res = await call(w, '/v1/decisions', DECISION_BODY);
   assert.equal(res.status, 403);
-  assert.match((await res.json<any>()).error.message, /无权访问/);
+  assert.match((await res.json<any>()).error.message, /not allowed to access/);
   assert.equal(w.credits.length, 0);
 });
 
@@ -537,7 +537,7 @@ test('没显式声明的 OpenAI 兼容渠道默认不支持决策接口', async 
   }
   assert.equal(script.calls.length, 0);
   assert.equal(res!.status, 500);
-  assert.match((await res!.json<any>()).error.message, /不支持决策接口/);
+  assert.match((await res!.json<any>()).error.message, /does not support the decisions API/);
   assert.equal(net(w), 0, '没打出去也要退款');
 });
 
@@ -553,7 +553,7 @@ test('非 OpenAI 形状的渠道被挡在决策接口之外，而不是当成 ch
   }
   assert.equal(script.calls.length, 0, '不支持决策的渠道不该发出任何上游请求');
   assert.equal(res!.status, 500);
-  assert.match((await res!.json<any>()).error.message, /不支持决策接口/);
+  assert.match((await res!.json<any>()).error.message, /does not support the decisions API/);
   assert.equal(net(w), 0, '构造失败也要退款');
 });
 
@@ -580,7 +580,7 @@ test('decisions 类型：模型自动是决策模型（无需声明），chat �
   // chat 门：分诊按渠道维度把它拦下（不靠 DecisionOnlyModels，也不靠 jev 前缀）
   const chatRes = await call(w, '/v1/chat/completions', { model: DMODEL, messages: [{ role: 'user', content: 'hi' }] });
   assert.equal(chatRes.status, 400);
-  assert.match((await chatRes.json<any>()).error.message, /只支持决策接口/);
+  assert.match((await chatRes.json<any>()).error.message, /only supports the decisions API/);
 
   // /v1/models 默认藏起，?capability=decisions 显式可查
   const list = await ((await call(w, '/v1/models', {}, { method: 'GET' })).json as any)();

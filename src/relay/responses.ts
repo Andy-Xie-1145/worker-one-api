@@ -196,7 +196,7 @@ export const openaiResponsesAdaptor: Adaptor = {
        */
       case 'response.failed': {
         const err = json.response?.error ?? json.error;
-        const message = String(err?.message ?? json.response?.status ?? '上游响应失败');
+        const message = String(err?.message ?? json.response?.status ?? 'Upstream response failed');
         const usage = json.response?.usage ? responsesUsage(json.response.usage) : undefined;
         return {
           chunks: [{ id: state.id, object: 'chat.completion.chunk', created: state.created, model: ctx.requestedModel, choices: [], error: { message, type: 'upstream_error', code: err?.code ?? null }, ...(usage ? { usage } : {}) }],

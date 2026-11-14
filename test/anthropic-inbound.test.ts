@@ -84,7 +84,7 @@ test('x-api-key 鉴权头在这两个路径上都照收（Anthropic 客户端就
     assert.equal(res.status, 401, path + ' 应走同样的鉴权');
     const json: any = await res.json();
     assert.equal(json.type, 'error');
-    assert.match(json.error.message, /令牌/);
+    assert.match(json.error.message, /API key/);
   }
 });
 

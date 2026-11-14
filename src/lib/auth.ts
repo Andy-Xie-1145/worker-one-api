@@ -23,11 +23,11 @@ import { applyCredit } from './ledger';
  */
 export function checkAdminKey(env: Env, raw: string): { ok: true } | { ok: false; status: 401 | 503; error: string } {
   const expected = env.ADMIN_KEY;
-  if (!expected) return { ok: false, status: 503, error: 'ADMIN_KEY 未配置，管理面不可用（在 wrangler.jsonc 的 vars 里设置）' };
+  if (!expected) return { ok: false, status: 503, error: 'ADMIN_KEY is not configured; admin API unavailable (set it in wrangler.jsonc vars)' };
   const provided = (raw ?? '').trim().replace(/^Bearer\b\s*/i, '');
-  if (!provided) return { ok: false, status: 401, error: '未提供管理令牌' };
+  if (!provided) return { ok: false, status: 401, error: 'Missing admin key' };
   const enc = new TextEncoder();
-  if (!timingSafeEqual(enc.encode(provided), enc.encode(expected))) return { ok: false, status: 401, error: '管理令牌不正确' };
+  if (!timingSafeEqual(enc.encode(provided), enc.encode(expected))) return { ok: false, status: 401, error: 'Invalid admin key' };
   return { ok: true };
 }
 
@@ -99,7 +99,7 @@ const TOKEN_CACHE_TTL = 60;
 /** Resolves an `Authorization: Bearer sk-...` API key to its token + owner. */
 export async function authenticateToken(env: Env, raw: string): Promise<TokenAuthResult | { error: string; status: number }> {
   const key = normalizeKey(raw);
-  if (!key) return { error: '未提供令牌', status: 401 };
+  if (!key) return { error: 'Missing API key', status: 401 };
 
   const cacheKey = `token:${key}`;
   /*
@@ -123,11 +123,11 @@ export async function authenticateToken(env: Env, raw: string): Promise<TokenAut
       }
     }
   }
-  if (!token) return { error: '无效的令牌', status: 401 };
+  if (!token) return { error: 'Invalid API key', status: 401 };
 
-  if (token.status === TokenStatusExpired) return { error: '该令牌已过期', status: 403 };
-  if (token.status === TokenStatusExhausted) return { error: '该令牌额度已用尽', status: 403 };
-  if (token.status !== TokenStatusEnabled) return { error: '该令牌状态不可用', status: 403 };
+  if (token.status === TokenStatusExpired) return { error: 'API key expired', status: 403 };
+  if (token.status === TokenStatusExhausted) return { error: 'API key quota exhausted', status: 403 };
+  if (token.status !== TokenStatusEnabled) return { error: 'API key disabled', status: 403 };
 
   const now = Math.floor(Date.now() / 1000);
   if (token.expired_time !== -1 && token.expired_time < now) {
@@ -137,7 +137,7 @@ export async function authenticateToken(env: Env, raw: string): Promise<TokenAut
     } catch {
       // KV 删除失败：条目 60 秒后自然过期，短暂读到旧状态可接受。
     }
-    return { error: '该令牌已过期', status: 403 };
+    return { error: 'API key expired', status: 403 };
   }
   if (!token.unlimited_quota && token.remain_quota <= 0) {
     await env.DB.prepare('UPDATE tokens SET status = ? WHERE id = ?').bind(TokenStatusExhausted, token.id).run();
@@ -146,11 +146,11 @@ export async function authenticateToken(env: Env, raw: string): Promise<TokenAut
     } catch {
       // 同上：删除失败只影响缓存新鲜度。
     }
-    return { error: '该令牌额度已用尽', status: 403 };
+    return { error: 'API key quota exhausted', status: 403 };
   }
 
   const user = await ensureOwner(env);
-  if (user.status !== StatusEnabled) return { error: '账户已被禁用', status: 403 };
+  if (user.status !== StatusEnabled) return { error: 'Account disabled', status: 403 };
 
   // Deliberately no balance check here. Authentication answers "who is this",
   // not "can they afford it" — the guarded debit in preConsume() is the

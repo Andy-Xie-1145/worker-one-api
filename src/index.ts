@@ -29,7 +29,7 @@ const maintenanceGate: MiddlewareHandler<{ Bindings: Env }> = async (c, next) =>
   if (c.env.MAINTENANCE !== 'on') return next();
   const path = c.req.path;
   if (path === '/api/status' || path.startsWith('/api/status/')) return next();
-  const message = '服务维护中（迁移窗口），请稍后重试';
+  const message = 'Service under maintenance, please retry later';
   return c.json(
     { success: false, message, error: { message, type: 'maintenance' } },
     503,
@@ -69,7 +69,7 @@ app.all('*', (c) => c.env.ASSETS.fetch(c.req.raw));
 
 app.onError((err, c) => {
   console.error('unhandled', err);
-  return c.json({ success: false, message: `服务器内部错误: ${err.message}`, error: { message: err.message, type: 'internal_error' } }, 500);
+  return c.json({ success: false, message: `Internal server error: ${err.message}`, error: { message: err.message, type: 'internal_error' } }, 500);
 });
 
 /**

@@ -6,7 +6,7 @@ export interface SSEEvent {
 /** 流式空闲超时：连续 idleMs 毫秒没有任何字节才抛——健康生成每秒都在吐字，永不触发。 */
 export class UpstreamIdleTimeoutError extends Error {
   constructor(public idleMs: number) {
-    super(`上游 ${Math.round(idleMs / 1000)}s 无任何数据，连接判死`);
+    super(`Upstream sent no data for ${Math.round(idleMs / 1000)}s; connection considered dead`);
     this.name = 'UpstreamIdleTimeoutError';
   }
 }

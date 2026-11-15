@@ -20,7 +20,7 @@ import { recordRelayEvents, type RelayEvent } from '../lib/health';
 import { alertRouteGap } from '../lib/route-alert';
 import { getAdaptor } from '../relay';
 import { type AdaptorContext, type ChatRequest, type RelayMode, newStreamState } from '../relay/adaptor';
-import { readSSE, sseChunk, SSE_DONE, SSE_HEADERS } from '../relay/sse';
+import { readSSE, sseChunk, SSE_DONE, SSE_HEADERS, type SSEEvent } from '../relay/sse';
 import { estimateUsage } from '../relay/openai';
 import { DECISIONS_PATH, SYSTEMONE_PATH, decisionsPromptPayload, decisionsSupport, estimateDecisionsUsage } from '../relay/decisions';
 import {
@@ -962,6 +962,23 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
 }
 
 /**
+ * 这个 chat chunk 是否携带「生成已终结」的证据。
+ *
+ * 两种形态（都按 OpenAI 兼容流的口径）：
+ *   - `choices[0].finish_reason` 非空（stop / length / tool_calls …）；
+ *   - include_usage 的末尾 usage-only chunk：带 usage 且 choices 为空。
+ *
+ * HPD 的 sol/terra 在 [DONE] 与连接关闭上都不靠谱，但这两类证据稳定出现，
+ * 所以用它来判定"内容已完整、可以收尾"，而不是死等 `data: [DONE]`。
+ */
+function isTerminalChatChunk(chunk: any): boolean {
+  if (!chunk || typeof chunk !== 'object') return false;
+  const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+  if (choice && choice.finish_reason) return true;
+  return !!chunk.usage && Array.isArray(chunk.choices) && chunk.choices.length === 0;
+}
+
+/**
  * Pipes the upstream SSE through the adaptor's converter without buffering,
  * accumulating usage so billing can be settled once the stream ends.
  */
@@ -1003,11 +1020,98 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
       // 流式空闲超时（默认 300s 无字节才判死，UpstreamBodyIdleTimeoutSec 可调）：
       // 没有总时长上限——健康长流跑多久都行，网关绝不主动切。
       const idleMs = Math.max(1, Number(options.UpstreamBodyIdleTimeoutSec ?? 300)) * 1000;
+      /*
+       * 终止证据之后的收尾窗口（HPD sol/terra 的固定毛病，2026-11-14 生产实测）：
+       * 它们发完内容后**不保证**补 `data: [DONE]`、也不保证干净关闭连接——有时直接
+       * 断连接（我们曾把它记成 stream_interrupted: Network connection lost），有时
+       * 干脆把连接吊着（客户端永远等不到结束标记）。
+       *
+       * 判据用「终止证据」而不是靠 [DONE]：finish_reason 非空，或 include_usage 的
+       * 末尾 usage-only chunk（choices 为空）。证据一到，内容与计费都已完整——
+       * 之后无论上游断开还是继续沉默，都按**正常结束**处理：补发我们自己的终结
+       * 事件（[DONE] / response.completed / message_stop），并给上游 3 秒收尾窗口。
+       */
+      const GRACE_MS = 3000;
+      let terminalSeen = false;
+      let graceTimer: any;
+      let fireGrace: (() => void) | null = null;
+      const graceP = new Promise<'grace'>((resolve) => { fireGrace = () => resolve('grace'); });
+      const armGrace = (): void => {
+        if (terminalSeen) return;
+        terminalSeen = true;
+        graceTimer = setTimeout(() => fireGrace?.(), GRACE_MS);
+      };
+      const finalizeTail = (): void => {
+        const tail = anthropic
+          ? finishAnthropicStream(anthropic, usage)
+          : responsesEnc
+            ? finishResponsesStream(responsesEnc, requestedModel, usage)
+            : geminiEnc
+              ? finishGeminiStream(geminiEnc, requestedModel, usage)
+              : SSE_DONE;
+        controller.enqueue(encoder.encode(tail));
+      };
+      const iter = readSSE(upstream.body!, { idleMs })[Symbol.asyncIterator]();
+      /*
+       * 上游从不给 finish_reason 时由网关补齐（HPD sol/terra 的固定毛病，2026-11-15）：
+       * 它们的 SSE 带工具参数、也带 [DONE]，但整条流里**一个 finish_reason 都没有**。
+       * OpenAI 客户端靠 finish_reason 判断"为什么结束"，Anthropic/Gemini 客户端更直接
+       * ——它们的结束标记就是 message_delta.stop_reason / finishReason，缺了等于流没结束。
+       * 非流式响应里这个字段是有的，所以同一个请求改非流式就正常。
+       *
+       * 补发时机：流收尾前（无论上游给的是 [DONE]、断连接还是沉默），只要真有内容产出
+       * 且全程未见 finish_reason，就构造一个标准终止 chunk 走同一条编码管线：
+       *   有工具调用 → tool_calls；撞到 max_tokens → length；否则 stop。
+       */
+      let sawFinishReason = false;
+      let sawToolCall = false;
+      let sawAnyDelta = false;
+      let lastChunk: any = null;
+      const emitSyntheticFinish = (): void => {
+        if (sawFinishReason || !sawAnyDelta) return;
+        const maxTok = Number((body as any).max_tokens ?? (body as any).max_completion_tokens ?? 0);
+        const completion = usage?.completion_tokens ?? 0;
+        const finish = sawToolCall ? 'tool_calls' : maxTok > 0 && completion >= maxTok ? 'length' : 'stop';
+        const synthetic = {
+          id: lastChunk?.id ?? `chatcmpl-${requestId}`,
+          object: 'chat.completion.chunk',
+          created: Number(lastChunk?.created ?? Math.floor(Date.now() / 1000)),
+          model: requestedModel,
+          choices: [{ index: 0, delta: {}, finish_reason: finish }],
+        };
+        const out = adaptor.convertStreamEvent({ data: JSON.stringify(synthetic) }, ctx, state);
+        for (const chunk of out.chunks) {
+          const text = anthropic
+            ? encodeAnthropicChunk(chunk, requestedModel, anthropic)
+            : responsesEnc
+              ? encodeResponsesChunk(responsesEnc, chunk, requestedModel)
+              : geminiEnc
+                ? encodeGeminiChunk(geminiEnc, chunk, requestedModel)
+                : sseChunk(chunk);
+          controller.enqueue(encoder.encode(text));
+        }
+      };
       try {
-        for await (const event of readSSE(upstream.body!, { idleMs })) {
-          const out = adaptor.convertStreamEvent(event, ctx, state);
+        for (;;) {
+          const next = terminalSeen ? await Promise.race([iter.next(), graceP]) : await iter.next();
+          if (next === 'grace') break; // 收尾窗口用尽：上游不再说话，正常结束
+          const step = next as IteratorResult<SSEEvent>;
+          if (step.done) break; // 上游关闭连接：同样按正常结束（有无 [DONE] 都一样）
+          const out = adaptor.convertStreamEvent(step.value, ctx, state);
           if (out.usage && (out.usage.prompt_tokens || out.usage.completion_tokens)) usage = out.usage;
           for (const chunk of out.chunks) {
+            if (chunk && typeof chunk === 'object') {
+              lastChunk = chunk;
+              const ch = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+              if (ch) {
+                if (ch.finish_reason) sawFinishReason = true;
+                const d = ch.delta;
+                if (d && typeof d === 'object') {
+                  if (Array.isArray(d.tool_calls) && d.tool_calls.length) { sawToolCall = true; sawAnyDelta = true; }
+                  if ((typeof d.content === 'string' && d.content) || (typeof d.reasoning_content === 'string' && d.reasoning_content)) sawAnyDelta = true;
+                }
+              }
+            }
             const text = anthropic
               ? encodeAnthropicChunk(chunk, requestedModel, anthropic)
               : responsesEnc
@@ -1017,54 +1121,62 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
                   : sseChunk(chunk);
             controller.enqueue(encoder.encode(text));
           }
-          if (out.done) break;
+          if (out.done) { armGrace(); break; } // 上游给了 [DONE]
+          if (out.chunks.some(isTerminalChatChunk)) armGrace(); // finish_reason / usage 尾块
         }
-        const tail = anthropic
-          ? finishAnthropicStream(anthropic, usage)
-          : responsesEnc
-            ? finishResponsesStream(responsesEnc, requestedModel, usage)
-            : geminiEnc
-              ? finishGeminiStream(geminiEnc, requestedModel, usage)
-              : SSE_DONE;
-        controller.enqueue(encoder.encode(tail));
+        emitSyntheticFinish();
+        finalizeTail();
       } catch (e: any) {
-        const idle = e?.name === 'UpstreamIdleTimeoutError';
-        const message = idle ? `Stream idle timeout: ${e.message}` : `Stream interrupted: ${e?.message ?? e}`;
-        /*
-         * 客户端早就拿到 200 了，所以这次不算进用户可见的失败率（final=0），
-         * 但渠道确实断在半路上，健康度必须看得见。空闲超时单独记 errorCode，
-         * 「正常长流被误杀」与「连接假死」在事件页一眼可分。
-         */
-        if (options.HealthEventsEnabled !== false) {
-          c.executionCtx?.waitUntil?.(
-            recordRelayEvents(c.env, [{
-              stage: 'stream',
-              status: 200,
-              modelName: requestedModel,
-              channelId: channel.id,
-              channelType: channel.type,
-              userId: user.id,
-              final: false,
-              elapsedMs: Date.now() - started,
-              errorCode: idle ? 'stream_idle_timeout' : 'stream_interrupted',
-              errorText: message,
-            }]),
-          );
-        }
-        if (anthropic) {
-          controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify(anthropicError(message))}\n\n`));
-          controller.enqueue(encoder.encode(finishAnthropicStream(anthropic, usage)));
-        } else if (responsesEnc) {
-          // 编码器已经发过终结事件（例如上游错误 chunk 已经产出 response.failed）时
-          // 不再补发第二个，避免客户端见到「终结事件之后还有事件」。
-          if (!responsesEnc.finished) controller.enqueue(encoder.encode(responsesErrorEvent(requestedModel, message)));
-        } else if (geminiEnc) {
-          controller.enqueue(encoder.encode(geminiErrorEvent(message)));
+        if (terminalSeen) {
+          /*
+           * 终止证据已到，随后上游断连接（"Network connection lost"）或空闲超时：
+           * 内容与 usage 都已完整，这只是收尾不干净——按正常结束补发终结事件，
+           * 不记失败事件、不给客户端错误事件。缺 finish_reason 时一并补上。
+           */
+          emitSyntheticFinish();
+          finalizeTail();
         } else {
-          controller.enqueue(encoder.encode(sseChunk({ error: { message, type: 'upstream_error' } })));
-          controller.enqueue(encoder.encode(SSE_DONE));
+          const idle = e?.name === 'UpstreamIdleTimeoutError';
+          const message = idle ? `Stream idle timeout: ${e.message}` : `Stream interrupted: ${e?.message ?? e}`;
+          /*
+           * 客户端早就拿到 200 了，所以这次不算进用户可见的失败率（final=0），
+           * 但渠道确实断在半路上，健康度必须看得见。空闲超时单独记 errorCode，
+           * 「正常长流被误杀」与「连接假死」在事件页一眼可分。
+           */
+          if (options.HealthEventsEnabled !== false) {
+            c.executionCtx?.waitUntil?.(
+              recordRelayEvents(c.env, [{
+                stage: 'stream',
+                status: 200,
+                modelName: requestedModel,
+                channelId: channel.id,
+                channelType: channel.type,
+                userId: user.id,
+                final: false,
+                elapsedMs: Date.now() - started,
+                errorCode: idle ? 'stream_idle_timeout' : 'stream_interrupted',
+                errorText: message,
+              }]),
+            );
+          }
+          if (anthropic) {
+            controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify(anthropicError(message))}\n\n`));
+            controller.enqueue(encoder.encode(finishAnthropicStream(anthropic, usage)));
+          } else if (responsesEnc) {
+            // 编码器已经发过终结事件（例如上游错误 chunk 已经产出 response.failed）时
+            // 不再补发第二个，避免客户端见到「终结事件之后还有事件」。
+            if (!responsesEnc.finished) controller.enqueue(encoder.encode(responsesErrorEvent(requestedModel, message)));
+          } else if (geminiEnc) {
+            controller.enqueue(encoder.encode(geminiErrorEvent(message)));
+          } else {
+            controller.enqueue(encoder.encode(sseChunk({ error: { message, type: 'upstream_error' } })));
+            controller.enqueue(encoder.encode(SSE_DONE));
+          }
         }
       } finally {
+        clearTimeout(graceTimer);
+        // 手动迭代器不会自动收尾：显式 return 让 readSSE 的 finally 取消上游流。
+        try { await (iter as any).return?.(); } catch { /* 已关闭 */ }
         controller.close();
         settle();
       }

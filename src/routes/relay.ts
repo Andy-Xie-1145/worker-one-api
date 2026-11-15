@@ -1079,17 +1079,22 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
           model: requestedModel,
           choices: [{ index: 0, delta: {}, finish_reason: finish }],
         };
-        const out = adaptor.convertStreamEvent({ data: JSON.stringify(synthetic) }, ctx, state);
-        for (const chunk of out.chunks) {
-          const text = anthropic
-            ? encodeAnthropicChunk(chunk, requestedModel, anthropic)
-            : responsesEnc
-              ? encodeResponsesChunk(responsesEnc, chunk, requestedModel)
-              : geminiEnc
-                ? encodeGeminiChunk(geminiEnc, chunk, requestedModel)
-                : sseChunk(chunk);
-          controller.enqueue(encoder.encode(text));
-        }
+        /*
+         * 直接进**协议编码器**，绝不回灌 `adaptor.convertStreamEvent`。
+         *
+         * 合成 chunk 已经是中枢 chat 形状；而上游适配器（如 openai-responses）
+         * 的 convertStreamEvent 是按**上游方言**分派的（switch on type/event），
+         * 拿一个 chat chunk 喂它只会落到 default → chunks: [] → 静默丢弃。
+         * 这正是 HPD GPT 渠道（type=openai-responses）补发无效的根因（2026-11-15）。
+         */
+        const text = anthropic
+          ? encodeAnthropicChunk(synthetic, requestedModel, anthropic)
+          : responsesEnc
+            ? encodeResponsesChunk(responsesEnc, synthetic, requestedModel)
+            : geminiEnc
+              ? encodeGeminiChunk(geminiEnc, synthetic, requestedModel)
+              : sseChunk(synthetic);
+        controller.enqueue(encoder.encode(text));
       };
       try {
         for (;;) {

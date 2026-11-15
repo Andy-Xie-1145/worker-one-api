@@ -68,10 +68,10 @@ function asD1(db: DatabaseSync) {
 }
 
 const MODEL = 'm-a';
-function setup() {
+function setup(channelType = 'openai') {
   const db = freshDB();
   db.exec(`INSERT INTO users (id, username, password, display_name, role, status, quota, used_quota, request_count, created_time) VALUES (1, 'owner', '', 'Owner', 100, 1, 10000000, 0, 0, 0)`);
-  db.exec(`INSERT INTO channels (id, type, key, status, name, weight, priority, base_url, models) VALUES (1, 'openai', 'k', 1, 'A', 1, 10, 'https://a.test', '${MODEL}')`);
+  db.exec(`INSERT INTO channels (id, type, key, status, name, weight, priority, base_url, models) VALUES (1, '${channelType}', 'k', 1, 'A', 1, 10, 'https://a.test', '${MODEL}')`);
   db.exec(`INSERT INTO abilities (model, channel_id, enabled, priority, weight) VALUES ('${MODEL}', 1, 1, 10, 1)`);
   db.prepare(`INSERT INTO tokens (user_id, key, status, name, created_time, accessed_time, expired_time, remain_quota, unlimited_quota, used_quota, models) VALUES (1, ?, 1, 't', 0, 0, -1, 0, 1, 0, '')`).run('a'.repeat(48));
   return {
@@ -187,6 +187,29 @@ test('上游已给 finish_reason → 不重复补发', async () => {
     const evs = sseEvents(await res.text());
     const finishes = evs.map((e) => e.choices?.[0]?.finish_reason).filter(Boolean);
     assert.deepEqual(finishes, ['stop'], '上游给过就不能再补，避免重复终止');
+  } finally { mock.restore(); }
+});
+
+test('openai-responses 渠道：Responses 事件流同样要补（HPD GPT 的真实形态）', async () => {
+  // 上游发的是 Responses 事件（response.created / output_item.added / arguments.delta /
+  // response.completed），adaptor 翻成 chat chunk 后全程没有 finish_reason。
+  // 曾经的 bug：合成 chunk 被回灌 adaptor.convertStreamEvent，Responses adaptor 按
+  // `type` 分派认不出 chat chunk → chunks: [] → 静默丢弃，线上永远补不出来。
+  const { env } = setup('openai-responses');
+  const ev = (type: string, payload: unknown) => `event: ${type}\ndata: ${JSON.stringify({ type, ...(payload as object) })}\n\n`;
+  const raw =
+    ev('response.created', { response: { id: 'resp_1', created_at: 1794729000 } }) +
+    ev('response.output_item.added', { item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } }) +
+    ev('response.function_call_arguments.delta', { item_id: 'fc_1', delta: '{"city":"Beijing"}' }) +
+    ev('response.completed', { response: { usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28 } } });
+  const mock = mockUpstreamSSE(raw);
+  try {
+    const res = await call(env, '/v1/chat/completions', { model: MODEL, messages: [{ role: 'user', content: 'hi' }], stream: true });
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    const finishes = sseEvents(text).map((e) => e.choices?.[0]?.finish_reason).filter(Boolean);
+    assert.deepEqual(finishes, ['tool_calls'], `Responses 渠道也必须补 tool_calls，实际 ${JSON.stringify(finishes)}`);
+    assert.ok(text.indexOf('"finish_reason":"tool_calls"') < text.indexOf('data: [DONE]'), '终止 chunk 在 [DONE] 之前');
   } finally { mock.restore(); }
 });
 

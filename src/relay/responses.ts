@@ -173,8 +173,27 @@ export const openaiResponsesAdaptor: Adaptor = {
       }
       case 'response.completed': {
         const usage = responsesUsage(json.response?.usage);
-        // 收尾：给 include_usage 的客户端一个空 choices 的 usage chunk。
-        return { chunks: [{ id: state.id, object: 'chat.completion.chunk', created: state.created, model: ctx.requestedModel, choices: [], usage }], usage, done: true };
+        /*
+         * Responses 事件流**没有 finish_reason 字段**——官方 spec 里它被 status /
+         * incomplete_details.reason 取代，流以 response.completed 收尾。chat 客户端
+         * 要的是 finish_reason，所以由翻译器按最终 output 判定：
+         *   有 function_call item → tool_calls；否则 → stop。
+         * 判据与非流式 convertResponse（第 110 行）完全一致——这正是「同一请求改
+         * 非流式就正常、流式却缺结束标记」的原因（2026-11-15 定位：问题在网关
+         * 翻译器，不在上游）。
+         *
+         * 顺序遵循 chat 规范：先 delta:{} + finish_reason，再 usage-only 尾块。
+         */
+        const outputs: any[] = Array.isArray(json.response?.output) ? json.response.output : [];
+        const hasFunctionCall = outputs.some((i) => i?.type === 'function_call') || Number(state.toolIndex ?? 0) > 0;
+        return {
+          chunks: [
+            chunk({}, hasFunctionCall ? 'tool_calls' : 'stop'),
+            { id: state.id, object: 'chat.completion.chunk', created: state.created, model: ctx.requestedModel, choices: [], usage },
+          ],
+          usage,
+          done: true,
+        };
       }
       /*
        * response.incomplete：截断不是成功。给 chat 客户端诚实的

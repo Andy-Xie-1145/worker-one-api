@@ -48,12 +48,22 @@ API keys from every platform into one endpoint your clients never have to change
 
 ## Design: less than one-api
 
-Semantic inspiration from [songquanpeng/one-api](https://github.com/songquanpeng/one-api) (MIT); this is an independent TypeScript rewrite that deliberately deletes:
+Semantic inspiration from [songquanpeng/one-api](https://github.com/songquanpeng/one-api)
+(MIT); this is an independent TypeScript rewrite that deliberately deletes the
+complexity a single-operator gateway never needed:
 
-- user registration, multi-user, user groups, group/multiplier ratios
-- an admin account system — one `ADMIN_KEY`, no sessions
-- server-side conversation state (`previous_response_id` → 400; bring full context)
-- the Go binary + MySQL + Redis stack — one Worker + D1 + KV
+| | this gateway | one-api / NewAPI |
+|---|---|---|
+| Deployment | one Worker + D1 + KV — `wrangler deploy`, free tier covers light use | Go server + MySQL (Redis optional) |
+| Admin surface | one `ADMIN_KEY`, no sessions | registration, login, user roles |
+| Channel access control | channel tags + per-token whitelist/blacklist ACL | user groups × group ratio |
+| Price representation | direct USD / 1M-token rates per bucket; tiers & time windows via plain arithmetic | model ratio × completion ratio × group ratio |
+| Balance integrity | every change is a ledger entry; daily self-check + `reconcile` | quota columns updated in place |
+| Protocol coverage | 6 inbound protocols × 7 channel types, any-to-any, incl. two decision protocols | fixed inbound set, no decision protocols |
+| Client-facing errors | gateway-written shell: whose fault + channel + upstream's original words | pass-through |
+| Long streams | `finish_reason` synthesized when the upstream omits it; no total-duration cap | pass-through |
+
+Stateless either way: `previous_response_id` → 400; bring full context.
 
 ## Quick start
 
@@ -242,3 +252,7 @@ npm test                        # 32 suites: protocols, billing, expressions,
 AGPL-3.0. Semantic inspiration from
 [songquanpeng/one-api](https://github.com/songquanpeng/one-api) (MIT); no code
 shared.
+
+---
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

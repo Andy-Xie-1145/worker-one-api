@@ -37,12 +37,20 @@ D1 存储、KV 缓存、内置 SPA 与命令行管理，一把 `ADMIN_KEY` 代�
 ## 设计：比 one-api 少了什么
 
 语义灵感来自 [songquanpeng/one-api](https://github.com/songquanpeng/one-api)（MIT）；
-本项目是独立的 TypeScript 重写，刻意删掉了：
+本项目是独立的 TypeScript 重写，刻意删掉了单人网关用不上的复杂度：
 
-- 用户注册、多用户、用户分组、分组/倍率体系
-- 管理员账号体系——只有一把 `ADMIN_KEY`，没有会话
-- 服务端对话状态（`previous_response_id` → 400，请携带完整上下文）
-- Go 二进制 + MySQL + Redis 那套栈——一个 Worker + D1 + KV
+| | 本网关 | one-api / NewAPI |
+|---|---|---|
+| 部署 | 单个 Worker + D1 + KV——`wrangler deploy`，免费额度可轻度使用 | Go 服务器 + MySQL（Redis 可选） |
+| 管理面 | 一把 `ADMIN_KEY`，无会话 | 注册、登录、用户角色 |
+| 渠道管控 | 渠道标签 + 令牌级白/黑名单 ACL | 用户分组 × 分组倍率 |
+| 定价表示 | 按桶直标 USD / 百万 tokens；分档/时段用普通算术 | 模型倍率 × 补全倍率 × 分组倍率 |
+| 余额完整性 | 每笔变动都是账本条目；每日自检 + `reconcile` 对账 | quota 字段原地增减 |
+| 协议覆盖 | 6 种入站 × 7 种渠道任意组合，含两个决策协议 | 固定几种入站，无决策协议 |
+| 客户端可见的错误 | 网关写的壳子：谁的锅 + 渠道 + 上游原话 | 原样透传 |
+| 长流 | 上游缺 `finish_reason` 时网关合成；无总时长上限 | 原样透传 |
+
+两者都是无状态代理：`previous_response_id` → 400，请携带完整上下文。
 
 ## 快速开始
 
@@ -216,3 +224,7 @@ npm test                        # 32 个套件：协议转换、计费、表达�
 
 AGPL-3.0。语义灵感来自
 [songquanpeng/one-api](https://github.com/songquanpeng/one-api)（MIT），不含其代码。
+
+---
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

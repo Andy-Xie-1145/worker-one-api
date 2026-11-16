@@ -31,12 +31,11 @@ API keys from every platform into one endpoint your clients never have to change
   arithmetic, not a ratio maze: `"in": "4 * (context > 272k ? 2 : 1)"`. Strict
   mode (`503 model_price_not_configured`) refuses unpriced models before any
   upstream call instead of silently billing a fallback.
-- **Model alias system** — one shared alias table resolves vendor prefixes
-  (`openai/`, `zai/`, …), spelling variants (`claude-opus-5.5` →
-  `claude-opus-5-5`), date-snapshot suffixes, and alias groups (overlapping
-  groups merge); routing, token allowlists, upstream name translation and
-  pricing all share it. Aliases carry no billing semantics — they are just
-  names for the same model.
+- **Model alias system** — vendor prefixes (`openai/`, `zai/`, …), spelling
+  variants (`claude-opus-5.5` → `claude-opus-5-5`), date-snapshot suffixes and
+  alias groups are all fully interchangeable names for the same model — across
+  routing, token allowlists, upstream name translation and pricing alike.
+  Aliases carry no billing semantics.
 - **Channel tags** — channels carry tags; tokens carry a whitelist/blacklist
   ACL mixing channel IDs and tags (empty whitelist = deny all). This replaces
   one-api's group system; a denial is an honest `403 permission_error`, never a

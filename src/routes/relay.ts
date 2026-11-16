@@ -401,7 +401,8 @@ async function handleRelay(
   const maxAttempts = Math.max(1, options.RetryTimes ?? 3);
   let quotaAttempts = 0;
   let round = 0;
-  let lastError: { status: number; body: unknown } | null = null;
+  /** 最后一次尝试的失败现场：状态码 + 上游体 + 「是哪种失败、哪条渠道」——报错文案要用它们。 */
+  let lastError: { status: number; stage: AttemptStage; channelName: string; body: unknown } | null = null;
   /** 因查不到价/费率求值失败而跳过的渠道数——全部渠道都因此跳过时，最终错误要如实说。 */
   let pricingSkips = 0;
 
@@ -658,7 +659,8 @@ async function handleRelay(
      * 只记最终失败的话，「3 个渠道试了 2 个才成功」这种半坏状态永远看不见。
      */
     events.push({
-      stage: result.stage,
+      // 'body'（响应体读不回来）在事件表里归到 network：都是「连接没把话说完」。
+      stage: result.stage === 'body' ? 'network' : result.stage,
       status: result.status,
       modelName: requestedModel,
       upstreamModel: mapModel(channel, servedModel),
@@ -671,7 +673,7 @@ async function handleRelay(
       errorText: result.errorText,
     });
 
-    lastError = { status: result.status, body: result.body };
+    lastError = { status: result.status, stage: result.stage, channelName: channel.name, body: result.body };
     if (shouldAutoDisable(result.status)) {
       // 401 与其它有限重试的错误一样占配额：key 失效重试几个渠道就该到头了。
       quotaAttempts++;
@@ -744,22 +746,73 @@ async function handleRelay(
     return c.json(errorBody(`Model ${requestedModel} has no price configured (strict billing)`, 'invalid_request_error', MODEL_PRICE_NOT_CONFIGURED), 503);
   }
   if (protocol === 'anthropic') {
-    const message = typeof (lastError?.body as any)?.error?.message === 'string' ? (lastError!.body as any).error.message : 'All upstream channels failed';
-    return c.json(anthropicError(message, 'api_error'), (lastError?.status ?? 502) as any);
+    return c.json(anthropicError(lastError ? upstreamFailureMessage(lastError) : 'All upstream channels failed', 'api_error'), (lastError?.status ?? 502) as any);
   }
-  // 错误信息统一过滤：只透传上游 error.message（可读原因），丢弃响应体其余字段——
-  // 防止上游在错误里意外回显密钥、请求体等敏感内容（审计建议）。
-  const safe = lastError ? clientSafeErrorBody(lastError.body, lastError.status) : errorBody('All upstream channels failed', 'upstream_error');
+  /*
+   * 客户端错误体 = **我们自己的壳子**：不裸透传上游原文，也不把它改写成只剩一句
+   * 「上游失败」——两头都丢信息，排查时都要猜。
+   *
+   * 2026-11-16 真实教训：HPD 回源抖了两分钟、上游只回一句 `error code: 521\n`，
+   * 网关原样转给客户端，客户端只能看到 521 和这句话：是网关坏了还是上游坏了没人
+   * 能判断，只能来问人。所以这里固定包一层：
+   *   - `message`：先给判定（谁的错 + 哪条渠道 + 状态码），**再附上上游原话**；
+   *   - `upstream`：同一份原话的结构化副本，方便程序读。
+   *
+   * 同时保住原审计结论：上游响应体除 error.message 外一律丢弃（防密钥/请求体回显）。
+   */
+  const safe = lastError ? clientSafeErrorBody(lastError) : errorBody('All upstream channels failed', 'upstream_error');
   return c.json(safe, (lastError?.status ?? 502) as any);
 }
 
-/** 上游错误体 → 客户端安全的错误形状：只保留 message/type/code，其余一律丢弃。 */
-function clientSafeErrorBody(body: unknown, status: number) {
-  const err = (body as any)?.error;
-  const message = typeof err?.message === 'string' && err.message ? err.message.slice(0, 2000) : `Upstream returned ${status}`;
+/**
+ * 把一次上游失败包成客户端可读的**我们的**文案。
+ *
+ * 壳子和证据都要在一句话里：先回答「这是谁的错」，再原样附上上游说的话。
+ * 上游原话不删（删了就没法判断是模型名错了、参数错了还是对方真挂了），
+ * 只做两件安全处理：去掉换行（避免把日志/HTML 拉成多行）和截断长度。
+ */
+export function upstreamFailureMessage(failure: { stage: AttemptStage; status: number; channelName: string; body: unknown }): string {
+  const raw = normalizeUpstreamText((failure.body as any)?.error?.message);
+  const said = raw ? `. Upstream said: ${raw}` : '';
+  const ch = failure.channelName ? `channel "${failure.channelName}"` : 'upstream channel';
+  if (failure.stage === 'build') return `Channel misconfiguration on ${ch} (gateway-side config error): ${raw || 'invalid channel config'}`;
+  if (failure.stage === 'network') return `Upstream unreachable (network failure, not a gateway fault) on ${ch}: ${raw || 'fetch failed'}`;
+  if (failure.stage === 'body') return `Upstream response unreadable (not a gateway fault): ${ch} returned a body that could not be read: ${raw || 'empty or truncated body'}`;
+  if (failure.status >= 500 || failure.status === 408 || failure.status === 429) {
+    return `Upstream failure, not a gateway fault: ${ch} returned HTTP ${failure.status}${said}`;
+  }
+  // 4xx：上游明确拒了这次请求。可能是参数，也可能是我们的翻译——不能替上游认成「网关故障」。
+  return `Upstream rejected the request: ${ch} returned HTTP ${failure.status}${said}`;
+}
+
+/**
+ * 上游原话的单行化：压缩空白（上游偶尔回 HTML/多行堆栈，压成一行才不会把错误
+ * 撑成十几行），并截断到 1000 字符——保留信息，但不让错误体变成日志转储。
+ */
+function normalizeUpstreamText(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  return value.trim().replace(/\s+/g, ' ').slice(0, 1000);
+}
+
+/**
+ * 上游错误体 → 客户端安全的错误壳子。
+ *
+ * `message` = 判定文案（见 upstreamFailureMessage，已含上游原话）；`upstream` 是
+ * 同一份原话的结构化副本；上游响应体的其余字段一律丢弃。
+ */
+function clientSafeErrorBody(failure: { stage: AttemptStage; status: number; channelName: string; body: unknown }) {
+  const err = (failure.body as any)?.error;
+  const raw = normalizeUpstreamText(err?.message);
   const type = typeof err?.type === 'string' && err.type ? err.type : 'upstream_error';
   const code = typeof err?.code === 'string' ? err.code : typeof err?.code === 'number' ? String(err.code) : null;
-  return errorBody(message, type, code);
+  return {
+    error: {
+      message: upstreamFailureMessage(failure),
+      type,
+      code,
+      upstream: { status: failure.status, message: raw || `HTTP ${failure.status}` },
+    },
+  };
 }
 
 interface AttemptArgs {
@@ -799,7 +852,10 @@ interface AttemptArgs {
  */
 type AttemptResult =
   | { kind: 'ok'; response: Response }
-  | { kind: 'error'; status: number; body: unknown; stage: 'build' | 'network' | 'upstream'; errorText: string };
+  | { kind: 'error'; status: number; body: unknown; stage: AttemptStage; errorText: string };
+
+/** 一次尝试失败在哪一步：渠道/网关配置、连不上、响应体读不回来、还是上游有响应但报了错。 */
+export type AttemptStage = 'build' | 'network' | 'body' | 'upstream';
 
 async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult> {
   const { channel, body, requestedModel, servedModel, mode, path, token, user, options, reservation, started, protocol, requestId } = args;
@@ -826,8 +882,9 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
       ? { ok: false as const, reason: `channel type ${channel.type} is not OpenAI-shaped` }
       : decisionsSupport(channel, config);
     if (!support.ok) {
-      const message = `Channel ${channel.name} does not support the decisions API: ${support.reason}`;
-      return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
+      // 渠道名不进 message：客户端壳子（upstreamFailureMessage）已经统一写渠道名。
+      const message = `does not support the decisions API: ${support.reason}`;
+      return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: `Channel ${channel.name} ${message}` };
     }
     // 路径由渠道决定（decisions→/v1/decisions、systemone→/v1/systemone，config.decisions_path 可覆盖）。
     ctx.path = support.path;
@@ -840,16 +897,16 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
      * 就已按决策模型拦下 chat；这条守卫是给「模型同时挂在 chat 渠道」的边角：
      * 500 = 跳过此渠道继续换下一个，而不是把整条路径打死。
      */
-    const message = `Channel ${channel.name} is decisions-only (${channel.type}); it serves only POST /v1/decisions or POST /v1/systemone`;
-    return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
+    const message = `is decisions-only (${channel.type}); it serves only POST /v1/decisions or POST /v1/systemone`;
+    return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: `Channel ${channel.name} ${message}` };
   }
 
   let built;
   try {
     built = adaptor.buildRequest(body, ctx);
   } catch (e: any) {
-    const message = `Channel ${channel.name} misconfigured: ${e?.message ?? e}`;
-    return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: message };
+    const message = `invalid channel config: ${e?.message ?? e}`;
+    return { kind: 'error', status: 500, body: errorBody(message), stage: 'build', errorText: `Channel ${channel.name} ${message}` };
   }
 
   let upstream: Response;
@@ -867,8 +924,8 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
       signal: ctrl.signal,
     });
   } catch (e: any) {
-    const message = `Request to channel ${channel.name} failed: ${e?.message ?? e}`;
-    return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'network', errorText: message };
+    const message = `fetch failed: ${e?.message ?? e}`;
+    return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'network', errorText: `Channel ${channel.name} ${message}` };
   } finally {
     clearTimeout(headersTimer); // 头到了就解除信号——此后绝不再 abort，长流不受任何总时长限制
   }
@@ -919,8 +976,8 @@ async function attemptUpstream(c: any, args: AttemptArgs): Promise<AttemptResult
           : new Promise<never>(() => {}),
       ]);
     } catch (e: any) {
-      const message = `Channel ${channel.name} response body read/parse failed: ${e?.message ?? e}`;
-      return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'upstream', errorText: message };
+      const message = `body read/parse failed: ${e?.message ?? e}`;
+      return { kind: 'error', status: 502, body: errorBody(message, 'upstream_error'), stage: 'body', errorText: `Channel ${channel.name} ${message}` };
     } finally {
       if (bodyTimer !== undefined) clearTimeout(bodyTimer);
     }
@@ -1142,7 +1199,13 @@ function streamResponse(c: any, upstream: Response, adaptor: ReturnType<typeof g
           finalizeTail();
         } else {
           const idle = e?.name === 'UpstreamIdleTimeoutError';
-          const message = idle ? `Stream idle timeout: ${e.message}` : `Stream interrupted: ${e?.message ?? e}`;
+          /*
+           * 给客户端的同样是**我们的壳子**：先说断的是上游（不是网关），再写渠道与细节。
+           * 客户端这时早就拿到 200 了，只能从流里的错误事件得知真相。
+           */
+          const message = idle
+            ? `Upstream stream idle timeout (not a gateway fault): channel "${channel.name}" sent no data for ${Math.round(Number(e?.idleMs ?? idleMs) / 1000)}s`
+            : `Upstream stream interrupted (not a gateway fault): channel "${channel.name}" — ${e?.message ?? e}`;
           /*
            * 客户端早就拿到 200 了，所以这次不算进用户可见的失败率（final=0），
            * 但渠道确实断在半路上，健康度必须看得见。空闲超时单独记 errorCode，

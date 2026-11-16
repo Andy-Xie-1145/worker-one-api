@@ -51,6 +51,10 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.
 .tag.ok{color:var(--ok);border-color:currentColor}
 .tag.err{color:var(--err);border-color:currentColor}
 .tag.warn{color:var(--warn);border-color:currentColor}
+.ac-wrap{position:relative;flex:1;min-width:220px}
+.ac-menu{position:absolute;top:calc(100% + 3px);left:0;right:0;background:var(--panel);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow);z-index:30;max-height:260px;overflow:auto;padding:4px 0}
+.ac-item{padding:6px 12px;cursor:pointer;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.ac-item:hover{background:var(--bg)}
 .muted{color:var(--muted)}
 .center{min-height:80vh;display:grid;place-items:center}
 .auth{width:340px}
@@ -103,7 +107,7 @@ const QUOTA_PER_USD = 500000;
  * 所以页面每隔几分钟、以及每次切回标签页/获得焦点时，都跟 /api/status 对一次构建号：
  * 不一致先自动重载一次，重载后还不一致就挂横幅让人硬刷新，绝不带着旧逻辑继续跑。
  */
-const SPA_BUILD = '2026-11-13.2';
+const SPA_BUILD = '2026-11-16.1';
 const usd = (q) => '$' + (Number(q || 0) / QUOTA_PER_USD).toFixed(4);
 const num = (s) => { const n = Number(s); return Number.isFinite(n) ? n : 0; };
 const ts = (t) => (!t || t < 0) ? '—' : new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
@@ -1569,8 +1573,9 @@ async function pageTerminal(view) {
 // ---------------------------------------------------------------- 模型别名
 
 /**
- * 别名组管理（并查集语义，无倍率）：组内名字视为同一个模型。
- * 纯 GUI：成员从下拉选择添加、chip 点 × 移除，不手写逗号串。
+ * 别名组管理（组内名字互通，无倍率）：组内名字视为同一个模型。
+ * 纯 GUI：成员在组合框里**搜索点选或直接输入自定义名**（不必已在模型表里），
+ * chip 点 × 移除，不手写逗号串。
  * 生效延迟 ≤60s（options KV 缓存 TTL）；保存为整包替换。
  */
 async function pageAliases(view) {
@@ -1580,7 +1585,7 @@ async function pageAliases(view) {
 
   view.replaceChildren($(`<div class="card">
     <div class="row" style="margin-bottom:12px"><h2 style="margin:0;flex:1">模型别名</h2><button class="primary" id="addGroup">＋ 新增别名组</button></div>
-    <p class="muted" style="margin:0 0 10px">同一组的名字视为<b>同一个模型</b>（并查集，跨组重名自动合并为一个联通块）：调用组内<b>任意</b>名字都会路由到「拥有组内名字」的渠道，并自动翻译成该渠道自己的叫法；令牌模型白名单拥有组内<b>任一</b>名字即拥有全组。无倍率语义，保存为整包替换，生效延迟 ≤60s。</p>
+    <p class="muted" style="margin:0 0 10px">同一组的名字视为<b>同一个模型</b>（跨组重名自动合并为一组）：调用组内<b>任意</b>名字都会路由到「拥有组内名字」的渠道，并自动翻译成该渠道自己的叫法；令牌模型白名单拥有组内<b>任一</b>名字即拥有全组。成员在输入框里<b>搜索选择或直接输入自定义名</b>（允许不在模型表里）。无倍率语义，保存为整包替换，生效延迟 ≤60s。</p>
     <div id="aliasGroups"></div>
     <div style="margin-top:12px"><button class="primary" id="saveAliases">保存全部</button></div>
   </div>`));
@@ -1588,18 +1593,17 @@ async function pageAliases(view) {
   const render = () => {
     const el = document.getElementById('aliasGroups');
     el.innerHTML = groups.length ? groups.map((names, gi) => {
-      const available = universe.filter((m) => !names.includes(m));
       return `<div class="card" style="margin:0 0 10px">
         <div class="row" style="margin-bottom:6px"><b>别名组 ${gi + 1}</b><span class="muted">${names.length} 个成员</span><button class="danger" data-del="${gi}" style="margin-left:auto">删除组</button></div>
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-          ${names.map((n) => `<span class="tag" style="display:inline-flex;align-items:center;gap:4px"><span class="mono">${esc(n)}</span><button type="button" data-rm-gi="${gi}" data-rm-name="${esc(n)}" title="移除 ${esc(n)}" style="border:0;background:none;cursor:pointer;padding:0;color:var(--err);font-weight:700">×</button></span>`).join('') || '<span class="muted">（空组——从下方下拉添加成员后生效）</span>'}
+          ${names.map((n) => `<span class="tag" style="display:inline-flex;align-items:center;gap:4px"><span class="mono">${esc(n)}</span><button type="button" data-rm-gi="${gi}" data-rm-name="${esc(n)}" title="移除 ${esc(n)}" style="border:0;background:none;cursor:pointer;padding:0;color:var(--err);font-weight:700">×</button></span>`).join('') || '<span class="muted">（空组——从下方输入框添加成员后生效）</span>'}
         </div>
         <div class="row" style="margin-bottom:0">
-          <select data-add="${gi}" style="flex:1"><option value="">从模型列表选择要加入的名字…</option>${available.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('')}</select>
+          <div class="ac-wrap"><input data-input="${gi}" placeholder="搜索模型名，或输入自定义名后回车…" autocomplete="off" spellcheck="false" style="width:100%"><div class="ac-menu" data-menu="${gi}" hidden></div></div>
           <button type="button" data-addbtn="${gi}">添加成员</button>
         </div>
       </div>`;
-    }).join('') : '<p class="muted">暂无别名组。点「＋ 新增别名组」创建，再从下拉添加成员。</p>';
+    }).join('') : '<p class="muted">暂无别名组。点「＋ 新增别名组」创建，再搜索或输入添加成员。</p>';
     el.querySelectorAll('[data-del]').forEach((b) => (b.onclick = () => { groups.splice(Number(b.dataset.del), 1); render(); }));
     el.querySelectorAll('[data-rm-name]').forEach((b) => (b.onclick = () => {
       const gi = Number(b.dataset.rmGi), n = b.dataset.rmName;
@@ -1607,13 +1611,46 @@ async function pageAliases(view) {
       if (!groups[gi].length) groups.splice(gi, 1);
       render();
     }));
-    el.querySelectorAll('[data-addbtn]').forEach((b) => (b.onclick = () => {
-      const gi = Number(b.dataset.addbtn);
-      const sel = el.querySelector(`select[data-add="${gi}"]`);
-      const name = sel?.value;
-      if (!name) { toast('先在下拉里选一个要加入的名字', 'err'); return; }
+
+    /** 往组里加一个名字：表内表外都行；去空白、组内去重；加完焦点还给同组输入框，便于连续加。 */
+    const addMember = (gi, raw) => {
+      const name = String(raw ?? '').trim();
+      if (!name) { toast('先输入或从候选里选一个名字', 'err'); return; }
+      if (groups[gi].includes(name)) { toast(`「${name}」已在组内`, 'err'); return; }
       groups[gi].push(name);
       render();
+      const again = el.querySelector(`input[data-input="${gi}"]`);
+      if (again) again.focus();
+    };
+
+    el.querySelectorAll('[data-input]').forEach((inp) => {
+      const gi = Number(inp.dataset.input);
+      const menu = el.querySelector(`[data-menu="${gi}"]`);
+      const open = () => {
+        const typed = inp.value.trim();
+        const q = typed.toLowerCase();
+        const inGroup = new Set(groups[gi]);
+        // 匹配排序：命中位置靠前优先，其次字典序；组内已有的不出现（防重复添加）。
+        const hits = universe.filter((m) => !inGroup.has(m) && (!q || m.toLowerCase().includes(q)))
+          .sort((a, b) => (a.toLowerCase().indexOf(q) - b.toLowerCase().indexOf(q)) || a.localeCompare(b))
+          .slice(0, 30);
+        menu.innerHTML = hits.map((m) => `<div class="ac-item" data-pick="${esc(m)}">${esc(m)}</div>`).join('')
+          + (typed && !hits.some((h) => h.toLowerCase() === q) ? `<div class="ac-item" data-pick="${esc(typed)}">＋ 添加自定义名「${esc(typed)}」</div>` : '');
+        menu.hidden = !menu.innerHTML;
+        menu.querySelectorAll('[data-pick]').forEach((it) => (it.onmousedown = (ev) => { ev.preventDefault(); addMember(gi, it.dataset.pick); }));
+      };
+      inp.oninput = open;
+      inp.onfocus = open;
+      inp.onkeydown = (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); addMember(gi, inp.value); }
+        else if (ev.key === 'Escape') menu.hidden = true;
+      };
+      inp.onblur = () => setTimeout(() => (menu.hidden = true), 150);
+    });
+    el.querySelectorAll('[data-addbtn]').forEach((b) => (b.onclick = () => {
+      const gi = Number(b.dataset.addbtn);
+      const inp = el.querySelector(`input[data-input="${gi}"]`);
+      addMember(gi, inp?.value ?? '');
     }));
   };
   render();

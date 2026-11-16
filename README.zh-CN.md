@@ -5,6 +5,7 @@
 [![Language: TypeScript](https://img.shields.io/badge/lang-TypeScript-3178c6)](https://www.typescriptlang.org/)
 [![Framework: Hono](https://img.shields.io/badge/framework-Hono-e36002)](https://hono.dev/)
 [![Tests](https://img.shields.io/badge/tests-32%20suites-brightgreen)](#开发)
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 [English](./README.md) | **简体中文**
 
@@ -24,9 +25,10 @@ D1 存储、KV 缓存、内置 SPA 与命令行管理，一把 `ADMIN_KEY` 代�
   （新鲜输入、缓存读、缓存写 5m/1h、输出）。分档/时段定价用普通算术写，不搞倍率迷宫：
   `"in": "4 * (context > 272k ? 2 : 1)"`。严格模式下未定价模型直接
   `503 model_price_not_configured`，不发上游、不预扣，绝不偷偷按兜底价记账。
-- **模型别名系统**——一个并查集索引统一解析厂商前缀（`openai/`、`zai/` …）、拼写变体
-  （`claude-opus-5.5` → `claude-opus-5-5`）、日期快照后缀和别名分组；选路、令牌白名单、
-  上游名字翻译、计价共用同一份。别名没有任何计费语义——它只是同一个模型的不同叫法。
+- **模型别名系统**——一张共享的别名表统一解析厂商前缀（`openai/`、`zai/` …）、拼写变体
+  （`claude-opus-5.5` → `claude-opus-5-5`）、日期快照后缀和别名分组（重叠分组自动合并）；
+  选路、令牌白名单、上游名字翻译、计价共用同一份。别名没有任何计费语义——它只是同一
+  个模型的不同叫法。
 - **渠道标签**——渠道带标签，令牌带白/黑名单 ACL（渠道 ID 与标签混用，空白名单 = 全禁），
   以此取代 one-api 的分组体系；权限拒绝是诚实的 `403 permission_error`，
   绝不伪装成 `503 no channel`。
@@ -224,7 +226,3 @@ npm test                        # 32 个套件：协议转换、计费、表达�
 
 AGPL-3.0。语义灵感来自
 [songquanpeng/one-api](https://github.com/songquanpeng/one-api)（MIT），不含其代码。
-
----
-
-[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

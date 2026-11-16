@@ -5,6 +5,7 @@
 [![Language: TypeScript](https://img.shields.io/badge/lang-TypeScript-3178c6)](https://www.typescriptlang.org/)
 [![Framework: Hono](https://img.shields.io/badge/framework-Hono-e36002)](https://hono.dev/)
 [![Tests](https://img.shields.io/badge/tests-32%20suites-brightgreen)](#development)
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 **English** | [简体中文](./README.zh-CN.md)
 
@@ -30,11 +31,12 @@ API keys from every platform into one endpoint your clients never have to change
   arithmetic, not a ratio maze: `"in": "4 * (context > 272k ? 2 : 1)"`. Strict
   mode (`503 model_price_not_configured`) refuses unpriced models before any
   upstream call instead of silently billing a fallback.
-- **Model alias system** — one union-find index resolves vendor prefixes
+- **Model alias system** — one shared alias table resolves vendor prefixes
   (`openai/`, `zai/`, …), spelling variants (`claude-opus-5.5` →
-  `claude-opus-5-5`), date-snapshot suffixes, and alias groups; routing, token
-  allowlists, upstream name translation and pricing all share it. Aliases carry
-  no billing semantics — they are just names for the same model.
+  `claude-opus-5-5`), date-snapshot suffixes, and alias groups (overlapping
+  groups merge); routing, token allowlists, upstream name translation and
+  pricing all share it. Aliases carry no billing semantics — they are just
+  names for the same model.
 - **Channel tags** — channels carry tags; tokens carry a whitelist/blacklist
   ACL mixing channel IDs and tags (empty whitelist = deny all). This replaces
   one-api's group system; a denial is an honest `403 permission_error`, never a
@@ -252,7 +254,3 @@ npm test                        # 32 suites: protocols, billing, expressions,
 AGPL-3.0. Semantic inspiration from
 [songquanpeng/one-api](https://github.com/songquanpeng/one-api) (MIT); no code
 shared.
-
----
-
-[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

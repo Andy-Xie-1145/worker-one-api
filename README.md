@@ -146,10 +146,13 @@ fresh = prompt − cacheRead − cw5m − cw1h          # 500000 quota == $1
   `reconcile` can prove it at any time.
 
 **Price sources, first hit wins**: channel override (`channels.price_config`)
-→ global override → built-in `PRICE_TABLE` → fallback price. Channel overrides
-let the same model cost differently per channel (reservations re-pin on
-failover, never cross-billing). Clearing the fallback enables strict mode:
-unpriced models get `503`, no upstream call, no reservation.
+→ global override → built-in `PRICE_TABLE` → fallback price. Everything is keyed
+by the **model actually called** — after `model_mapping` redirection and alias
+resolution, not by the name the client sent (upstreams bill the real model, so a
+redirection never inherits the old name's price). Channel overrides let the same
+model cost differently per channel (reservations re-pin on failover, never
+cross-billing). Clearing the fallback enables strict mode: unpriced models get
+`503`, no upstream call, no reservation.
 
 **Name resolution**: strip vendor prefix → spelling aliases → strip date-snapshot
 suffix → exact match. No prefix matching — near-names never get billed wrong.

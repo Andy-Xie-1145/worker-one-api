@@ -67,6 +67,29 @@ export const PRICE_TABLE: Record<string, Price> = {
   'gpt-6.1-sol': { in: 2, out: 10, cached_in: 0.1 },
   'gpt-6-sol': { in: 2, out: 10, cached_in: 0.2 },
   'gpt-6-luna': { in: 0.1, out: 0.5, cached_in: 0.01 },
+  /*
+   * GPT-6.2 家族（2026-11-17 发布，官方价 2026-11-18 核对）：
+   *   - 6.2-sol 与 6.1-sol **同价**：$2 / $10 / 缓存读 $0.10，缓存写 30m $2.5 / 12h $5
+   *   - 6.2-astra 比 6-astra 便宜：输入/输出/写 = 80%（$8 / $40 / $10 / $20），
+   *     缓存读 = 40%（$0.40，官方"降 60%"）
+   * 长上下文（>272K）沿用官方阶梯：输入/缓存按 2 倍、输出按 1.5 倍。
+   * 来源：https://developers.openai.com/api/docs/pricing ，
+   *       https://docs.litellm.ai/blog/gpt-6-2-astra-sol
+   */
+  'gpt-6.2-sol': {
+    in: '2 * (context > 272k ? 2 : 1)',
+    out: '10 * (context > 272k ? 1.5 : 1)',
+    cached_in: '0.1 * (context > 272k ? 2 : 1)',
+    cache_write_5m: '2.5 * (context > 272k ? 2 : 1)',
+    cache_write_1h: '5 * (context > 272k ? 2 : 1)',
+  },
+  'gpt-6.2-astra': {
+    in: '8 * (context > 272k ? 2 : 1)',
+    out: '40 * (context > 272k ? 1.5 : 1)',
+    cached_in: '0.4 * (context > 272k ? 2 : 1)',
+    cache_write_5m: '10 * (context > 272k ? 2 : 1)',
+    cache_write_1h: '20 * (context > 272k ? 2 : 1)',
+  },
 
   'o4-mini': { in: 1.1, out: 4.4 },
   'o3-mini': { in: 1.1, out: 4.4 },
@@ -396,30 +419,35 @@ export function strictBillingEnabled(options?: Options): boolean {
 }
 
 /**
- * 计费身份：一个请求最终按**哪个名字、哪条配置、经由谁**计费。
+ * 计费身份：一个请求最终按**哪个模型名、哪条配置、经由谁**计费。
  *
  * 在「选中渠道后、发上游前」解析一次并连同费率一起钉在预扣上；结算复用同一份，
  * 绝不重新解析——两次解析之间配置、时间函数都可能变，前后不一致会让找平出错。
  */
 export interface BillingIdentity {
-  /** 命中的名字（请求名，或 model_mapping 后的上游名）。 */
+  /** 计费名 = **实际被调用的模型名**（model_mapping 之后；无映射时等于请求名）。 */
   billingModel: string;
   spec: PriceSpec;
   source: PriceSource;
-  /** 价格是按请求名查到的，还是按映射后的上游名查到的。 */
+  /** 计费名来自请求名（无映射）还是映射后的上游名（改名了）。 */
   via: 'requested' | 'upstream';
 }
 
 /**
  * 解析计费身份，**查不到价时回 null**（严格计费的 fail-closed 入口）。
  *
- * 优先级（渠道 > 全局 > 内置表；Key 级已按决策删除——令牌混用渠道还有 fallback，
- * 在 Key 上定价没有意义）：
- *   1. **渠道覆盖**（`channels.price_config`，按**请求名**的候选序列精确命中）——
- *      「这家渠道的真实价」：折扣渠道/免费 NIM 各配各的，路由到谁就按谁的价；
- *   2. 全局覆盖按请求名（管理员明确的对外价）；
- *   3. 映射改名 → 只按上游名走 全局覆盖 > 内置表；没有映射 → 按请求名走同一条链；
- *   4. 都没有 → 兜底价（设了）或 null（严格计费 503）。
+ * **计费名 = 实际被调用的模型**：渠道 model_mapping 改了名就用改后的名字，去走和
+ * 普通模型**完全相同**的查价链：
+ *   1. 渠道覆盖（`channels.price_config`，按实际模型名的候选序列精确命中）
+ *   2. 全局覆盖
+ *   3. 内置价格表
+ *   4. 兜底价（设了）/ null（严格计费 503）
+ *
+ * 没有任何「映射了就退回请求名价格」的特判：请求名只是客户端的叫法，上游按**实际
+ * 模型**收费。2026-11-18 实况：ch4 把 gpt-6.1-sol 映射到 gpt-6.2-sol 后，旧的实现
+ * 先用请求名命中渠道价，于是 346 笔 6.2-sol 的调用全按 6.1-sol 的价记账。
+ *
+ * Key 级定价不提供：令牌混用渠道还有 failover，在 Key 上定价没有意义。
  */
 export function resolveBillableModel(
   requested: string,
@@ -427,19 +455,20 @@ export function resolveBillableModel(
   options?: Options,
   channelPrices?: OverrideTable,
 ): BillingIdentity | null {
-  const channelHit = lookupOverride(channelPrices, requested);
-  if (channelHit) return { billingModel: requested, spec: channelHit, source: 'channel', via: 'requested' };
-  const adminGlobal = lookupOverride(options?.ModelPriceOverride, requested);
-  if (adminGlobal) return { billingModel: requested, spec: adminGlobal, source: 'global', via: 'requested' };
-  const mapped = upstreamModel && upstreamModel !== requested;
-  const hit = cascade(mapped ? upstreamModel! : requested, options);
+  const mapped = !!upstreamModel && upstreamModel !== requested;
+  const model = mapped ? upstreamModel! : requested;
+  const via: BillingIdentity['via'] = mapped ? 'upstream' : 'requested';
+
+  const channelHit = lookupOverride(channelPrices, model);
+  if (channelHit) return { billingModel: model, spec: channelHit, source: 'channel', via };
+  const adminGlobal = lookupOverride(options?.ModelPriceOverride, model);
+  if (adminGlobal) return { billingModel: model, spec: adminGlobal, source: 'global', via };
+  const hit = cascade(model, options);
   if (!hit) {
-    if (options?.DefaultPrice) {
-      return { billingModel: requested, spec: options.DefaultPrice, source: 'default', via: 'requested' };
-    }
+    if (options?.DefaultPrice) return { billingModel: model, spec: options.DefaultPrice, source: 'default', via };
     return null;
   }
-  return { billingModel: hit.canonical ?? (mapped ? upstreamModel! : requested), spec: hit.spec, source: hit.source, via: mapped ? 'upstream' : 'requested' };
+  return { billingModel: hit.canonical ?? model, spec: hit.spec, source: hit.source, via };
 }
 
 /** 两个计费身份是否等价（换渠道时用来判断要不要重开一对 pre/fin ref）。 */

@@ -3,7 +3,7 @@ import { applyCredit, reconcile } from './ledger';
 import { pruneRelayEvents } from './health';
 import { findPrice, strictBillingEnabled, resolveBillableModel } from './pricing/llm';
 import { listModels, mapModel, csv, parseChannelPriceConfig } from './channel';
-import { findUnpricedChannelModels } from './model-billing';
+import { findUnpricedChannelModels, ACTUAL_MODEL } from './model-billing';
 import { getOptions } from './options';
 import type { Options } from './options';
 import type { ChannelRow } from '../types';
@@ -268,14 +268,22 @@ export async function detectUnpricedModels(env: Env, options?: Options): Promise
         }
       }
     }
-    const unpriced = [...new Set(combos.map((c) => c.requested))].filter((m) => !m.includes(':') && !pricedSomewhere.has(m));
+    /*
+     * 报告的是**实际模型名**（model_mapping 之后）：缺价时要去补的是它的价，
+     * 请求名只是客户端的叫法。名字里带 `:` 的语音一并排除。
+     */
+    const unpriced = [...new Set(
+      combos
+        .filter((c) => !c.requested.includes(':') && !pricedSomewhere.has(c.requested))
+        .map((c) => c.upstream || c.requested),
+    )];
     if (!unpriced.length) return [];
     // 近 24h 的用量做补充信息（没被用过的未定价模型 n=0——它还没造成损失，但马上会）。
     const placeholders = unpriced.map(() => '?').join(',');
     const result = await env.DB.prepare(
-      `SELECT model_name AS model, COUNT(*) AS n, COALESCE(SUM(quota),0) AS quota FROM logs
-        WHERE type = 2 AND created_at > ? AND model_name IN (${placeholders})
-        GROUP BY model_name`,
+      `SELECT ${ACTUAL_MODEL} AS model, COUNT(*) AS n, COALESCE(SUM(quota),0) AS quota FROM logs
+        WHERE type = 2 AND created_at > ? AND ${ACTUAL_MODEL} IN (${placeholders})
+        GROUP BY ${ACTUAL_MODEL}`,
     )
       .bind(since, ...unpriced)
       .all<{ model: string; n: number; quota: number }>();

@@ -356,7 +356,17 @@ const meta = (path: string) => `CASE WHEN json_valid(billing_meta) THEN json_ext
 const HAS_CACHE = `${meta('cached_tokens')} IS NOT NULL`;
 
 /**
- * 近 N 天消费行按 (model_name, channel_id) 聚合。一次往返。
+ * 统计口径的「实际模型名」：model_mapping 之后的真名优先，空则退回请求名。
+ * logs / relay_events 都同时存了这两列，聚合时统一用它。
+ */
+export const ACTUAL_MODEL = "COALESCE(NULLIF(upstream_model, ''), model_name)";
+
+/**
+ * 近 N 天消费行按 (**实际模型**, 渠道) 聚合。一次往返。
+ *
+ * 「实际模型」= `upstream_model`（model_mapping 之后的真名），空则退回 `model_name`
+ * （请求名）。计费与报表都按实际模型算：请求名只是客户端的叫法，上游按实际模型收费
+ * （2026-11-18：ch4 把 gpt-6.1-sol 映射到 gpt-6.2-sol，报表按请求名聚就把两者混成一笔）。
  */
 export function usageSQL(withMeta: boolean): string {
   const metaCols = withMeta
@@ -368,13 +378,13 @@ export function usageSQL(withMeta: boolean): string {
        MAX(${meta('billing_model')}) AS billing_model`
     : `0 AS meta_requests, 0 AS meta_prompt_tokens, 0 AS cached_tokens,
        NULL AS meta_last_at, NULL AS pricing_version, NULL AS billing_model`;
-  return `SELECT model_name, channel_id, COUNT(*) AS requests,
+  return `SELECT ${ACTUAL_MODEL} AS model_name, channel_id, COUNT(*) AS requests,
        SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens,
        SUM(quota) AS quota, MAX(created_at) AS last_at,
        ${metaCols}
      FROM logs
      WHERE created_at >= ? AND type = 2 AND model_name != ''
-     GROUP BY model_name, channel_id`;
+     GROUP BY ${ACTUAL_MODEL}, channel_id`;
 }
 
 /** 渠道只取计费页要的列，key / base_url / config 一个字节都不读。 */

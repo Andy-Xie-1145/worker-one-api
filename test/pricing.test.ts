@@ -41,15 +41,19 @@ test('优先级：渠道覆盖 > 全局覆盖 > 内置表 > 默认价（Key 级�
   assert.deepEqual(resolveBillableModel('my-model', 'my-model', global, {} as never)!.spec, { in: 1, out: 2 });
 });
 
-test('渠道覆盖只按请求名命中（不认映射后的上游名）', () => {
-  const channel = { 'flash-lite-latest': { in: 0.1, out: 0.5 } };
-  // 请求名命中渠道覆盖（即使映射改了名——配置键就是渠道 models 里写的名字）
+test('渠道覆盖按**实际模型名**命中（映射改名后按上游名，请求名不再参与查价）', () => {
+  // 配置键 = model_mapping 之后的真名：上游按实际模型收费
+  const channel = { 'gemini-3.1-flash-lite': { in: 0.1, out: 0.5 } };
   const hit = resolveBillableModel('flash-lite-latest', 'gemini-3.1-flash-lite', undefined, channel as never)!;
   assert.equal(hit.source, 'channel');
   assert.deepEqual(hit.spec, { in: 0.1, out: 0.5 });
-  assert.equal(hit.via, 'requested');
-  // 渠道覆盖没写请求名 → 照常走映射后的上游名（内置表价）
-  const miss = resolveBillableModel('flash-lite-latest2', 'gemini-3.1-flash-lite', undefined, channel as never)!;
+  assert.equal(hit.via, 'upstream');
+  assert.equal(hit.billingModel, 'gemini-3.1-flash-lite');
+
+  // 反过来：覆盖表里写的是请求名（映射前的旧价）→ **不得命中**，按上游名走内置表
+  const stale = { 'flash-lite-latest': { in: 0.1, out: 0.5 } };
+  const miss = resolveBillableModel('flash-lite-latest', 'gemini-3.1-flash-lite', undefined, stale as never)!;
+  assert.notEqual(miss.source, 'channel', '映射改名后不得退回请求名的渠道价');
   assert.equal(miss.source, 'builtin');
   assert.deepEqual(miss.spec, { in: 0.25, out: 1.5 });
 });

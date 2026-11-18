@@ -22,20 +22,26 @@ const test = (name: string, fn: () => Promise<void> | void) => tests.push([name,
 
 const opts = (over: Record<string, unknown>) => over as never;
 
-test('请求名直接命中 → via=requested；映射到无名模型 = 查不到价（管理员定价除外）', () => {
+test('映射改名后计费名 = 上游名：请求名的全局覆盖不再生效，上游名有价才放行', () => {
   const id = resolveBillableModel('gpt-4o', 'gpt-4o');
   assert.ok(id);
   assert.equal(id.via, 'requested');
   assert.equal(id.source, 'builtin');
   const alias = resolveBillableModel('openai/gpt-4o', 'gpt-4o');
   assert.ok(alias);
-  assert.equal(alias.via, 'upstream', '上游名与请求名不同 → 走映射路径，命中的还是同一个规范名');
+  assert.equal(alias.via, 'upstream', '上游名与请求名不同 → via=upstream，命中的还是同一个规范名');
   assert.equal(alias.billingModel, 'gpt-4o');
-  // 映射改名后只认上游名：指向一个没价的模型 → null（管理员没给请求名定价时）
+  // 映射改名后只认上游名：指向一个没价的模型 → null
   assert.equal(resolveBillableModel('gpt-4o', 'totally-unknown-upstream'), null);
-  // 但管理员给请求名显式定的价仍然放行（对外价是明确决定）
-  const saved = resolveBillableModel('gpt-4o', 'totally-unknown-upstream', opts({ ModelPriceOverride: { 'gpt-4o': { in: 9, out: 9 } } }));
-  assert.ok(saved && saved.source === 'global' && saved.via === 'requested');
+  // 请求名上的全局覆盖**不再**替上游名兜底：请求名只是客户端的叫法
+  assert.equal(
+    resolveBillableModel('gpt-4o', 'totally-unknown-upstream', opts({ ModelPriceOverride: { 'gpt-4o': { in: 9, out: 9 } } })),
+    null,
+    '不得用请求名的价给映射后的无名上游兜底',
+  );
+  // 给**上游名**定价就走通了
+  const upstreamPriced = resolveBillableModel('gpt-4o', 'totally-unknown-upstream', opts({ ModelPriceOverride: { 'totally-unknown-upstream': { in: 9, out: 9 } } }));
+  assert.ok(upstreamPriced && upstreamPriced.source === 'global' && upstreamPriced.via === 'upstream');
 });
 
 test('请求名查不到、映射后的上游名查得到 → via=upstream', () => {

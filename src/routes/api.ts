@@ -10,7 +10,7 @@ import { getOptions, setOptions, DEFAULT_OPTIONS } from '../lib/options';
 import { rebuildAbilities, deleteAbilities, listModels, csv, parseConfig, resolveTestModel, validateTokenAclInput, parseTokenAcl, normalizeChannelTags } from '../lib/channel';
 import { buildProbeRequest } from '../lib/channel-probe';
 import { listUpstreamModels } from '../lib/upstream-models';
-import { loadModelBilling } from '../lib/model-billing';
+import { loadModelBilling, ACTUAL_MODEL } from '../lib/model-billing';
 import { reconcile, applyCredit } from '../lib/ledger';
 import { getHeartbeat, runWatchdog } from '../lib/watchdog';
 import { listInflight } from '../lib/inflight';
@@ -174,11 +174,11 @@ async function buildPublicStatus(env: Env, windowSec: number) {
   const dayAgo = now() - 24 * 3600;
 
   const [successes, failures, latencies, okHours, errHours] = await Promise.all([
-    env.DB.prepare('SELECT model_name, COUNT(*) AS n FROM logs WHERE type = 2 AND created_at >= ? GROUP BY model_name')
+    env.DB.prepare(`SELECT ${ACTUAL_MODEL} AS model_name, COUNT(*) AS n FROM logs WHERE type = 2 AND created_at >= ? GROUP BY ${ACTUAL_MODEL}`)
       .bind(since).all<{ model_name: string; n: number }>(),
-    env.DB.prepare('SELECT model_name, SUM(final) AS finals FROM relay_events WHERE created_at >= ? GROUP BY model_name')
+    env.DB.prepare(`SELECT ${ACTUAL_MODEL} AS model_name, SUM(final) AS finals FROM relay_events WHERE created_at >= ? GROUP BY ${ACTUAL_MODEL}`)
       .bind(since).all<{ model_name: string; finals: number }>(),
-    env.DB.prepare('SELECT model_name, elapsed_ms FROM logs WHERE type = 2 AND created_at >= ? AND elapsed_ms > 0 ORDER BY created_at DESC LIMIT 1000')
+    env.DB.prepare(`SELECT ${ACTUAL_MODEL} AS model_name, elapsed_ms FROM logs WHERE type = 2 AND created_at >= ? AND elapsed_ms > 0 ORDER BY created_at DESC LIMIT 1000`)
       .bind(since).all<{ model_name: string; elapsed_ms: number }>(),
     env.DB.prepare(
       `SELECT strftime('%Y-%m-%dT%H:00Z', created_at, 'unixepoch') AS hour, COUNT(*) AS n
@@ -733,9 +733,9 @@ api.get('/health/models', requireAdmin, async (c) => {
   const since = now() - windowSec;
 
   const [successes, failures, gaps] = await Promise.all([
-    c.env.DB.prepare('SELECT model_name, COUNT(*) AS n FROM logs WHERE type = 2 AND created_at >= ? GROUP BY model_name')
+    c.env.DB.prepare(`SELECT ${ACTUAL_MODEL} AS model_name, COUNT(*) AS n FROM logs WHERE type = 2 AND created_at >= ? GROUP BY ${ACTUAL_MODEL}`)
       .bind(since).all<{ model_name: string; n: number }>(),
-    c.env.DB.prepare('SELECT model_name, COUNT(*) AS n, SUM(final) AS finals FROM relay_events WHERE created_at >= ? GROUP BY model_name')
+    c.env.DB.prepare(`SELECT ${ACTUAL_MODEL} AS model_name, COUNT(*) AS n, SUM(final) AS finals FROM relay_events WHERE created_at >= ? GROUP BY ${ACTUAL_MODEL}`)
       .bind(since).all<{ model_name: string; n: number; finals: number }>(),
     /*
      * 路由缺口：请求了但一个渠道都匹配不上的模型。
@@ -823,10 +823,10 @@ api.get('/dashboard', requireAdmin, async (c) => {
   const since = now() - 7 * 86400;
 
   const daily = await c.env.DB.prepare(
-    `SELECT date(created_at, 'unixepoch') AS day, model_name, COUNT(*) AS count, SUM(quota) AS quota,
+    `SELECT date(created_at, 'unixepoch') AS day, ${ACTUAL_MODEL} AS model_name, COUNT(*) AS count, SUM(quota) AS quota,
             SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens
      FROM logs WHERE type = 2 AND created_at >= ?
-     GROUP BY day, model_name ORDER BY day`,
+     GROUP BY day, ${ACTUAL_MODEL} ORDER BY day`,
   ).bind(since).all();
 
   const totals = await c.env.DB.prepare(
